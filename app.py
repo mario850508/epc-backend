@@ -79,12 +79,15 @@ def airtable_headers():
 
 
 def airtable_get_all(api_url, filter_formula, fields):
-    """處理 Airtable 分頁，把符合條件的所有記錄抓完。"""
+    """處理 Airtable 分頁，把符合條件的所有記錄抓完。
+    加上 returnFieldsByFieldId=true，讓回傳的 fields 物件用「欄位 ID」當 key
+    （不加的話 Airtable 預設用「欄位名稱」當 key，會跟程式裡用 ID 讀取的邏輯對不起來）。"""
     records = []
     params = {
         "filterByFormula": filter_formula,
         "fields[]": fields,
         "pageSize": 100,
+        "returnFieldsByFieldId": "true",
     }
     offset = None
     while True:
@@ -209,7 +212,7 @@ def entry_cases():
     case_records = []
     for cid in shipped_case_ids:
         resp = requests.get(f"{CASE_API_URL}/{cid}", headers=airtable_headers(),
-                             params={"fields[]": fields}, timeout=20)
+                             params={"fields[]": fields, "returnFieldsByFieldId": "true"}, timeout=20)
         if resp.status_code == 200:
             case_records.append(resp.json())
 
