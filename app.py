@@ -240,7 +240,9 @@ def compute_entry_cases(ship_map=None):
 
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS,
               FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY]
-    formula = "OR(" + ",".join(f"RECORD_ID()='{cid}'" for cid in shipped_case_ids) + ")"
+    id_formula = "OR(" + ",".join(f"RECORD_ID()='{cid}'" for cid in shipped_case_ids) + ")"
+    vendor_formula = "OR(" + ",".join(f"{{{FIELD_VENDOR}}}='{v}'" for v in VENDOR_NAMES) + ")"
+    formula = f"AND({id_formula},{vendor_formula})"  # 跟待安排出貨案件一樣，先只抓三創/尚展/曙光測試
     case_records = airtable_get_all(CASE_API_URL, formula, fields)
 
     all_inverter_ids = set()
