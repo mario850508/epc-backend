@@ -107,9 +107,22 @@ def airtable_get_all(api_url, filter_formula, fields):
     return records
 
 
+import time
+
+_milestone_cache = {}
+_MILESTONE_CACHE_TTL = 45  # 秒；同一批使用者短時間內重複載入頁面時，不用每次都重新掃全庫
+
+
 def get_milestone_map(milestone_type):
     """回傳 {案件record_id: {milestone_record_id, actual_date, est_date}}，
-    只抓「種類」等於指定里程碑的那一批記錄（每個案件在這批裡只會有一筆）。"""
+    只抓「種類」等於指定里程碑的那一批記錄（每個案件在這批裡只會有一筆）。
+    加上短暫快取：「待安排出貨案件」跟「案件進場安排」兩個 API 幾乎同時被呼叫時，
+    常常會查同一種里程碑類型，快取可以省掉重複掃全庫的時間。"""
+    now = time.time()
+    cached = _milestone_cache.get(milestone_type)
+    if cached and (now - cached["time"]) < _MILESTONE_CACHE_TTL:
+        return cached["map"]
+
     formula = f"{{{FIELD_MS_TYPE}}}='{milestone_type}'"
     records = airtable_get_all(
         MILESTONE_API_URL, formula,
@@ -125,7 +138,13 @@ def get_milestone_map(milestone_type):
                 "actual_date": f.get(FIELD_MS_ACTUAL_DATE),
                 "est_date": f.get(FIELD_MS_EST_DATE),
             }
+    _milestone_cache[milestone_type] = {"map": result, "time": now}
     return result
+
+
+def invalidate_milestone_cache():
+    """排定出貨/進場之後要清快取，不然剛寫入的資料要等 45 秒快取過期才會反映。"""
+    _milestone_cache.clear()
 
 
 def format_module(fields):
@@ -286,6 +305,7 @@ def schedule_shipment():
     )
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    invalidate_milestone_cache()
     return jsonify({"ok": True, "record": resp.json()})
 
 
@@ -308,6 +328,7 @@ def schedule_entry():
     )
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    invalidate_milestone_cache()
     return jsonify({"ok": True, "record": resp.json()})
 
 
