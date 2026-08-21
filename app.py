@@ -305,6 +305,14 @@ scheduler.start()
 threading.Thread(target=refresh_cache, daemon=True).start()
 
 
+@app.after_request
+def add_no_cache_headers(response):
+    """所有 API 回應都禁止瀏覽器快取，避免「舊的空資料」被瀏覽器記住重複回放
+    （這是之前遇到「後端明明有資料，網頁卻一直顯示尚未準備好」的根本原因）。"""
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
 @app.route("/api/pending-cases")
 def pending_cases():
     """待安排出貨案件 —— 直接回傳快取內容，不即時查 Airtable。"""
