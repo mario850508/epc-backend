@@ -50,12 +50,16 @@ FIELD_ADDRESS = "fldSox2FNoZwdZ0hh"       # 地址
 FIELD_AGREE_DATE = "fldfZlnPNHYaKy20o"    # 同意備案（lookup，唯讀）
 FIELD_MODULE_MODEL = "fldhZHcdwFYpZAol2"  # 模組型號
 FIELD_MODULE_QTY = "fldUSsNYyCZnO4zZv"    # 電廠模組片數
-FIELD_INVERTER = "fldJInen90VWm95ut"      # 採購-逆變器（linked records，顯示型號）
+FIELD_INVERTER = "fldJInen90VWm95ut"      # 採購-逆變器（linked records，回傳的是記錄代碼，要另外查表轉型號）
 FIELD_INVERTER_QTY = "fld1h9cneDIQWnYrN"  # 逆變器數量（lookup）
 FIELD_CLOSE_STATUS = "fldrnWIhxkZzJ7Got"  # 專案結案狀態
 FIELD_HANG_METER_DATE = "fldNS6vTbnDtmQG0X"  # 掛表日期（lookup，唯讀）
 
 VENDOR_NAMES = ["三創", "尚展", "曙光"]  # 先以這三間廠商測試
+
+# ---- 採購-逆變器（連結欄位指到這張表，要用記錄 ID 反查型號） ----
+INVERTER_TABLE_ID = "tbl7l7OM63jo3pxDN"
+INVERTER_MODEL_FIELD = "fldBkhuYPlr2w8hrH"  # 型號
 
 # ---- 進度管理（里程碑表） ----
 MILESTONE_TABLE_ID = "tblxeiUluMFOBI2ci"
@@ -135,13 +139,30 @@ def format_module(fields):
     return model
 
 
+_inverter_name_cache = {"map": None}
+
+
+def get_inverter_name_map():
+    """把「採購-逆變器」表的所有記錄抓一次，建立 record_id -> 型號 的對照表。
+    簡單做法：整個表不大，直接全抓，快取在記憶體裡（伺服器重啟後會重新抓一次）。"""
+    if _inverter_name_cache["map"] is not None:
+        return _inverter_name_cache["map"]
+    url = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
+    records = airtable_get_all(url, "TRUE()", [INVERTER_MODEL_FIELD])
+    mapping = {r["id"]: r["fields"].get(INVERTER_MODEL_FIELD, r["id"]) for r in records}
+    _inverter_name_cache["map"] = mapping
+    return mapping
+
+
 def format_inverter(fields):
-    names = fields.get(FIELD_INVERTER) or []
+    ids = fields.get(FIELD_INVERTER) or []
     qtys = fields.get(FIELD_INVERTER_QTY) or []
-    if not names:
+    if not ids:
         return None
+    name_map = get_inverter_name_map()
     parts = []
-    for i, name in enumerate(names):
+    for i, rid in enumerate(ids):
+        name = name_map.get(rid, rid)
         q = qtys[i] if i < len(qtys) else None
         parts.append(f"{name} ×{q}" if q is not None else name)
     return "、".join(parts)
