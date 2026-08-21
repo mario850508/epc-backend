@@ -139,27 +139,23 @@ def format_module(fields):
     return model
 
 
-_inverter_name_cache = {"map": None}
-
-
-def get_inverter_name_map():
-    """把「採購-逆變器」表的所有記錄抓一次，建立 record_id -> 型號 的對照表。
-    簡單做法：整個表不大，直接全抓，快取在記憶體裡（伺服器重啟後會重新抓一次）。"""
-    if _inverter_name_cache["map"] is not None:
-        return _inverter_name_cache["map"]
+def resolve_inverter_names(record_ids):
+    """只查真正用到的那幾筆逆變器記錄的型號，不要整張表撈（那張表可能有上千筆，
+    整表撈會被 Render 的請求逾時砍斷）。"""
+    ids = [rid for rid in record_ids if rid]
+    if not ids:
+        return {}
     url = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
-    records = airtable_get_all(url, "TRUE()", [INVERTER_MODEL_FIELD])
-    mapping = {r["id"]: r["fields"].get(INVERTER_MODEL_FIELD, r["id"]) for r in records}
-    _inverter_name_cache["map"] = mapping
-    return mapping
+    formula = "OR(" + ",".join(f"RECORD_ID()='{rid}'" for rid in ids) + ")"
+    records = airtable_get_all(url, formula, [INVERTER_MODEL_FIELD])
+    return {r["id"]: r["fields"].get(INVERTER_MODEL_FIELD, r["id"]) for r in records}
 
 
-def format_inverter(fields):
+def format_inverter(fields, name_map):
     ids = fields.get(FIELD_INVERTER) or []
     qtys = fields.get(FIELD_INVERTER_QTY) or []
     if not ids:
         return None
-    name_map = get_inverter_name_map()
     parts = []
     for i, rid in enumerate(ids):
         name = name_map.get(rid, rid)
@@ -189,6 +185,12 @@ def pending_cases():
 
     ship_map = get_milestone_map(MILESTONE_TYPE_SHIP)
 
+    # 先收集這批案件實際用到的逆變器記錄 ID，只查這些，不要整張逆變器表都撈
+    all_inverter_ids = set()
+    for r in case_records:
+        all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
+    inverter_name_map = resolve_inverter_names(all_inverter_ids)
+
     result = []
     for r in case_records:
         ship_info = ship_map.get(r["id"])
@@ -206,7 +208,7 @@ def pending_cases():
             "address": f.get(FIELD_ADDRESS, ""),
             "agree_date": agree[0] if isinstance(agree, list) and agree else agree,
             "module": format_module(f),
-            "inverter": format_inverter(f),
+            "inverter": format_inverter(f, inverter_name_map),
         })
 
     return jsonify({"count": len(result), "cases": result})
@@ -237,6 +239,11 @@ def entry_cases():
         if resp.status_code == 200:
             case_records.append(resp.json())
 
+    all_inverter_ids = set()
+    for r in case_records:
+        all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
+    inverter_name_map = resolve_inverter_names(all_inverter_ids)
+
     result = []
     for r in case_records:
         f = r["fields"]
@@ -251,7 +258,7 @@ def entry_cases():
             "vendor": f.get(FIELD_VENDOR, ""),
             "address": f.get(FIELD_ADDRESS, ""),
             "module": format_module(f),
-            "inverter": format_inverter(f),
+            "inverter": format_inverter(f, inverter_name_map),
             "ship_date": ship_info.get("actual_date"),
         })
 
