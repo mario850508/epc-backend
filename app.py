@@ -9,33 +9,39 @@ EPC 出貨／進場排程 後端 API
 ===================================================================
 「[電廠] 案場管理」Base 裡有兩張關鍵表：
 
-1. 專案細節（案件主表）：一個案件一筆記錄，案號／廠商／地址／同意備案／掛表日期都在這。
-2. 進度管理（里程碑表）：**一個案件對應 18 筆記錄**，每筆代表一個里程碑階段
+1. 專案細節（案件主表）：一個案件一筆記錄，案號／廠商／地址／同意備案／掛表日期都在這；
+   還有一個「進度管理」連結欄位，連到該案件在「進度管理」表裡的 18 筆里程碑記錄。
+2. 進度管理（里程碑表）：**整張表是全公司所有案件、所有歷史紀錄**，一個案件對應 18 筆
    （工程合約簽約、併聯審查、同意備案…大料出貨時間、進場屋主預約…），
-   每筆都有「預估日期」「實際日期」欄位。
+   各自有「預估日期」「實際日期」欄位。這張表可能非常大（全公司歷年案件 × 18）。
 
-也就是說「模組／變流器出貨」跟「進場」在 Airtable 裡本來就有對應的里程碑，
-不需要另外新增欄位：
-  - 出貨 → 進度管理表裡「種類 = 大料出貨時間」那一筆的「實際日期」
-  - 進場 → 進度管理表裡「種類 = 進場屋主預約」那一筆的「實際日期」
-（大料出貨時間視為模組＋變流器同一個出貨事件，寫同一個日期。）
-
-狀態設計（不額外存資料庫，直接反映 Airtable 欄位）：
-  待安排出貨案件 = 同意備案有值 且 掛表日期空 且「大料出貨時間」實際日期空
-  案件進場安排   = 「大料出貨時間」實際日期有值 且「進場屋主預約」實際日期空
-  已完成         = 「進場屋主預約」實際日期有值
+出貨、進場的排定，寫的就是「進度管理」表裡對應那一筆的「實際日期」：
+  - 出貨 → 「大料出貨時間」那一筆（模組＋變流器視為同一個出貨事件，寫同一天）
+  - 進場 → 「進場屋主預約」那一筆
 
 ===================================================================
-資料更新架構（V2：排程快取，不再即時查詢）
+效能設計（重要！之前踩過的坑）
 ===================================================================
-直接即時查 Airtable 太慢（案件量一多，一次要 30 秒～1 分多鐘），改成：
-  - 伺服器背景排程，每天 00:00 / 06:00 / 12:00 / 18:00（台北時間）自動整批查詢一次，
-    結果存在記憶體裡的 DATA_CACHE。
-  - 前端呼叫 /api/pending-cases、/api/entry-cases 時，直接回傳 DATA_CACHE 裡的內容，
-    不會去查 Airtable，幾乎是秒開。
-  - 使用者按「排定日期」「排定進場日期」寫入成功後，會立刻觸發一次 refresh_cache()，
-    讓清單馬上反映最新狀態（這個當下會等幾秒，因為要重新整批查詢，但平常瀏覽時是秒開）。
-  - 伺服器剛啟動時（第一次部署、或 Render 重啟）會立刻背景跑一次，不用等到下個整點。
+❌ 錯誤做法：對整張「進度管理」表做 filterByFormula 找「種類=大料出貨時間」，
+   因為這張表是全公司歷史資料，符合的筆數可能是幾千筆，分頁抓取要跑非常久
+   （實測會卡超過 20 分鐘沒有回應，等同卡死）。
+
+✅ 正確做法：
+   1. 先用「專案細節」表的篩選條件（進行中 / 廠商 / 同意備案 / 掛表日期）鎖定
+      一小批相關案件（通常幾十到一兩百筆）。
+   2. 從這批案件的「進度管理」連結欄位，直接拿到每個案件對應的 18 筆里程碑
+      record ID（不用查表，這些 ID 就在案件自己的欄位裡）。
+   3. 把這些 ID 收集起來，用 OR(RECORD_ID()='...', ...) 分批只查「這些 ID
+      裡種類是大料出貨時間或進場屋主預約」的記錄，不用管全表其他幾千筆。
+
+===================================================================
+資料更新架構（排程快取，不即時查詢）
+===================================================================
+  - 伺服器背景排程，每天 00:00／06:00／12:00／18:00（台北時間）整批查一次，
+    存在記憶體的 DATA_CACHE。
+  - 前端呼叫 /api/pending-cases、/api/entry-cases 直接讀 DATA_CACHE，秒開。
+  - 使用者「排定日期」寫入成功後，立刻觸發一次重新整理。
+  - 伺服器剛啟動時會立刻背景跑一次。
 """
 
 import os
@@ -49,44 +55,45 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
-CORS(app)  # 讓網頁前端（不同網域）可以呼叫這支 API
+CORS(app)
 
 # ===================================================================
 # CONFIG
 # ===================================================================
 
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")  # 部署到 Render 時用環境變數設定，不要寫死在程式碼裡
+AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
 BASE_ID = "appj1wnO3WnRtIEvg"  # [電廠] 案場管理
 
 # ---- 專案細節（案件主表） ----
 CASE_TABLE_ID = "tblf6BPFcanBjHbaJ"
-FIELD_CASE_NO = "fldt8vJbC6JtULwS6"       # 案號
-FIELD_ALIAS = "fldU5syY0OnJTS4ej"         # 別名
-FIELD_VENDOR = "fldgSgF77Yphcexx5"        # 施作廠商
-FIELD_ADDRESS = "fldSox2FNoZwdZ0hh"       # 地址
-FIELD_AGREE_DATE = "fldfZlnPNHYaKy20o"    # 同意備案（lookup，唯讀）
-FIELD_MODULE_MODEL = "fldhZHcdwFYpZAol2"  # 模組型號
-FIELD_MODULE_QTY = "fldUSsNYyCZnO4zZv"    # 電廠模組片數
-FIELD_INVERTER = "fldJInen90VWm95ut"      # 採購-逆變器（linked records，回傳的是記錄代碼，要另外查表轉型號）
-FIELD_INVERTER_QTY = "fld1h9cneDIQWnYrN"  # 逆變器數量（lookup）
-FIELD_CLOSE_STATUS = "fldrnWIhxkZzJ7Got"  # 專案結案狀態
-FIELD_HANG_METER_DATE = "fldNS6vTbnDtmQG0X"  # 掛表日期（lookup，唯讀）
+FIELD_CASE_NO = "fldt8vJbC6JtULwS6"
+FIELD_ALIAS = "fldU5syY0OnJTS4ej"
+FIELD_VENDOR = "fldgSgF77Yphcexx5"
+FIELD_ADDRESS = "fldSox2FNoZwdZ0hh"
+FIELD_AGREE_DATE = "fldfZlnPNHYaKy20o"
+FIELD_MODULE_MODEL = "fldhZHcdwFYpZAol2"
+FIELD_MODULE_QTY = "fldUSsNYyCZnO4zZv"
+FIELD_INVERTER = "fldJInen90VWm95ut"
+FIELD_INVERTER_QTY = "fld1h9cneDIQWnYrN"
+FIELD_CLOSE_STATUS = "fldrnWIhxkZzJ7Got"
+FIELD_HANG_METER_DATE = "fldNS6vTbnDtmQG0X"
+FIELD_MS_LINK_ON_CASE = "fldEs9vLzY416tTHo"  # 「進度管理」連結欄位（在專案細節表上）
 
-VENDOR_NAMES = ["三創", "尚展", "曙光"]  # 先以這三間廠商測試
+VENDOR_NAMES = ["三創", "尚展", "曙光"]
 
-# ---- 採購-逆變器（連結欄位指到這張表，要用記錄 ID 反查型號） ----
+# ---- 採購-逆變器 ----
 INVERTER_TABLE_ID = "tbl7l7OM63jo3pxDN"
-INVERTER_MODEL_FIELD = "fldBkhuYPlr2w8hrH"  # 型號
+INVERTER_MODEL_FIELD = "fldBkhuYPlr2w8hrH"
 
 # ---- 進度管理（里程碑表） ----
 MILESTONE_TABLE_ID = "tblxeiUluMFOBI2ci"
-FIELD_MS_CASE_LINK = "fldome7Uo2fuK2Ucp"   # 專案（連回專案細節的 linked records）
-FIELD_MS_TYPE = "fldTr1O1foeVmDbnm"        # 種類（single select）
-FIELD_MS_ACTUAL_DATE = "fldWuXRAVhfZJcjXj"  # 實際日期
-FIELD_MS_EST_DATE = "fldA9MK2ATP7GrLJC"     # 預估日期
+FIELD_MS_CASE_LINK = "fldome7Uo2fuK2Ucp"
+FIELD_MS_TYPE = "fldTr1O1foeVmDbnm"
+FIELD_MS_ACTUAL_DATE = "fldWuXRAVhfZJcjXj"
+FIELD_MS_EST_DATE = "fldA9MK2ATP7GrLJC"
 
-MILESTONE_TYPE_SHIP = "大料出貨時間"   # 對應「模組／變流器出貨」
-MILESTONE_TYPE_ENTRY = "進場屋主預約"  # 對應「進場」
+MILESTONE_TYPE_SHIP = "大料出貨時間"
+MILESTONE_TYPE_ENTRY = "進場屋主預約"
 
 CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
@@ -101,9 +108,8 @@ def airtable_headers():
 
 
 def airtable_get_all(api_url, filter_formula, fields):
-    """處理 Airtable 分頁，把符合條件的所有記錄抓完。
-    加上 returnFieldsByFieldId=true，讓回傳的 fields 物件用「欄位 ID」當 key
-    （不加的話 Airtable 預設用「欄位名稱」當 key，會跟程式裡用 ID 讀取的邏輯對不起來）。"""
+    """處理 Airtable 分頁，把符合條件的所有記錄抓完（加上安全上限，避免萬一公式寫錯
+    導致無止盡分頁）。用 returnFieldsByFieldId=true 讓回傳的 fields 用欄位 ID 當 key。"""
     records = []
     params = {
         "filterByFormula": filter_formula,
@@ -112,6 +118,8 @@ def airtable_get_all(api_url, filter_formula, fields):
         "returnFieldsByFieldId": "true",
     }
     offset = None
+    max_pages = 200  # 安全上限：最多 20,000 筆，正常情況遠遠用不到，純粹防呆避免真的卡死
+    page = 0
     while True:
         if offset:
             params["offset"] = offset
@@ -120,29 +128,10 @@ def airtable_get_all(api_url, filter_formula, fields):
         data = resp.json()
         records.extend(data.get("records", []))
         offset = data.get("offset")
-        if not offset:
+        page += 1
+        if not offset or page >= max_pages:
             break
     return records
-
-
-def get_milestone_map(milestone_type):
-    """回傳 {案件record_id: {milestone_record_id, actual_date, est_date}}。"""
-    formula = f"{{{FIELD_MS_TYPE}}}='{milestone_type}'"
-    records = airtable_get_all(
-        MILESTONE_API_URL, formula,
-        [FIELD_MS_CASE_LINK, FIELD_MS_ACTUAL_DATE, FIELD_MS_EST_DATE],
-    )
-    result = {}
-    for r in records:
-        f = r["fields"]
-        case_ids = f.get(FIELD_MS_CASE_LINK) or []
-        for cid in case_ids:
-            result[cid] = {
-                "milestone_record_id": r["id"],
-                "actual_date": f.get(FIELD_MS_ACTUAL_DATE),
-                "est_date": f.get(FIELD_MS_EST_DATE),
-            }
-    return result
 
 
 def format_module(fields):
@@ -157,13 +146,20 @@ def format_module(fields):
 
 
 def resolve_inverter_names(record_ids):
-    """只查真正用到的那幾筆逆變器記錄的型號，不要整張表撈（那張表可能有上千筆）。"""
+    """只查真正用到的那幾筆逆變器記錄的型號，不整表撈。"""
     ids = [rid for rid in record_ids if rid]
     if not ids:
         return {}
-    formula = "OR(" + ",".join(f"RECORD_ID()='{rid}'" for rid in ids) + ")"
-    records = airtable_get_all(INVERTER_API_URL, formula, [INVERTER_MODEL_FIELD])
-    return {r["id"]: r["fields"].get(INVERTER_MODEL_FIELD, r["id"]) for r in records}
+    name_map = {}
+    batch_size = 80
+    ids_list = list(set(ids))
+    for i in range(0, len(ids_list), batch_size):
+        batch = ids_list[i:i + batch_size]
+        formula = "OR(" + ",".join(f"RECORD_ID()='{rid}'" for rid in batch) + ")"
+        records = airtable_get_all(INVERTER_API_URL, formula, [INVERTER_MODEL_FIELD])
+        for r in records:
+            name_map[r["id"]] = r["fields"].get(INVERTER_MODEL_FIELD, r["id"])
+    return name_map
 
 
 def format_inverter(fields, name_map):
@@ -179,11 +175,49 @@ def format_inverter(fields, name_map):
     return "、".join(parts)
 
 
-# ===================================================================
-# 整批查詢邏輯（背景排程 / 手動刷新都呼叫這兩支）
-# ===================================================================
+def fetch_milestones_for_case_pool(case_records):
+    """收集這批案件（bounded，通常幾十到一兩百筆）在「進度管理」表裡的連結 record ID，
+    分批只查『種類是大料出貨時間或進場屋主預約』的那幾筆——不用管全表其他幾千筆歷史資料。
+    回傳 (ship_map, entry_map)，key 都是案件的 record_id。"""
+    all_ms_ids = set()
+    for r in case_records:
+        all_ms_ids.update(r["fields"].get(FIELD_MS_LINK_ON_CASE) or [])
 
-def compute_pending_cases():
+    ship_map, entry_map = {}, {}
+    if not all_ms_ids:
+        return ship_map, entry_map
+
+    type_formula = f"OR({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_SHIP}',{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}')"
+    ids_list = list(all_ms_ids)
+    batch_size = 80  # Airtable formula/URL 長度有限，分批查
+    for i in range(0, len(ids_list), batch_size):
+        batch = ids_list[i:i + batch_size]
+        id_formula = "OR(" + ",".join(f"RECORD_ID()='{mid}'" for mid in batch) + ")"
+        formula = f"AND({id_formula},{type_formula})"
+        records = airtable_get_all(
+            MILESTONE_API_URL, formula,
+            [FIELD_MS_CASE_LINK, FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_EST_DATE],
+        )
+        for r in records:
+            f = r["fields"]
+            ms_type = f.get(FIELD_MS_TYPE)
+            entry = {
+                "milestone_record_id": r["id"],
+                "actual_date": f.get(FIELD_MS_ACTUAL_DATE),
+                "est_date": f.get(FIELD_MS_EST_DATE),
+            }
+            for cid in (f.get(FIELD_MS_CASE_LINK) or []):
+                if ms_type == MILESTONE_TYPE_SHIP:
+                    ship_map[cid] = entry
+                elif ms_type == MILESTONE_TYPE_ENTRY:
+                    entry_map[cid] = entry
+    return ship_map, entry_map
+
+
+def compute_case_pool():
+    """抓一次基礎案件池：進行中 + 同意備案已填 + 掛表日期空 + 三創/尚展/曙光。
+    這批案件同時涵蓋『待安排出貨』跟『已出貨待進場』兩種狀態（因為兩者都還沒掛表），
+    後面再依「大料出貨時間」「進場屋主預約」是否已填分流，不用分兩次查案件表。"""
     vendor_formula = "OR(" + ",".join(f"{{{FIELD_VENDOR}}}='{v}'" for v in VENDOR_NAMES) + ")"
     formula = (
         f"AND("
@@ -194,105 +228,83 @@ def compute_pending_cases():
         f")"
     )
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_AGREE_DATE,
-              FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY]
-    case_records = airtable_get_all(CASE_API_URL, formula, fields)
+              FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
+              FIELD_MS_LINK_ON_CASE]
+    return airtable_get_all(CASE_API_URL, formula, fields)
 
-    ship_map = get_milestone_map(MILESTONE_TYPE_SHIP)
+
+def compute_pending_and_entry():
+    """一次算出「待安排出貨案件」跟「案件進場安排」兩份清單。"""
+    case_records = compute_case_pool()
+    ship_map, entry_map = fetch_milestones_for_case_pool(case_records)
 
     all_inverter_ids = set()
     for r in case_records:
         all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
     inverter_name_map = resolve_inverter_names(all_inverter_ids)
 
-    result = []
+    pending, entry = [], []
     for r in case_records:
+        f = r["fields"]
         ship_info = ship_map.get(r["id"])
-        if ship_info and ship_info.get("actual_date"):
-            continue  # 已經排過出貨了，不屬於「待安排」
+        entry_info = entry_map.get(r["id"])
+        module = format_module(f)
+        inverter = format_inverter(f, inverter_name_map)
 
-        f = r["fields"]
-        agree = f.get(FIELD_AGREE_DATE)
-        result.append({
+        base = {
             "record_id": r["id"],
-            "ship_milestone_record_id": ship_info["milestone_record_id"] if ship_info else None,
             "case": f.get(FIELD_CASE_NO, ""),
             "alias": f.get(FIELD_ALIAS, ""),
             "vendor": f.get(FIELD_VENDOR, ""),
             "address": f.get(FIELD_ADDRESS, ""),
-            "agree_date": agree[0] if isinstance(agree, list) and agree else agree,
-            "module": format_module(f),
-            "inverter": format_inverter(f, inverter_name_map),
-        })
-    return result, ship_map  # ship_map 給 compute_entry_cases 重複使用，不用再查一次
+            "module": module,
+            "inverter": inverter,
+        }
 
+        if not (ship_info and ship_info.get("actual_date")):
+            # 還沒出貨 → 待安排出貨案件
+            agree = f.get(FIELD_AGREE_DATE)
+            pending.append({
+                **base,
+                "ship_milestone_record_id": ship_info["milestone_record_id"] if ship_info else None,
+                "agree_date": agree[0] if isinstance(agree, list) and agree else agree,
+            })
+        elif not (entry_info and entry_info.get("actual_date")):
+            # 已出貨，還沒進場 → 案件進場安排
+            entry.append({
+                **base,
+                "ship_milestone_record_id": ship_info["milestone_record_id"],
+                "entry_milestone_record_id": entry_info["milestone_record_id"] if entry_info else None,
+                "ship_date": ship_info.get("actual_date"),
+            })
+        # else：已進場，兩份清單都不列（之後排程日曆功能會用到）
 
-def compute_entry_cases(ship_map=None):
-    if ship_map is None:
-        ship_map = get_milestone_map(MILESTONE_TYPE_SHIP)
-    entry_map = get_milestone_map(MILESTONE_TYPE_ENTRY)
-
-    shipped_case_ids = [
-        cid for cid, info in ship_map.items()
-        if info.get("actual_date") and not (entry_map.get(cid) or {}).get("actual_date")
-    ]
-    if not shipped_case_ids:
-        return []
-
-    fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS,
-              FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY]
-    id_formula = "OR(" + ",".join(f"RECORD_ID()='{cid}'" for cid in shipped_case_ids) + ")"
-    vendor_formula = "OR(" + ",".join(f"{{{FIELD_VENDOR}}}='{v}'" for v in VENDOR_NAMES) + ")"
-    formula = f"AND({id_formula},{vendor_formula})"  # 跟待安排出貨案件一樣，先只抓三創/尚展/曙光測試
-    case_records = airtable_get_all(CASE_API_URL, formula, fields)
-
-    all_inverter_ids = set()
-    for r in case_records:
-        all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
-    inverter_name_map = resolve_inverter_names(all_inverter_ids)
-
-    result = []
-    for r in case_records:
-        f = r["fields"]
-        ship_info = ship_map.get(r["id"], {})
-        entry_info = entry_map.get(r["id"], {})
-        result.append({
-            "record_id": r["id"],
-            "ship_milestone_record_id": ship_info.get("milestone_record_id"),
-            "entry_milestone_record_id": entry_info.get("milestone_record_id"),
-            "case": f.get(FIELD_CASE_NO, ""),
-            "alias": f.get(FIELD_ALIAS, ""),
-            "vendor": f.get(FIELD_VENDOR, ""),
-            "address": f.get(FIELD_ADDRESS, ""),
-            "module": format_module(f),
-            "inverter": format_inverter(f, inverter_name_map),
-            "ship_date": ship_info.get("actual_date"),
-        })
-    return result
+    return pending, entry
 
 
 # ===================================================================
 # 記憶體快取 + 背景排程
 # ===================================================================
 
-DATA_CACHE = {"pending": [], "entry": [], "updated_at": None, "refreshing": False}
+DATA_CACHE = {"pending": [], "entry": [], "updated_at": None, "refreshing": False, "last_error": None}
 _cache_lock = threading.Lock()
 
 
 def refresh_cache():
-    """整批重新查詢一次 Airtable，更新 DATA_CACHE。定時排程跟「排定日期後」都會呼叫這支。"""
     with _cache_lock:
         if DATA_CACHE["refreshing"]:
-            return  # 已經有一份在跑了，不要重複跑
+            return
         DATA_CACHE["refreshing"] = True
     try:
-        pending, ship_map = compute_pending_cases()
-        entry = compute_entry_cases(ship_map)
+        pending, entry = compute_pending_and_entry()
         DATA_CACHE["pending"] = pending
         DATA_CACHE["entry"] = entry
         DATA_CACHE["updated_at"] = datetime.now().isoformat()
-        print(f"[refresh_cache] 完成，pending={len(pending)} entry={len(entry)}")
+        DATA_CACHE["last_error"] = None
+        print(f"[refresh_cache] 完成，pending={len(pending)} entry={len(entry)}", flush=True)
     except Exception as e:
-        print(f"[refresh_cache] 失敗：{e}")
+        DATA_CACHE["last_error"] = str(e)
+        print(f"[refresh_cache] 失敗：{e}", flush=True)
     finally:
         DATA_CACHE["refreshing"] = False
 
@@ -301,41 +313,39 @@ scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
 scheduler.start()
 
-# 伺服器一啟動就在背景跑一次，不用等到下個整點才有資料
 threading.Thread(target=refresh_cache, daemon=True).start()
 
 
 @app.after_request
 def add_no_cache_headers(response):
-    """所有 API 回應都禁止瀏覽器快取，避免「舊的空資料」被瀏覽器記住重複回放
-    （這是之前遇到「後端明明有資料，網頁卻一直顯示尚未準備好」的根本原因）。"""
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
 
 
 @app.route("/api/pending-cases")
 def pending_cases():
-    """待安排出貨案件 —— 直接回傳快取內容，不即時查 Airtable。"""
     return jsonify({
         "count": len(DATA_CACHE["pending"]),
         "cases": DATA_CACHE["pending"],
         "updated_at": DATA_CACHE["updated_at"],
+        "refreshing": DATA_CACHE["refreshing"],
+        "last_error": DATA_CACHE["last_error"],
     })
 
 
 @app.route("/api/entry-cases")
 def entry_cases():
-    """案件進場安排 —— 直接回傳快取內容，不即時查 Airtable。"""
     return jsonify({
         "count": len(DATA_CACHE["entry"]),
         "cases": DATA_CACHE["entry"],
         "updated_at": DATA_CACHE["updated_at"],
+        "refreshing": DATA_CACHE["refreshing"],
+        "last_error": DATA_CACHE["last_error"],
     })
 
 
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
-    """手動觸發一次重新整理（排定日期成功後會自動呼叫；也保留給以後有需要時手動呼叫）。"""
     threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "message": "已在背景開始重新整理"})
 
@@ -343,12 +353,10 @@ def manual_refresh():
 @app.route("/api/schedule", methods=["POST"])
 def schedule_shipment():
     """排定（或重新排定）出貨時間，寫進「進度管理」表「大料出貨時間」那筆的實際日期。
-    body: {milestone_record_id, ship_date}
-    （模組／變流器視為同一個出貨事件，寫同一個日期；milestone_record_id 從
-    /api/pending-cases 或 /api/entry-cases 回傳的 ship_milestone_record_id 取得）"""
+    body: {milestone_record_id, ship_date}"""
     body = request.get_json(force=True)
     milestone_record_id = body.get("milestone_record_id")
-    ship_date = body.get("ship_date")  # "YYYY-MM-DD"
+    ship_date = body.get("ship_date")
 
     if not milestone_record_id or not ship_date:
         return jsonify({"error": "缺少 milestone_record_id 或 ship_date"}), 400
@@ -361,7 +369,7 @@ def schedule_shipment():
     )
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
-    refresh_cache()  # 寫入成功後立刻整批重整一次，讓清單馬上反映最新狀態
+    threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
 
 
@@ -384,7 +392,7 @@ def schedule_entry():
     )
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
-    refresh_cache()
+    threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
 
 
@@ -394,6 +402,8 @@ def health():
         "status": "ok",
         "service": "epc-backend",
         "cache_updated_at": DATA_CACHE["updated_at"],
+        "refreshing": DATA_CACHE["refreshing"],
+        "last_error": DATA_CACHE["last_error"],
         "pending_count": len(DATA_CACHE["pending"]),
         "entry_count": len(DATA_CACHE["entry"]),
     })
