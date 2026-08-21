@@ -153,10 +153,14 @@ def resolve_inverter_names(record_ids):
     name_map = {}
     batch_size = 80
     ids_list = list(set(ids))
+    total_batches = (len(ids_list) + batch_size - 1) // batch_size
+    print(f"[步驟3] 共 {len(ids_list)} 個逆變器 ID，分 {total_batches} 批查詢…", flush=True)
     for i in range(0, len(ids_list), batch_size):
+        batch_no = i // batch_size + 1
         batch = ids_list[i:i + batch_size]
         formula = "OR(" + ",".join(f"RECORD_ID()='{rid}'" for rid in batch) + ")"
         records = airtable_get_all(INVERTER_API_URL, formula, [INVERTER_MODEL_FIELD])
+        print(f"[步驟3] 第 {batch_no}/{total_batches} 批完成，取得 {len(records)} 筆", flush=True)
         for r in records:
             name_map[r["id"]] = r["fields"].get(INVERTER_MODEL_FIELD, r["id"])
     return name_map
@@ -185,19 +189,25 @@ def fetch_milestones_for_case_pool(case_records):
 
     ship_map, entry_map = {}, {}
     if not all_ms_ids:
+        print("[步驟2] 這批案件沒有任何『進度管理』連結 ID，略過", flush=True)
         return ship_map, entry_map
 
     type_formula = f"OR({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_SHIP}',{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}')"
     ids_list = list(all_ms_ids)
     batch_size = 80  # Airtable formula/URL 長度有限，分批查
+    total_batches = (len(ids_list) + batch_size - 1) // batch_size
+    print(f"[步驟2] 共 {len(ids_list)} 個里程碑 ID，分 {total_batches} 批查詢…", flush=True)
     for i in range(0, len(ids_list), batch_size):
+        batch_no = i // batch_size + 1
         batch = ids_list[i:i + batch_size]
         id_formula = "OR(" + ",".join(f"RECORD_ID()='{mid}'" for mid in batch) + ")"
         formula = f"AND({id_formula},{type_formula})"
+        print(f"[步驟2] 查詢第 {batch_no}/{total_batches} 批…", flush=True)
         records = airtable_get_all(
             MILESTONE_API_URL, formula,
             [FIELD_MS_CASE_LINK, FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_EST_DATE],
         )
+        print(f"[步驟2] 第 {batch_no}/{total_batches} 批完成，取得 {len(records)} 筆", flush=True)
         for r in records:
             f = r["fields"]
             ms_type = f.get(FIELD_MS_TYPE)
@@ -211,6 +221,7 @@ def fetch_milestones_for_case_pool(case_records):
                     ship_map[cid] = entry
                 elif ms_type == MILESTONE_TYPE_ENTRY:
                     entry_map[cid] = entry
+    print(f"[步驟2] 全部完成，ship_map={len(ship_map)} entry_map={len(entry_map)}", flush=True)
     return ship_map, entry_map
 
 
@@ -230,7 +241,10 @@ def compute_case_pool():
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_AGREE_DATE,
               FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
               FIELD_MS_LINK_ON_CASE]
-    return airtable_get_all(CASE_API_URL, formula, fields)
+    print("[步驟1] 開始查詢案件池…", flush=True)
+    records = airtable_get_all(CASE_API_URL, formula, fields)
+    print(f"[步驟1] 完成，案件池共 {len(records)} 筆", flush=True)
+    return records
 
 
 def compute_pending_and_entry():
@@ -242,6 +256,7 @@ def compute_pending_and_entry():
     for r in case_records:
         all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
     inverter_name_map = resolve_inverter_names(all_inverter_ids)
+    print("[步驟4] 開始整理清單…", flush=True)
 
     pending, entry = [], []
     for r in case_records:
@@ -295,6 +310,7 @@ def refresh_cache():
         if DATA_CACHE["refreshing"]:
             return
         DATA_CACHE["refreshing"] = True
+    print("[refresh_cache] 開始…", flush=True)
     try:
         pending, entry = compute_pending_and_entry()
         DATA_CACHE["pending"] = pending
