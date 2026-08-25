@@ -539,6 +539,34 @@ def schedule_entry():
     return jsonify({"ok": True, "record": resp.json()})
 
 
+@app.route("/api/hang-meter-date", methods=["POST"])
+def schedule_hang_meter():
+    """排定掛表日期，寫進「專案細節」（案件表）的「掛表日期」欄位——注意這是案件
+    record 本身的欄位，不是「進度管理」里程碑表的欄位，所以直接用 CASE_API_URL、
+    body 傳的是案件的 record_id（不是 milestone_record_id）。
+    寫入後，這筆案件的「掛表日期」不再是空值，下次 refresh_cache 時就會自然從
+    整個排程池（pending/entry/completed）中消失——這是既有 compute_case_pool()
+    篩選條件本來就有的行為，不用額外處理。
+    body: {record_id, hang_meter_date}"""
+    body = request.get_json(force=True)
+    record_id = body.get("record_id")
+    hang_meter_date = body.get("hang_meter_date")
+
+    if not record_id or not hang_meter_date:
+        return jsonify({"error": "缺少 record_id 或 hang_meter_date"}), 400
+
+    resp = requests.patch(
+        f"{CASE_API_URL}/{record_id}",
+        headers=airtable_headers(),
+        json={"fields": {FIELD_HANG_METER_DATE: hang_meter_date}},
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    threading.Thread(target=refresh_cache, daemon=True).start()
+    return jsonify({"ok": True, "record": resp.json()})
+
+
 @app.route("/")
 def health():
     return jsonify({
