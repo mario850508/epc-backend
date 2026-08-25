@@ -108,6 +108,7 @@ FIELD_MS_EST_DATE = "fldA9MK2ATP7GrLJC"
 
 MILESTONE_TYPE_SHIP = "大料出貨時間"
 MILESTONE_TYPE_ENTRY = "進場屋主預約"
+MILESTONE_TYPE_METER = "掛表"
 
 CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
@@ -202,18 +203,28 @@ def format_inverter(fields, name_map):
 
 def fetch_milestones_for_case_pool(case_records):
     """收集這批案件（bounded，通常幾十到一兩百筆）在「進度管理」表裡的連結 record ID，
-    分批只查『種類是大料出貨時間或進場屋主預約』的那幾筆——不用管全表其他幾千筆歷史資料。
-    回傳 (ship_map, entry_map)，key 都是案件的 record_id。"""
+    分批只查『種類是大料出貨時間、進場屋主預約、或掛表』的那幾筆——不用管全表其他幾千筆歷史資料。
+    回傳 (ship_map, entry_map, meter_map)，key 都是案件的 record_id。
+
+    「掛表日期」是寫在這裡（里程碑記錄），不是案件表（專案細節）上那個同名欄位——
+    案件表上的「掛表日期」欄位是唯讀的 lookup/rollup，直接寫入會失敗；
+    案件表原本用來篩選案件池的 {FIELD_HANG_METER_DATE}='' 條件，等這裡的里程碑
+    實際日期寫入後，Airtable 端會自動連動更新，下次 refresh_cache 案件就會自然
+    從排程池消失，不用另外處理。"""
     all_ms_ids = set()
     for r in case_records:
         all_ms_ids.update(r["fields"].get(FIELD_MS_LINK_ON_CASE) or [])
 
-    ship_map, entry_map = {}, {}
+    ship_map, entry_map, meter_map = {}, {}, {}
     if not all_ms_ids:
         print("[步驟2] 這批案件沒有任何『進度管理』連結 ID，略過", flush=True)
-        return ship_map, entry_map
+        return ship_map, entry_map, meter_map
 
-    type_formula = f"OR({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_SHIP}',{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}')"
+    type_formula = (
+        f"OR({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_SHIP}',"
+        f"{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}',"
+        f"{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_METER}')"
+    )
     ids_list = list(all_ms_ids)
     batch_size = 80  # Airtable formula/URL 長度有限，分批查
     total_batches = (len(ids_list) + batch_size - 1) // batch_size
@@ -242,8 +253,11 @@ def fetch_milestones_for_case_pool(case_records):
                     ship_map[cid] = entry
                 elif ms_type == MILESTONE_TYPE_ENTRY:
                     entry_map[cid] = entry
-    print(f"[步驟2] 全部完成，ship_map={len(ship_map)} entry_map={len(entry_map)}", flush=True)
-    return ship_map, entry_map
+                elif ms_type == MILESTONE_TYPE_METER:
+                    meter_map[cid] = entry
+    print(f"[步驟2] 全部完成，ship_map={len(ship_map)} entry_map={len(entry_map)} "
+          f"meter_map={len(meter_map)}", flush=True)
+    return ship_map, entry_map, meter_map
 
 
 def compute_case_pool():
@@ -274,7 +288,7 @@ def compute_pending_and_entry():
     純粹是前端本機自己記錄的狀態，不會回寫 Airtable，所以這份清單一律回傳
     給前端，由前端自己決定要不要繼續顯示在「案件進場安排」或移到「歷史紀錄」。"""
     case_records = compute_case_pool()
-    ship_map, entry_map = fetch_milestones_for_case_pool(case_records)
+    ship_map, entry_map, meter_map = fetch_milestones_for_case_pool(case_records)
 
     all_inverter_ids = set()
     for r in case_records:
@@ -287,6 +301,7 @@ def compute_pending_and_entry():
         f = r["fields"]
         ship_info = ship_map.get(r["id"])
         entry_info = entry_map.get(r["id"])
+        meter_info = meter_map.get(r["id"])
         module = format_module(f)
         inverter = format_inverter(f, inverter_name_map)
 
@@ -317,11 +332,12 @@ def compute_pending_and_entry():
                 "ship_date": ship_info.get("actual_date"),
             })
         else:
-            # 出貨+進場都已完成 → 已進場（前端自行決定何時標記「完工」移入歷史紀錄）
+            # 出貨+進場都已完成 → 已進場（前端自行決定何時標記「完工」/「掛表」）
             completed.append({
                 **base,
                 "ship_date": ship_info.get("actual_date"),
                 "entry_date": entry_info.get("actual_date"),
+                "meter_milestone_record_id": meter_info["milestone_record_id"] if meter_info else None,
             })
 
     return pending, entry, completed
@@ -541,24 +557,24 @@ def schedule_entry():
 
 @app.route("/api/hang-meter-date", methods=["POST"])
 def schedule_hang_meter():
-    """排定掛表日期，寫進「專案細節」（案件表）的「掛表日期」欄位——注意這是案件
-    record 本身的欄位，不是「進度管理」里程碑表的欄位，所以直接用 CASE_API_URL、
-    body 傳的是案件的 record_id（不是 milestone_record_id）。
-    寫入後，這筆案件的「掛表日期」不再是空值，下次 refresh_cache 時就會自然從
-    整個排程池（pending/entry/completed）中消失——這是既有 compute_case_pool()
-    篩選條件本來就有的行為，不用額外處理。
-    body: {record_id, hang_meter_date}"""
+    """排定掛表日期，寫進「進度管理」表「掛表」那筆的實際日期——注意這是里程碑
+    記錄（跟大料出貨時間、進場屋主預約的寫法一樣），不是案件表（專案細節）上那個
+    同名欄位（那個是唯讀的 lookup/rollup，直接寫入會失敗）。
+    寫入後，案件表上的「掛表日期」lookup 欄位會被 Airtable 自動連動更新，
+    下次 refresh_cache 時案件就會自然從整個排程池（pending/entry/completed）消失
+    ——這是既有 compute_case_pool() 篩選條件本來就有的行為，不用額外處理。
+    body: {milestone_record_id, hang_meter_date}"""
     body = request.get_json(force=True)
-    record_id = body.get("record_id")
+    milestone_record_id = body.get("milestone_record_id")
     hang_meter_date = body.get("hang_meter_date")
 
-    if not record_id or not hang_meter_date:
-        return jsonify({"error": "缺少 record_id 或 hang_meter_date"}), 400
+    if not milestone_record_id or not hang_meter_date:
+        return jsonify({"error": "缺少 milestone_record_id 或 hang_meter_date"}), 400
 
     resp = requests.patch(
-        f"{CASE_API_URL}/{record_id}",
+        f"{MILESTONE_API_URL}/{milestone_record_id}",
         headers=airtable_headers(),
-        json={"fields": {FIELD_HANG_METER_DATE: hang_meter_date}},
+        json={"fields": {FIELD_MS_ACTUAL_DATE: hang_meter_date}},
         timeout=20,
     )
     if resp.status_code >= 400:
