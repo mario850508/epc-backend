@@ -57,6 +57,9 @@ EPC 出貨／進場排程 後端 API
 import os
 import time
 import threading
+import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前先 import 一次，避免 requests 內部
+              # 的 get_netrc_auth() 在多執行緒同時第一次 import 這個模組時卡死（曾造成
+              # gunicorn worker 因 WORKER TIMEOUT 被砍掉，且完全沒有任何錯誤 log）。
 import requests
 from datetime import datetime
 from flask import Flask, jsonify, request
