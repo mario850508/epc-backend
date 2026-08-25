@@ -393,6 +393,26 @@ def refresh_cache():
                       f"這是異常情況，需要留意", flush=True)
 
 
+# ===================================================================
+# requests 套件暖機（重要！）
+# ===================================================================
+# 曾經發生過背景執行緒卡在第一次呼叫 requests.get()/patch() 就永遠不動、
+# 連我們自己設定的 timeout 都不會觸發、也不會拋出任何例外的情況（懷疑是
+# requests/urllib3 底層某些模組——例如 netrc、ssl、certifi、字元編碼判斷
+# 模組等——在多執行緒同時「第一次」import 時發生死結）。
+# 解法：在這裡、程式還是單一執行緒、背景排程跟其他執行緒都還沒啟動之前，
+# 先真的發一次 HTTPS 請求出去（就算失敗也沒關係，重點是強迫底層所有
+# 這些模組把 import 走過一輪、放進 sys.modules 快取），這樣之後不管多少
+# 執行緒同時打 requests.*，都不會再搶著做「第一次 import」而卡死。
+try:
+    print("[startup] 暖機中：預先發送一次 HTTPS 請求，避免多執行緒 import 死結…", flush=True)
+    requests.get("https://api.airtable.com/", timeout=10)
+    print("[startup] 暖機完成", flush=True)
+except Exception as e:
+    # 暖機請求失敗完全沒關係（例如網路還沒完全就緒），重點只是讓 import 跑過一輪
+    print(f"[startup] 暖機請求本身失敗（沒關係，目的已達成）：{e}", flush=True)
+
+
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
 scheduler.start()
