@@ -42,6 +42,16 @@ EPC 出貨／進場排程 後端 API
   - 前端呼叫 /api/pending-cases、/api/entry-cases 直接讀 DATA_CACHE，秒開。
   - 使用者「排定日期」寫入成功後，立刻觸發一次重新整理。
   - 伺服器剛啟動時會立刻背景跑一次。
+
+===================================================================
+2026-08-25 修改：refresh_cache 過期自動重置防呆
+===================================================================
+  - 之前發生過 refreshing 卡在 True、但完全沒有對應 log 的情況（懷疑是背景執行緒
+    被中斷但沒machine執行到 finally，或 process 被砍時機太巧）。
+  - 加上 refreshing_started_at 時間戳記：如果偵測到上一輪已經「開始」超過
+    STALE_REFRESH_SECONDS 秒還沒結束，視為異常卡死，強制放行讓新的一輪開始，
+    不再需要手動重啟服務。
+  - 同時在每一行 log 加上時間相關資訊，方便之後排查卡在哪個時間點。
 """
 
 import os
@@ -301,28 +311,55 @@ def compute_pending_and_entry():
 # 記憶體快取 + 背景排程
 # ===================================================================
 
-DATA_CACHE = {"pending": [], "entry": [], "updated_at": None, "refreshing": False, "last_error": None}
+DATA_CACHE = {
+    "pending": [],
+    "entry": [],
+    "updated_at": None,
+    "refreshing": False,
+    "refreshing_started_at": None,   # 這一輪 refresh 是什麼時候開始的（datetime）
+    "last_error": None,
+}
 _cache_lock = threading.Lock()
+
+# 如果 refreshing=True 但已經超過這個秒數還沒結束，視為異常卡死，
+# 下一次呼叫 refresh_cache() 時強制重置、重新開始，不用再手動重啟服務。
+STALE_REFRESH_SECONDS = 300  # 5 分鐘（正常一輪大約 10~30 秒內會跑完，5 分鐘已經是很寬鬆的上限）
 
 
 def refresh_cache():
+    now = datetime.now()
     with _cache_lock:
         if DATA_CACHE["refreshing"]:
-            return
+            started = DATA_CACHE.get("refreshing_started_at")
+            age = (now - started).total_seconds() if started else None
+            if age is not None and age < STALE_REFRESH_SECONDS:
+                print(f"[refresh_cache] 已有其他更新在進行中（開始於 {started.isoformat()}，"
+                      f"已過 {age:.0f} 秒），略過本次觸發", flush=True)
+                return
+            # 卡超過門檻，視為卡死，強制放行
+            print(f"[refresh_cache] 偵測到上一輪疑似卡死（開始於 "
+                  f"{started.isoformat() if started else '未知'}，已過 "
+                  f"{age:.0f} 秒，超過 {STALE_REFRESH_SECONDS} 秒門檻），強制重新開始", flush=True)
         DATA_CACHE["refreshing"] = True
-    print("[refresh_cache] 開始…", flush=True)
+        DATA_CACHE["refreshing_started_at"] = now
+
+    pid = os.getpid()
+    print(f"[refresh_cache] 開始…（pid={pid}, {now.isoformat()}）", flush=True)
     try:
         pending, entry = compute_pending_and_entry()
         DATA_CACHE["pending"] = pending
         DATA_CACHE["entry"] = entry
         DATA_CACHE["updated_at"] = datetime.now().isoformat()
         DATA_CACHE["last_error"] = None
-        print(f"[refresh_cache] 完成，pending={len(pending)} entry={len(entry)}", flush=True)
+        elapsed = (datetime.now() - now).total_seconds()
+        print(f"[refresh_cache] 完成，pending={len(pending)} entry={len(entry)}，"
+              f"耗時 {elapsed:.1f} 秒（pid={pid}）", flush=True)
     except Exception as e:
         DATA_CACHE["last_error"] = str(e)
-        print(f"[refresh_cache] 失敗：{e}", flush=True)
+        print(f"[refresh_cache] 失敗：{e}（pid={pid}）", flush=True)
     finally:
         DATA_CACHE["refreshing"] = False
+        DATA_CACHE["refreshing_started_at"] = None
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
@@ -345,6 +382,10 @@ def pending_cases():
         "cases": DATA_CACHE["pending"],
         "updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
+        "refreshing_started_at": (
+            DATA_CACHE["refreshing_started_at"].isoformat()
+            if DATA_CACHE["refreshing_started_at"] else None
+        ),
         "last_error": DATA_CACHE["last_error"],
     })
 
@@ -356,6 +397,10 @@ def entry_cases():
         "cases": DATA_CACHE["entry"],
         "updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
+        "refreshing_started_at": (
+            DATA_CACHE["refreshing_started_at"].isoformat()
+            if DATA_CACHE["refreshing_started_at"] else None
+        ),
         "last_error": DATA_CACHE["last_error"],
     })
 
@@ -419,6 +464,10 @@ def health():
         "service": "epc-backend",
         "cache_updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
+        "refreshing_started_at": (
+            DATA_CACHE["refreshing_started_at"].isoformat()
+            if DATA_CACHE["refreshing_started_at"] else None
+        ),
         "last_error": DATA_CACHE["last_error"],
         "pending_count": len(DATA_CACHE["pending"]),
         "entry_count": len(DATA_CACHE["entry"]),
