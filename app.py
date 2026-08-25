@@ -328,7 +328,11 @@ _cache_lock = threading.Lock()
 
 # 如果 refreshing=True 但已經超過這個秒數還沒結束，視為異常卡死，
 # 下一次呼叫 refresh_cache() 時強制重置、重新開始，不用再手動重啟服務。
-STALE_REFRESH_SECONDS = 300  # 5 分鐘（正常一輪大約 10~30 秒內會跑完，5 分鐘已經是很寬鬆的上限）
+# 2026-08-25：正常一輪大約 10~30 秒會跑完，實測發現偶爾會出現不同 worker
+# process 之間狀態不同步的情況（懷疑跟 Render 平台的 worker 生命週期/健康檢查機制有關，
+# 不是單純的程式邏輯問題），因此把門檻從 5 分鐘縮短到 1 分鐘，讓系統能更快自動恢復，
+# 把使用者最長等待時間壓在可接受範圍內。
+STALE_REFRESH_SECONDS = 60
 
 
 def refresh_cache():
