@@ -56,6 +56,7 @@ EPC 出貨／進場排程 後端 API
 
 import os
 import time
+import uuid
 import threading
 import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前先 import 一次，避免 requests 內部
               # 的 get_netrc_auth() 在多執行緒同時第一次 import 這個模組時卡死（曾造成
@@ -320,6 +321,7 @@ DATA_CACHE = {
     "updated_at": None,
     "refreshing": False,
     "refreshing_started_at": None,   # 這一輪 refresh 是什麼時候開始的（datetime）
+    "refreshing_run_id": None,       # 這一輪 refresh 的獨立編號，方便對照 log 追蹤
     "last_error": None,
 }
 _cache_lock = threading.Lock()
@@ -330,24 +332,29 @@ STALE_REFRESH_SECONDS = 300  # 5 分鐘（正常一輪大約 10~30 秒內會跑�
 
 
 def refresh_cache():
+    run_id = uuid.uuid4().hex[:8]  # 每一輪獨立編號，方便從 log 精準追蹤同一輪的開始/完成/重置
+    pid = os.getpid()
+    tid = threading.get_ident()
     now = datetime.now()
+    tag = f"[refresh_cache #{run_id} pid={pid} tid={tid}]"
+
     with _cache_lock:
         if DATA_CACHE["refreshing"]:
             started = DATA_CACHE.get("refreshing_started_at")
+            owner = DATA_CACHE.get("refreshing_run_id")
             age = (now - started).total_seconds() if started else None
             if age is not None and age < STALE_REFRESH_SECONDS:
-                print(f"[refresh_cache] 已有其他更新在進行中（開始於 {started.isoformat()}，"
-                      f"已過 {age:.0f} 秒），略過本次觸發", flush=True)
+                print(f"{tag} 已有其他更新在進行中（run_id={owner}，開始於 "
+                      f"{started.isoformat()}，已過 {age:.0f} 秒），略過本次觸發", flush=True)
                 return
-            # 卡超過門檻，視為卡死，強制放行
-            print(f"[refresh_cache] 偵測到上一輪疑似卡死（開始於 "
+            print(f"{tag} 偵測到上一輪（run_id={owner}）疑似卡死（開始於 "
                   f"{started.isoformat() if started else '未知'}，已過 "
                   f"{age:.0f} 秒，超過 {STALE_REFRESH_SECONDS} 秒門檻），強制重新開始", flush=True)
         DATA_CACHE["refreshing"] = True
         DATA_CACHE["refreshing_started_at"] = now
+        DATA_CACHE["refreshing_run_id"] = run_id
 
-    pid = os.getpid()
-    print(f"[refresh_cache] 開始…（pid={pid}, {now.isoformat()}）", flush=True)
+    print(f"{tag} 開始…（{now.isoformat()}）", flush=True)
     try:
         pending, entry = compute_pending_and_entry()
         DATA_CACHE["pending"] = pending
@@ -355,14 +362,24 @@ def refresh_cache():
         DATA_CACHE["updated_at"] = datetime.now().isoformat()
         DATA_CACHE["last_error"] = None
         elapsed = (datetime.now() - now).total_seconds()
-        print(f"[refresh_cache] 完成，pending={len(pending)} entry={len(entry)}，"
-              f"耗時 {elapsed:.1f} 秒（pid={pid}）", flush=True)
+        print(f"{tag} 完成，pending={len(pending)} entry={len(entry)}，"
+              f"耗時 {elapsed:.1f} 秒", flush=True)
     except Exception as e:
         DATA_CACHE["last_error"] = str(e)
-        print(f"[refresh_cache] 失敗：{e}（pid={pid}）", flush=True)
+        print(f"{tag} 失敗：{e}", flush=True)
     finally:
-        DATA_CACHE["refreshing"] = False
-        DATA_CACHE["refreshing_started_at"] = None
+        with _cache_lock:
+            # 只有「這一輪自己」才可以清除 refreshing 狀態，避免萬一之後有更複雜的併發情境時，
+            # 不小心清掉別輪剛設定好的狀態（目前設計下理論上不會發生，但這樣寫更保險）。
+            if DATA_CACHE.get("refreshing_run_id") == run_id:
+                DATA_CACHE["refreshing"] = False
+                DATA_CACHE["refreshing_started_at"] = None
+                DATA_CACHE["refreshing_run_id"] = None
+                print(f"{tag} 已重置 refreshing=False", flush=True)
+            else:
+                print(f"{tag} 結束，但目前 refreshing_run_id 已經是 "
+                      f"{DATA_CACHE.get('refreshing_run_id')}（不是自己），不重置，"
+                      f"這是異常情況，需要留意", flush=True)
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
@@ -389,6 +406,7 @@ def pending_cases():
             DATA_CACHE["refreshing_started_at"].isoformat()
             if DATA_CACHE["refreshing_started_at"] else None
         ),
+        "refreshing_run_id": DATA_CACHE.get("refreshing_run_id"),
         "last_error": DATA_CACHE["last_error"],
     })
 
@@ -404,6 +422,7 @@ def entry_cases():
             DATA_CACHE["refreshing_started_at"].isoformat()
             if DATA_CACHE["refreshing_started_at"] else None
         ),
+        "refreshing_run_id": DATA_CACHE.get("refreshing_run_id"),
         "last_error": DATA_CACHE["last_error"],
     })
 
@@ -465,12 +484,14 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "epc-backend",
+        "pid": os.getpid(),
         "cache_updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
         "refreshing_started_at": (
             DATA_CACHE["refreshing_started_at"].isoformat()
             if DATA_CACHE["refreshing_started_at"] else None
         ),
+        "refreshing_run_id": DATA_CACHE.get("refreshing_run_id"),
         "last_error": DATA_CACHE["last_error"],
         "pending_count": len(DATA_CACHE["pending"]),
         "entry_count": len(DATA_CACHE["entry"]),
