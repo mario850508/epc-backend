@@ -154,7 +154,11 @@ def format_module(fields):
         return None
     qty = fields.get(FIELD_MODULE_QTY)
     if isinstance(qty, (int, float)):
-        qty = int(qty) if float(qty).is_integer() else qty
+        # Airtable 這個欄位背後常常是公式/rollup 算出來的，可能回傳像 25.999999999999996
+        # 這種浮點數誤差值，不會完全等於整數，因此不能只用 is_integer() 判斷；
+        # 改成「跟最接近的整數相差在極小誤差內」就視為整數。
+        rounded = round(qty)
+        qty = rounded if abs(qty - rounded) < 1e-6 else qty
         return f"{model} ×{qty}"
     return model
 
@@ -189,6 +193,9 @@ def format_inverter(fields, name_map):
     for i, rid in enumerate(ids):
         name = name_map.get(rid, rid)
         q = qtys[i] if i < len(qtys) else None
+        if isinstance(q, (int, float)):
+            rounded = round(q)
+            q = rounded if abs(q - rounded) < 1e-6 else q
         parts.append(f"{name} ×{q}" if q is not None else name)
     return "、".join(parts)
 
