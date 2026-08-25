@@ -269,7 +269,10 @@ def compute_case_pool():
 
 
 def compute_pending_and_entry():
-    """一次算出「待安排出貨案件」跟「案件進場安排」兩份清單。"""
+    """一次算出「待安排出貨案件」「案件進場安排」「已進場」三份清單。
+    「已進場」是模組出貨+進場日期都已填寫的案件；是否要在前端標記為「完工」
+    純粹是前端本機自己記錄的狀態，不會回寫 Airtable，所以這份清單一律回傳
+    給前端，由前端自己決定要不要繼續顯示在「案件進場安排」或移到「歷史紀錄」。"""
     case_records = compute_case_pool()
     ship_map, entry_map = fetch_milestones_for_case_pool(case_records)
 
@@ -279,7 +282,7 @@ def compute_pending_and_entry():
     inverter_name_map = resolve_inverter_names(all_inverter_ids)
     print("[步驟4] 開始整理清單…", flush=True)
 
-    pending, entry = [], []
+    pending, entry, completed = [], [], []
     for r in case_records:
         f = r["fields"]
         ship_info = ship_map.get(r["id"])
@@ -313,9 +316,15 @@ def compute_pending_and_entry():
                 "entry_milestone_record_id": entry_info["milestone_record_id"] if entry_info else None,
                 "ship_date": ship_info.get("actual_date"),
             })
-        # else：已進場，兩份清單都不列（之後排程日曆功能會用到）
+        else:
+            # 出貨+進場都已完成 → 已進場（前端自行決定何時標記「完工」移入歷史紀錄）
+            completed.append({
+                **base,
+                "ship_date": ship_info.get("actual_date"),
+                "entry_date": entry_info.get("actual_date"),
+            })
 
-    return pending, entry
+    return pending, entry, completed
 
 
 # ===================================================================
@@ -325,6 +334,7 @@ def compute_pending_and_entry():
 DATA_CACHE = {
     "pending": [],
     "entry": [],
+    "completed": [],  # 出貨+進場都已完成，前端自行決定是否標記「完工」移入歷史紀錄
     "updated_at": None,
     "refreshing": False,
     "refreshing_started_at": None,   # 這一輪 refresh 是什麼時候開始的（datetime）
@@ -367,13 +377,14 @@ def refresh_cache():
 
     print(f"{tag} 開始…（{now.isoformat()}）", flush=True)
     try:
-        pending, entry = compute_pending_and_entry()
+        pending, entry, completed = compute_pending_and_entry()
         DATA_CACHE["pending"] = pending
         DATA_CACHE["entry"] = entry
+        DATA_CACHE["completed"] = completed
         DATA_CACHE["updated_at"] = datetime.now().isoformat()
         DATA_CACHE["last_error"] = None
         elapsed = (datetime.now() - now).total_seconds()
-        print(f"{tag} 完成，pending={len(pending)} entry={len(entry)}，"
+        print(f"{tag} 完成，pending={len(pending)} entry={len(entry)} completed={len(completed)}，"
               f"耗時 {elapsed:.1f} 秒", flush=True)
     except Exception as e:
         DATA_CACHE["last_error"] = str(e)
@@ -458,6 +469,24 @@ def entry_cases():
     })
 
 
+@app.route("/api/completed-cases")
+def completed_cases():
+    """出貨+進場都已完成的案件；是否標記「完工」移入歷史紀錄純粹是前端本機
+    自己的狀態，這裡一律回傳全部已進場案件，由前端自行過濾顯示。"""
+    return jsonify({
+        "count": len(DATA_CACHE["completed"]),
+        "cases": DATA_CACHE["completed"],
+        "updated_at": DATA_CACHE["updated_at"],
+        "refreshing": DATA_CACHE["refreshing"],
+        "refreshing_started_at": (
+            DATA_CACHE["refreshing_started_at"].isoformat()
+            if DATA_CACHE["refreshing_started_at"] else None
+        ),
+        "refreshing_run_id": DATA_CACHE.get("refreshing_run_id"),
+        "last_error": DATA_CACHE["last_error"],
+    })
+
+
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
     threading.Thread(target=refresh_cache, daemon=True).start()
@@ -526,6 +555,7 @@ def health():
         "last_error": DATA_CACHE["last_error"],
         "pending_count": len(DATA_CACHE["pending"]),
         "entry_count": len(DATA_CACHE["entry"]),
+        "completed_count": len(DATA_CACHE["completed"]),
     })
 
 
