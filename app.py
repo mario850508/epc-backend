@@ -114,6 +114,14 @@ CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
 INVERTER_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
 
+# ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
+# 這張表是 2026-08-25 新增的，用來存放「已完工」「掛表安排」「異常案件」「變流器出貨日期」
+# 「註記清單」這幾個原本只存在瀏覽器本機的狀態，改成寫回 Airtable，讓不同電腦、不同同事
+# 都能看到同一份資料。這張表用「欄位名稱」而不是欄位 ID 存取（跟其他表不同），單純是因為
+# 這張表是全新建立的，直接用名稱比較好維護，不用另外去 Airtable 查每個欄位的 ID。
+APP_DATA_TABLE_ID = "tblafnN1qFDoLgTx1"
+APP_DATA_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{APP_DATA_TABLE_ID}"
+
 
 def airtable_headers():
     return {
@@ -147,6 +155,110 @@ def airtable_get_all(api_url, filter_formula, fields):
         if not offset or page >= max_pages:
             break
     return records
+
+
+# ===================================================================
+# APP資料表 輔助函式（用欄位名稱，不是欄位 ID）
+# ===================================================================
+
+def app_data_get_all(filter_formula=None):
+    records = []
+    params = {"pageSize": 100}
+    if filter_formula:
+        params["filterByFormula"] = filter_formula
+    offset = None
+    while True:
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(APP_DATA_API_URL, headers=airtable_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        records.extend(data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            break
+    return records
+
+
+def app_data_find_case_row(case_record_id):
+    """找這個案件在 APP資料 表裡「類型=案件狀態」的那一列（如果有的話）。"""
+    escaped = case_record_id.replace("'", "\\'")
+    formula = f"AND({{案件RecordID}}='{escaped}',{{類型}}='案件狀態')"
+    recs = app_data_get_all(formula)
+    return recs[0] if recs else None
+
+
+def app_data_create(fields):
+    resp = requests.post(APP_DATA_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def app_data_update(record_id, fields):
+    resp = requests.patch(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(),
+                           json={"fields": fields}, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def app_data_delete(record_id):
+    resp = requests.delete(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_case_snapshot_for_archive(case_record_id):
+    """針對已經離開排程池的案件（掛表已確認完成），直接用 record_id 查案件本身跟相關里程碑，
+    補齊「歷史紀錄」要顯示的資料。查不到就回傳 None（可能案件被刪除，或 record_id 有誤）。"""
+    try:
+        resp = requests.get(f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(), timeout=15)
+        if resp.status_code >= 400:
+            return None
+        f = resp.json().get("fields", {})
+    except Exception:
+        return None
+
+    module = format_module(f)
+    inverter_ids = f.get(FIELD_INVERTER) or []
+    inverter_name_map = resolve_inverter_names(inverter_ids)
+    inverter = format_inverter(f, inverter_name_map)
+
+    ms_ids = f.get(FIELD_MS_LINK_ON_CASE) or []
+    ship_date = entry_date = meter_date = None
+    if ms_ids:
+        id_formula = "OR(" + ",".join(f"RECORD_ID()='{mid}'" for mid in ms_ids) + ")"
+        type_formula = (
+            f"OR({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_SHIP}',"
+            f"{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}',"
+            f"{{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_METER}')"
+        )
+        formula = f"AND({id_formula},{type_formula})"
+        records = airtable_get_all(
+            MILESTONE_API_URL, formula,
+            [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE],
+        )
+        for r in records:
+            mf = r["fields"]
+            mtype = mf.get(FIELD_MS_TYPE)
+            date = mf.get(FIELD_MS_ACTUAL_DATE)
+            if mtype == MILESTONE_TYPE_SHIP:
+                ship_date = date
+            elif mtype == MILESTONE_TYPE_ENTRY:
+                entry_date = date
+            elif mtype == MILESTONE_TYPE_METER:
+                meter_date = date
+
+    return {
+        "case": f.get(FIELD_CASE_NO, ""),
+        "alias": f.get(FIELD_ALIAS, ""),
+        "vendor": f.get(FIELD_VENDOR, ""),
+        "address": f.get(FIELD_ADDRESS, ""),
+        "module": module,
+        "inverter": inverter,
+        "ship_date": ship_date,
+        "entry_date": entry_date,
+        "meter_date": meter_date,
+    }
 
 
 def format_module(fields):
@@ -563,8 +675,11 @@ def schedule_hang_meter():
     寫入後，案件表上的「掛表日期」lookup 欄位會被 Airtable 自動連動更新，
     下次 refresh_cache 時案件就會自然從整個排程池（pending/entry/completed）消失
     ——這是既有 compute_case_pool() 篩選條件本來就有的行為，不用額外處理。
-    body: {milestone_record_id, hang_meter_date}"""
+    同時，如果有帶 case_record_id，會一併把 APP資料 表裡這筆案件狀態標記為
+    「掛表日期已確認」，讓前端知道要把這筆案件移入歷史紀錄。
+    body: {case_record_id, milestone_record_id, hang_meter_date}"""
     body = request.get_json(force=True)
+    case_record_id = body.get("case_record_id")
     milestone_record_id = body.get("milestone_record_id")
     hang_meter_date = body.get("hang_meter_date")
 
@@ -579,8 +694,155 @@ def schedule_hang_meter():
     )
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+
+    if case_record_id:
+        try:
+            existing = app_data_find_case_row(case_record_id)
+            if existing:
+                app_data_update(existing["id"], {"掛表日期已確認": True})
+        except Exception as e:
+            print(f"[schedule_hang_meter] 更新 APP資料 掛表確認狀態失敗（不影響主要寫入）：{e}", flush=True)
+
     threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
+
+
+# ===================================================================
+# APP資料 相關 API（已完工／掛表安排／異常案件／變流器日期／註記清單，跨裝置共用）
+# ===================================================================
+
+@app.route("/api/app-data")
+def get_app_data():
+    """回傳 APP資料 表所有列，前端用來重建已完工/掛表安排/異常案件/變流器日期/註記清單
+    這幾個原本存在本機瀏覽器的狀態。對於「掛表日期已確認」的案件（已經離開排程池，
+    查不到即時資料了），額外去 Airtable 抓一次案件本身跟里程碑的完整資料，
+    補齊歷史紀錄要顯示的欄位。"""
+    try:
+        rows = app_data_get_all()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    case_status = []
+    notes = []
+    for r in rows:
+        f = r["fields"]
+        t = f.get("類型")
+        if t == "案件狀態":
+            case_status.append({
+                "app_record_id": r["id"],
+                "case_record_id": f.get("案件RecordID"),
+                "case_no": f.get("案號"),
+                "completed_date": f.get("完工日期"),
+                "meter_planned_date": f.get("預計掛表日期"),
+                "meter_confirmed": bool(f.get("掛表日期已確認")),
+                "issue_note": f.get("異常狀況"),
+                "issue_date": f.get("異常記錄日期"),
+                "inverter_ship_date": f.get("變流器出貨日期"),
+            })
+        elif t in ("併聯取得時備貨", "其他狀況備住"):
+            notes.append({
+                "app_record_id": r["id"],
+                "type": t,
+                "case_text": f.get("案號或別名"),
+                "content": f.get("內容"),
+                "date": f.get("記錄日期"),
+            })
+
+    archived = []
+    for cs in case_status:
+        if not cs["meter_confirmed"] or not cs["case_record_id"]:
+            continue
+        snap = fetch_case_snapshot_for_archive(cs["case_record_id"])
+        if snap:
+            archived.append({**cs, **snap})
+
+    return jsonify({"case_status": case_status, "notes": notes, "archived": archived})
+
+
+@app.route("/api/app-data/case-status", methods=["POST"])
+def upsert_case_status():
+    """新增或更新一筆「案件狀態」列（已完工/掛表安排/異常案件/變流器日期共用同一列）。
+    body: {case_record_id, case_no, fields: {...僅放要更新的欄位...}}
+    fields 可包含：completed_date, meter_planned_date, meter_confirmed,
+    issue_note, issue_date, inverter_ship_date（value 給 None 代表清空該欄位）"""
+    body = request.get_json(force=True)
+    case_record_id = body.get("case_record_id")
+    case_no = body.get("case_no", "")
+    patch = body.get("fields", {}) or {}
+    if not case_record_id:
+        return jsonify({"error": "缺少 case_record_id"}), 400
+
+    field_map = {
+        "completed_date": "完工日期",
+        "meter_planned_date": "預計掛表日期",
+        "meter_confirmed": "掛表日期已確認",
+        "issue_note": "異常狀況",
+        "issue_date": "異常記錄日期",
+        "inverter_ship_date": "變流器出貨日期",
+    }
+    airtable_fields = {field_map[k]: v for k, v in patch.items() if k in field_map}
+
+    try:
+        existing = app_data_find_case_row(case_record_id)
+        if existing:
+            result = app_data_update(existing["id"], airtable_fields)
+        else:
+            create_fields = {"類型": "案件狀態", "案件RecordID": case_record_id, "案號": case_no, **airtable_fields}
+            result = app_data_create(create_fields)
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "record": result})
+
+
+@app.route("/api/app-data/case-status/clear", methods=["POST"])
+def clear_case_status():
+    """整筆刪除某案件在 APP資料 表裡的「案件狀態」列（用於「移回案件進場安排」）。
+    body: {case_record_id}"""
+    body = request.get_json(force=True)
+    case_record_id = body.get("case_record_id")
+    if not case_record_id:
+        return jsonify({"error": "缺少 case_record_id"}), 400
+    try:
+        existing = app_data_find_case_row(case_record_id)
+        if existing:
+            app_data_delete(existing["id"])
+    except Exception as e:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/app-data/note", methods=["POST"])
+def create_note():
+    """新增一筆註記清單項目（併聯取得時備貨／其他狀況備住）。
+    body: {type, case_text, content}"""
+    body = request.get_json(force=True)
+    note_type = body.get("type")
+    case_text = (body.get("case_text") or "").strip()
+    content = (body.get("content") or "").strip()
+    if note_type not in ("併聯取得時備貨", "其他狀況備住"):
+        return jsonify({"error": "type 必須是 併聯取得時備貨 或 其他狀況備住"}), 400
+    if not case_text or not content:
+        return jsonify({"error": "缺少 case_text 或 content"}), 400
+    try:
+        result = app_data_create({
+            "類型": note_type,
+            "案號或別名": case_text,
+            "內容": content,
+            "記錄日期": datetime.now().strftime("%Y-%m-%d"),
+        })
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "record": result})
+
+
+@app.route("/api/app-data/<record_id>", methods=["DELETE"])
+def delete_app_data_row(record_id):
+    """刪除 APP資料 表裡的任一列（刪除註記清單項目用）。"""
+    try:
+        app_data_delete(record_id)
+    except Exception as e:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/")
