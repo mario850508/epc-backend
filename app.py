@@ -80,6 +80,17 @@ EPC 出貨／進場排程 後端 API
     目前只有「未使用料件」會帶這個值，用來記錄該料件原本是哪天出貨的。
   - 新增 PATCH /api/app-data/note/<record_id>，讓前端可以修改既有註記的內容
     （用於「未使用料件」被部分使用後更新剩餘數量說明，不用整筆刪除重建）。
+
+===================================================================
+2026-08-27 修改（四）：里程碑記錄缺失時自動新增
+===================================================================
+  - 發現有些案件（通常是舊案件、或人工建立時漏掉）在「進度管理」表裡缺少
+    「大料出貨時間」「進場屋主預約」或「掛表」這幾筆里程碑記錄，導致前端完全
+    無法排定日期（因為沒有 milestone_record_id 可以寫入）。
+  - 新增 ensure_milestone_record()：/api/schedule、/api/entry-date、
+    /api/hang-meter-date 這三支 API 現在都接受 milestone_record_id 留空，
+    只要有帶 case_record_id，缺記錄時就會自動在「進度管理」表新增一筆對應種類
+    的記錄並連結回案件，再繼續寫入日期，使用者不會再卡住。
 """
 
 import os
@@ -238,6 +249,22 @@ def app_data_delete(record_id):
     resp = requests.delete(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
     resp.raise_for_status()
     return resp.json()
+
+
+def ensure_milestone_record(case_record_id, milestone_type):
+    """如果案件在「進度管理」表裡缺少指定種類的里程碑記錄（例如舊案件建立時
+    範本還沒有這個種類、或人工建立時漏掉了），就自動新增一筆，種類設為
+    milestone_type，並連結回這個案件。Airtable 的雙向連結欄位會自動把這筆
+    新記錄同步反向連結回案件表的「進度管理」欄位，不需要另外更新案件表。
+    回傳新記錄的 record_id；失敗會拋出例外，由呼叫端處理。"""
+    resp = requests.post(
+        MILESTONE_API_URL,
+        headers=airtable_headers(),
+        json={"fields": {FIELD_MS_TYPE: milestone_type, FIELD_MS_CASE_LINK: [case_record_id]}},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
 
 
 def fetch_case_snapshot_for_archive(case_record_id):
@@ -657,13 +684,26 @@ def manual_refresh():
 @app.route("/api/schedule", methods=["POST"])
 def schedule_shipment():
     """排定（或重新排定）出貨時間，寫進「進度管理」表「大料出貨時間」那筆的實際日期。
-    body: {milestone_record_id, ship_date}"""
+    body: {milestone_record_id, case_record_id, ship_date}
+    milestone_record_id 可以留空——如果案件在 Airtable「進度管理」表裡缺少這筆
+    「大料出貨時間」里程碑記錄（例如舊案件建立時模板漏掉了），會自動幫這個案件
+    新增一筆再寫入，但這種情況下就必須帶 case_record_id 才能知道要連結到哪個案件。"""
     body = request.get_json(force=True)
     milestone_record_id = body.get("milestone_record_id")
+    case_record_id = body.get("case_record_id")
     ship_date = body.get("ship_date")
 
-    if not milestone_record_id or not ship_date:
-        return jsonify({"error": "缺少 milestone_record_id 或 ship_date"}), 400
+    if not ship_date:
+        return jsonify({"error": "缺少 ship_date"}), 400
+    if not milestone_record_id:
+        if not case_record_id:
+            return jsonify({"error": "缺少 milestone_record_id 或 case_record_id"}), 400
+        try:
+            milestone_record_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_SHIP)
+            print(f"[schedule_shipment] 案件 {case_record_id} 缺少「大料出貨時間」里程碑，"
+                  f"已自動新增：{milestone_record_id}", flush=True)
+        except Exception as e:
+            return jsonify({"error": "自動新增「大料出貨時間」里程碑記錄失敗", "detail": str(e)}), 502
 
     resp = requests.patch(
         f"{MILESTONE_API_URL}/{milestone_record_id}",
@@ -680,13 +720,24 @@ def schedule_shipment():
 @app.route("/api/entry-date", methods=["POST"])
 def schedule_entry():
     """排定進場日期，寫進「進度管理」表「進場屋主預約」那筆的實際日期。
-    body: {milestone_record_id, entry_date}"""
+    body: {milestone_record_id, case_record_id, entry_date}
+    milestone_record_id 留空時，邏輯同 /api/schedule：自動新增缺少的里程碑記錄。"""
     body = request.get_json(force=True)
     milestone_record_id = body.get("milestone_record_id")
+    case_record_id = body.get("case_record_id")
     entry_date = body.get("entry_date")
 
-    if not milestone_record_id or not entry_date:
-        return jsonify({"error": "缺少 milestone_record_id 或 entry_date"}), 400
+    if not entry_date:
+        return jsonify({"error": "缺少 entry_date"}), 400
+    if not milestone_record_id:
+        if not case_record_id:
+            return jsonify({"error": "缺少 milestone_record_id 或 case_record_id"}), 400
+        try:
+            milestone_record_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_ENTRY)
+            print(f"[schedule_entry] 案件 {case_record_id} 缺少「進場屋主預約」里程碑，"
+                  f"已自動新增：{milestone_record_id}", flush=True)
+        except Exception as e:
+            return jsonify({"error": "自動新增「進場屋主預約」里程碑記錄失敗", "detail": str(e)}), 502
 
     resp = requests.patch(
         f"{MILESTONE_API_URL}/{milestone_record_id}",
@@ -710,14 +761,25 @@ def schedule_hang_meter():
     ——這是既有 compute_case_pool() 篩選條件本來就有的行為，不用額外處理。
     同時，如果有帶 case_record_id，會一併把 APP資料 表裡這筆案件狀態標記為
     「掛表日期已確認」，讓前端知道要把這筆案件移入歷史紀錄。
-    body: {case_record_id, milestone_record_id, hang_meter_date}"""
+    body: {case_record_id, milestone_record_id, hang_meter_date}
+    milestone_record_id 留空時，邏輯同 /api/schedule：自動新增缺少的里程碑記錄
+    （這種情況下 case_record_id 是必填，本來就必填，不受影響）。"""
     body = request.get_json(force=True)
     case_record_id = body.get("case_record_id")
     milestone_record_id = body.get("milestone_record_id")
     hang_meter_date = body.get("hang_meter_date")
 
-    if not milestone_record_id or not hang_meter_date:
-        return jsonify({"error": "缺少 milestone_record_id 或 hang_meter_date"}), 400
+    if not hang_meter_date:
+        return jsonify({"error": "缺少 hang_meter_date"}), 400
+    if not milestone_record_id:
+        if not case_record_id:
+            return jsonify({"error": "缺少 milestone_record_id 或 case_record_id"}), 400
+        try:
+            milestone_record_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_METER)
+            print(f"[schedule_hang_meter] 案件 {case_record_id} 缺少「掛表」里程碑，"
+                  f"已自動新增：{milestone_record_id}", flush=True)
+        except Exception as e:
+            return jsonify({"error": "自動新增「掛表」里程碑記錄失敗", "detail": str(e)}), 502
 
     resp = requests.patch(
         f"{MILESTONE_API_URL}/{milestone_record_id}",
