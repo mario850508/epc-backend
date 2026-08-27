@@ -112,7 +112,7 @@ FIELD_CLOSE_STATUS = "fldrnWIhxkZzJ7Got"
 FIELD_HANG_METER_DATE = "fldNS6vTbnDtmQG0X"
 FIELD_MS_LINK_ON_CASE = "fldEs9vLzY416tTHo"  # 「進度管理」連結欄位（在專案細節表上）
 
-VENDOR_NAMES = ["三創", "尚展", "曙光"]
+VENDOR_NAMES = ["三創", "尚展", "曙光", "光鼎"]
 
 # ---- 採購-逆變器 ----
 INVERTER_TABLE_ID = "tbl7l7OM63jo3pxDN"
