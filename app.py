@@ -71,6 +71,15 @@ EPC 出貨／進場排程 後端 API
     看起來寫入成功，重新整理後又消失」的假象。這裡把 field_map 跟
     get_app_data() 的讀取端都補齊，兩邊要同時改，道理跟上面「未使用料件」
     那次一樣。
+
+===================================================================
+2026-08-27 修改（三）：未使用料件加上出貨日期 + 新增「料件使用」清單
+===================================================================
+  - 註記清單新增「料件使用」類型，記錄「哪筆未使用料件被挪去哪個案場用掉了」。
+  - create_note() 新增可選的 ship_date 欄位（寫入 Airtable「出貨日期」欄），
+    目前只有「未使用料件」會帶這個值，用來記錄該料件原本是哪天出貨的。
+  - 新增 PATCH /api/app-data/note/<record_id>，讓前端可以修改既有註記的內容
+    （用於「未使用料件」被部分使用後更新剩餘數量說明，不用整筆刪除重建）。
 """
 
 import os
@@ -144,7 +153,7 @@ APP_DATA_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{APP_DATA_TABLE_ID}"
 # 註記清單允許的「類型」。2026-08-27 新增「未使用料件」——
 # create_note() 的驗證跟 get_app_data() 組裝 notes 的判斷都要用這份同一份清單，
 # 避免兩邊各自寫一次、改一邊忘了改另一邊。
-NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件")
+NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件", "料件使用")
 
 
 def airtable_headers():
@@ -777,6 +786,7 @@ def get_app_data():
                 "case_text": f.get("案號或別名"),
                 "content": f.get("內容"),
                 "date": f.get("記錄日期"),
+                "ship_date": f.get("出貨日期"),
             })
 
     archived = []
@@ -851,23 +861,28 @@ def clear_case_status():
 
 @app.route("/api/app-data/note", methods=["POST"])
 def create_note():
-    """新增一筆註記清單項目（併聯取得時備貨／其他狀況備住／未使用料件）。
-    body: {type, case_text, content}"""
+    """新增一筆註記清單項目（併聯取得時備貨／其他狀況備住／未使用料件／料件使用）。
+    body: {type, case_text, content, ship_date}
+    ship_date 是選填欄位，目前只有「未使用料件」會用到（記錄這批料件原本的出貨日期）。"""
     body = request.get_json(force=True)
     note_type = body.get("type")
     case_text = (body.get("case_text") or "").strip()
     content = (body.get("content") or "").strip()
+    ship_date = (body.get("ship_date") or "").strip()
     if note_type not in NOTE_TYPES:
         return jsonify({"error": f"type 必須是以下其中之一：{'、'.join(NOTE_TYPES)}"}), 400
     if not case_text or not content:
         return jsonify({"error": "缺少 case_text 或 content"}), 400
     try:
-        result = app_data_create({
+        fields = {
             "類型": note_type,
             "案號或別名": case_text,
             "內容": content,
             "記錄日期": datetime.now().strftime("%Y-%m-%d"),
-        })
+        }
+        if ship_date:
+            fields["出貨日期"] = ship_date
+        result = app_data_create(fields)
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
     return jsonify({"ok": True, "record": result})
@@ -881,6 +896,21 @@ def delete_app_data_row(record_id):
     except Exception as e:
         return jsonify({"error": "Airtable 刪除失敗", "detail": str(e)}), 502
     return jsonify({"ok": True})
+
+
+@app.route("/api/app-data/note/<record_id>", methods=["PATCH"])
+def update_note(record_id):
+    """修改一筆註記清單項目的內容（例如「未使用料件」被部分使用後，更新剩餘數量說明）。
+    body: {content}"""
+    body = request.get_json(force=True)
+    content = (body.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "缺少 content"}), 400
+    try:
+        result = app_data_update(record_id, {"內容": content})
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "record": result})
 
 
 @app.route("/")
