@@ -91,6 +91,24 @@ EPC 出貨／進場排程 後端 API
     /api/hang-meter-date 這三支 API 現在都接受 milestone_record_id 留空，
     只要有帶 case_record_id，缺記錄時就會自動在「進度管理」表新增一筆對應種類
     的記錄並連結回案件，再繼續寫入日期，使用者不會再卡住。
+
+===================================================================
+2026-08-27 修改（五）：異常案件新增「待取得函文再進場」
+===================================================================
+  - 「異常案件」現在可以額外標記案件是卡在等某份函文（免雜／細部協商／
+    台電購售契約）才能進場，存在 APP資料 表的「等待函文種類」欄位
+    （waiting_doc_type）。
+  - 新增 /api/milestone-status：即時查詢單一案件、單一種類里程碑在 Airtable
+    「進度管理」表的完成狀態（不用等整批快取），前端在異常案件列表用這支 API
+    顯示函文目前實際進度，讓使用者不用自己回 Airtable 對照。
+
+===================================================================
+2026-08-27 修改（六）：函文取得後自動排除異常 + 觸發依據改用函文日期
+===================================================================
+  - 新增「等待函文取得日期」欄位（waiting_doc_date）。前端偵測到函文已取得時，
+    會自動清空 issue_note/issue_date（等同「已排除異常」），並把取得日期存進
+    waiting_doc_date，但保留 waiting_doc_type，讓案件回到「待安排出貨&植筋」
+    清單時，「觸發依據」欄位可以顯示這份函文的日期，而不是原本的同意備案日期。
 """
 
 import os
@@ -148,6 +166,11 @@ FIELD_MS_EST_DATE = "fldA9MK2ATP7GrLJC"
 MILESTONE_TYPE_SHIP = "大料出貨時間"
 MILESTONE_TYPE_ENTRY = "進場屋主預約"
 MILESTONE_TYPE_METER = "掛表"
+
+# 「異常案件」裡「待取得函文再進場」功能可選的函文種類，對應「進度管理」表裡
+# 實際存在的里程碑「種類」名稱。如果 Airtable 那邊的實際命名跟這裡不同
+# （尤其「台電契約」，Airtable 裡可能叫「台電購售契約」），要一併修改這裡。
+DOCUMENT_MILESTONE_TYPES = ["免雜", "細部協商", "台電購售契約"]
 
 CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
@@ -802,6 +825,38 @@ def schedule_hang_meter():
     return jsonify({"ok": True, "record": resp.json()})
 
 
+@app.route("/api/milestone-status")
+def milestone_status():
+    """查詢單一案件、單一種類里程碑目前在 Airtable「進度管理」表的完成狀態
+    （有沒有實際日期）。用於「異常案件」裡「待取得函文再進場」這個功能，
+    即時反映 Airtable 最新進度，不用等整批快取更新，因為只有少數案件會用到，
+    不需要跟 pending/entry/completed 那樣整批處理。
+    query params: case_record_id, type（type 必須是 DOCUMENT_MILESTONE_TYPES 其中之一）"""
+    case_record_id = request.args.get("case_record_id")
+    milestone_type = request.args.get("type")
+    if not case_record_id or not milestone_type:
+        return jsonify({"error": "缺少 case_record_id 或 type"}), 400
+    if milestone_type not in DOCUMENT_MILESTONE_TYPES:
+        return jsonify({"error": f"type 必須是以下其中之一：{'、'.join(DOCUMENT_MILESTONE_TYPES)}"}), 400
+    try:
+        resp = requests.get(f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(), timeout=15)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 找不到這筆案件"}), 404
+        f = resp.json().get("fields", {})
+        ms_ids = f.get(FIELD_MS_LINK_ON_CASE) or []
+        if not ms_ids:
+            return jsonify({"completed": False, "actual_date": None, "found_milestone": False})
+        id_formula = "OR(" + ",".join(f"RECORD_ID()='{mid}'" for mid in ms_ids) + ")"
+        formula = f"AND({id_formula},{{{FIELD_MS_TYPE}}}='{milestone_type}')"
+        records = airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE])
+        if not records:
+            return jsonify({"completed": False, "actual_date": None, "found_milestone": False})
+        actual_date = records[0]["fields"].get(FIELD_MS_ACTUAL_DATE)
+        return jsonify({"completed": bool(actual_date), "actual_date": actual_date, "found_milestone": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 # ===================================================================
 # APP資料 相關 API（已完工／掛表安排／異常案件／變流器日期／註記清單，跨裝置共用）
 # ===================================================================
@@ -840,6 +895,8 @@ def get_app_data():
                 "owner_contact_note": f.get("屋主備註"),
                 "rebar_planned_date": f.get("植筋日期"),
                 "rebar_with_entry": bool(f.get("植筋跟進場一起")),
+                "waiting_doc_type": f.get("等待函文種類"),
+                "waiting_doc_date": f.get("等待函文取得日期"),
             })
         elif t in NOTE_TYPES:
             notes.append({
@@ -889,6 +946,8 @@ def upsert_case_status():
         "owner_contact_note": "屋主備註",
         "rebar_planned_date": "植筋日期",
         "rebar_with_entry": "植筋跟進場一起",
+        "waiting_doc_type": "等待函文種類",
+        "waiting_doc_date": "等待函文取得日期",
     }
     airtable_fields = {field_map[k]: v for k, v in patch.items() if k in field_map}
 
