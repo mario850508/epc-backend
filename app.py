@@ -52,6 +52,15 @@ EPC 出貨／進場排程 後端 API
     STALE_REFRESH_SECONDS 秒還沒結束，視為異常卡死，強制放行讓新的一輪開始，
     不再需要手動重啟服務。
   - 同時在每一行 log 加上時間相關資訊，方便之後排查卡在哪個時間點。
+
+===================================================================
+2026-08-27 修改：註記清單新增「未使用料件」類型
+===================================================================
+  - 前端「異常案件」在案件已出貨的狀態下按「撤案」時，會詢問是否把這筆案件的
+    模組/逆變器規格記到「未使用料件」清單，也開放使用者手動新增料件；
+    這裡把 create_note() 的允許類型清單、以及 get_app_data() 組裝 notes 時
+    判斷的類型清單，都加上「未使用料件」，兩處要同時改，不然會出現「寫得進去、
+    但讀不出來」的不一致情況。
 """
 
 import os
@@ -121,6 +130,11 @@ INVERTER_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
 # 這張表是全新建立的，直接用名稱比較好維護，不用另外去 Airtable 查每個欄位的 ID。
 APP_DATA_TABLE_ID = "tblafnN1qFDoLgTx1"
 APP_DATA_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{APP_DATA_TABLE_ID}"
+
+# 註記清單允許的「類型」。2026-08-27 新增「未使用料件」——
+# create_note() 的驗證跟 get_app_data() 組裝 notes 的判斷都要用這份同一份清單，
+# 避免兩邊各自寫一次、改一邊忘了改另一邊。
+NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件")
 
 
 def airtable_headers():
@@ -739,7 +753,7 @@ def get_app_data():
                 "issue_date": f.get("異常記錄日期"),
                 "inverter_ship_date": f.get("變流器出貨日期"),
             })
-        elif t in ("併聯取得時備貨", "其他狀況備住"):
+        elif t in NOTE_TYPES:
             notes.append({
                 "app_record_id": r["id"],
                 "type": t,
@@ -813,14 +827,14 @@ def clear_case_status():
 
 @app.route("/api/app-data/note", methods=["POST"])
 def create_note():
-    """新增一筆註記清單項目（併聯取得時備貨／其他狀況備住）。
+    """新增一筆註記清單項目（併聯取得時備貨／其他狀況備住／未使用料件）。
     body: {type, case_text, content}"""
     body = request.get_json(force=True)
     note_type = body.get("type")
     case_text = (body.get("case_text") or "").strip()
     content = (body.get("content") or "").strip()
-    if note_type not in ("併聯取得時備貨", "其他狀況備住"):
-        return jsonify({"error": "type 必須是 併聯取得時備貨 或 其他狀況備住"}), 400
+    if note_type not in NOTE_TYPES:
+        return jsonify({"error": f"type 必須是以下其中之一：{'、'.join(NOTE_TYPES)}"}), 400
     if not case_text or not content:
         return jsonify({"error": "缺少 case_text 或 content"}), 400
     try:
