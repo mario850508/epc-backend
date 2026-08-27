@@ -61,6 +61,16 @@ EPC 出貨／進場排程 後端 API
     這裡把 create_note() 的允許類型清單、以及 get_app_data() 組裝 notes 時
     判斷的類型清單，都加上「未使用料件」，兩處要同時改，不然會出現「寫得進去、
     但讀不出來」的不一致情況。
+
+===================================================================
+2026-08-27 修改（二）：補齊 upsert_case_status() 的欄位白名單
+===================================================================
+  - 發現撤案原因/撤案日期、屋主聯絡資訊、植筋日期這幾個前端後來新增的欄位，
+    從來沒有被加進 upsert_case_status() 的 field_map，導致前端送出的資料
+    在後端就被過濾掉、根本沒送到 Airtable，但 API 仍回傳成功，造成「畫面上
+    看起來寫入成功，重新整理後又消失」的假象。這裡把 field_map 跟
+    get_app_data() 的讀取端都補齊，兩邊要同時改，道理跟上面「未使用料件」
+    那次一樣。
 """
 
 import os
@@ -752,6 +762,13 @@ def get_app_data():
                 "issue_note": f.get("異常狀況"),
                 "issue_date": f.get("異常記錄日期"),
                 "inverter_ship_date": f.get("變流器出貨日期"),
+                "withdrawn_note": f.get("撤案原因"),
+                "withdrawn_date": f.get("撤案日期"),
+                "owner_contact_name": f.get("屋主聯絡人"),
+                "owner_contact_phone": f.get("屋主聯絡電話"),
+                "owner_contact_note": f.get("屋主備註"),
+                "rebar_planned_date": f.get("植筋日期"),
+                "rebar_with_entry": bool(f.get("植筋跟進場一起")),
             })
         elif t in NOTE_TYPES:
             notes.append({
@@ -793,6 +810,13 @@ def upsert_case_status():
         "issue_note": "異常狀況",
         "issue_date": "異常記錄日期",
         "inverter_ship_date": "變流器出貨日期",
+        "withdrawn_note": "撤案原因",
+        "withdrawn_date": "撤案日期",
+        "owner_contact_name": "屋主聯絡人",
+        "owner_contact_phone": "屋主聯絡電話",
+        "owner_contact_note": "屋主備註",
+        "rebar_planned_date": "植筋日期",
+        "rebar_with_entry": "植筋跟進場一起",
     }
     airtable_fields = {field_map[k]: v for k, v in patch.items() if k in field_map}
 
