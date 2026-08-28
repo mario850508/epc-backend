@@ -116,6 +116,16 @@ EPC 出貨／進場排程 後端 API
   - update_note() 從只能改 content，擴充成 content/case_text/ship_date
     三個欄位都可以選擇性更新，用於「未使用料件」清單補填漏掉的出貨日期、
     或修正打錯的內容/案號，不用整筆刪除重建。
+
+===================================================================
+2026-08-27 修改（八）：/api/app-data 支援跳過歷史紀錄，給高頻率背景同步用
+===================================================================
+  - 前端要做多人協作的背景自動同步（每幾秒偷偷檢查一次有沒有其他人改過資料），
+    但 get_app_data() 裡「歷史紀錄」那段，每一筆已封存案件都要額外查 1-2 次
+    Airtable，案件一多會很慢，高頻率輪詢下更會逼近甚至超過 Airtable 每秒 5 次
+    請求的限制。加上 include_archived=false 這個參數後，前端可以讓「案件狀態／
+    註記」這種輕量、變動頻繁的部分用高頻率同步，「歷史紀錄」這種本來就不太會
+    臨時變動的部分用低頻率同步，兩者互不拖累。
 """
 
 import os
@@ -873,7 +883,12 @@ def get_app_data():
     """回傳 APP資料 表所有列，前端用來重建已完工/掛表安排/異常案件/變流器日期/註記清單
     這幾個原本存在本機瀏覽器的狀態。對於「掛表日期已確認」的案件（已經離開排程池，
     查不到即時資料了），額外去 Airtable 抓一次案件本身跟里程碑的完整資料，
-    補齊歷史紀錄要顯示的欄位。"""
+    補齊歷史紀錄要顯示的欄位。
+    query param: include_archived=false 可以跳過歷史紀錄這段（每筆都要額外查 1-2 次
+    Airtable，案件一多會拖慢速度、甚至撞到 Airtable 每秒 5 次請求的限制）；
+    前端做高頻率背景同步時應該帶這個參數，只有真的要看歷史紀錄或低頻率全量刷新時
+    才不帶（或帶 true）。"""
+    include_archived = request.args.get("include_archived", "true").lower() != "false"
     try:
         rows = app_data_get_all()
     except Exception as e:
@@ -915,15 +930,20 @@ def get_app_data():
                 "ship_date": f.get("出貨日期"),
             })
 
-    archived = []
-    for cs in case_status:
-        if not cs["meter_confirmed"] or not cs["case_record_id"]:
-            continue
-        snap = fetch_case_snapshot_for_archive(cs["case_record_id"])
-        if snap:
-            archived.append({**cs, **snap})
+    archived = None
+    if include_archived:
+        archived = []
+        for cs in case_status:
+            if not cs["meter_confirmed"] or not cs["case_record_id"]:
+                continue
+            snap = fetch_case_snapshot_for_archive(cs["case_record_id"])
+            if snap:
+                archived.append({**cs, **snap})
 
-    return jsonify({"case_status": case_status, "notes": notes, "archived": archived})
+    result = {"case_status": case_status, "notes": notes}
+    if archived is not None:
+        result["archived"] = archived
+    return jsonify(result)
 
 
 @app.route("/api/app-data/case-status", methods=["POST"])
