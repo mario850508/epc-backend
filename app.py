@@ -126,6 +126,16 @@ EPC 出貨／進場排程 後端 API
     請求的限制。加上 include_archived=false 這個參數後，前端可以讓「案件狀態／
     註記」這種輕量、變動頻繁的部分用高頻率同步，「歷史紀錄」這種本來就不太會
     臨時變動的部分用低頻率同步，兩者互不拖累。
+
+===================================================================
+2026-08-28 修改（九）：直接在網站補填模組/逆變器規格，不用回 Airtable
+===================================================================
+  - 新增 /api/inverter-options：回傳「採購-逆變器」表現有的型號選項
+    （record_id + 名稱）。逆變器在案件表上是連結欄位，前端不能自己打型號名稱，
+    必須從這裡的選項裡選，才能正確連結。
+  - 新增 /api/case-spec：把使用者在網站上填的模組型號/數量、逆變器型號/數量
+    寫回 Airtable「專案細節」表，寫入成功後觸發一次 refresh_cache，讓「⚠ 尚未
+    填寫規格」的案件補填完立刻反映在案件池快取裡。
 """
 
 import os
@@ -838,6 +848,61 @@ def schedule_hang_meter():
         except Exception as e:
             print(f"[schedule_hang_meter] 更新 APP資料 掛表確認狀態失敗（不影響主要寫入）：{e}", flush=True)
 
+    threading.Thread(target=refresh_cache, daemon=True).start()
+    return jsonify({"ok": True, "record": resp.json()})
+
+
+@app.route("/api/inverter-options")
+def inverter_options():
+    """回傳「採購-逆變器」表所有型號選項（record_id + 名稱），給前端做逆變器選單用。
+    逆變器欄位在案件表上是連結欄位，前端不能自己亂打型號名稱，必須從這裡回傳的
+    現有選項裡選，才能正確連結到 Airtable 的記錄。"""
+    try:
+        records = airtable_get_all(INVERTER_API_URL, "TRUE()", [INVERTER_MODEL_FIELD])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    options = [
+        {"record_id": r["id"], "name": r["fields"].get(INVERTER_MODEL_FIELD, r["id"])}
+        for r in records
+    ]
+    options.sort(key=lambda o: o["name"] or "")
+    return jsonify({"options": options})
+
+
+@app.route("/api/case-spec", methods=["POST"])
+def update_case_spec():
+    """直接在網站上補填/修改案件的模組、逆變器規格，寫回 Airtable「專案細節」表，
+    不用再回 Airtable 手動填。模組型號是純文字欄位，可以自由輸入；逆變器是連結欄位，
+    body 裡要帶 /api/inverter-options 回傳的 record_id，不能只給名稱。
+    body: {case_record_id, module_model, module_qty, inverters: [{record_id, qty}, ...]}
+    module_model/module_qty/inverters 都是選填，只會更新有帶到的欄位；
+    inverters 給空陣列代表清空逆變器（連同數量欄位一起清空）。"""
+    body = request.get_json(force=True)
+    case_record_id = body.get("case_record_id")
+    if not case_record_id:
+        return jsonify({"error": "缺少 case_record_id"}), 400
+
+    fields = {}
+    if "module_model" in body:
+        fields[FIELD_MODULE_MODEL] = (body.get("module_model") or "").strip() or None
+    if "module_qty" in body:
+        fields[FIELD_MODULE_QTY] = body.get("module_qty")
+    if "inverters" in body:
+        inverters = body.get("inverters") or []
+        fields[FIELD_INVERTER] = [inv["record_id"] for inv in inverters if inv.get("record_id")]
+        fields[FIELD_INVERTER_QTY] = [inv.get("qty") for inv in inverters if inv.get("record_id")]
+
+    if not fields:
+        return jsonify({"error": "沒有帶任何要更新的欄位"}), 400
+
+    resp = requests.patch(
+        f"{CASE_API_URL}/{case_record_id}",
+        headers=airtable_headers(),
+        json={"fields": fields},
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
     threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
 
