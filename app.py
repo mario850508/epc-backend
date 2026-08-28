@@ -136,6 +136,17 @@ EPC 出貨／進場排程 後端 API
   - 新增 /api/case-spec：把使用者在網站上填的模組型號/數量、逆變器型號/數量
     寫回 Airtable「專案細節」表，寫入成功後觸發一次 refresh_cache，讓「⚠ 尚未
     填寫規格」的案件補填完立刻反映在案件池快取裡。
+
+===================================================================
+2026-08-28 修改（十）：模組型號也改成選單 + 型號管理功能
+===================================================================
+  - 「模組型號」是 Airtable 的 Single select（固定選項）欄位，新增
+    /api/module-options（GET 讀取現有選項、POST 新增選項），用 Airtable
+    的 Meta API（schema.bases:read / schema.bases:write）讀寫這個欄位的
+    選項清單，不是一般的資料讀寫 API，需要 Token 額外開這兩個 schema 權限，
+    沒開的話會回傳明確的錯誤訊息，前端要能優雅降級（退回文字輸入），不能整個卡死。
+  - 新增 POST /api/inverter-options：在「採購-逆變器」表新增一筆新記錄，
+    對應前端「新增逆變器型號」的管理功能。
 """
 
 import os
@@ -867,6 +878,100 @@ def inverter_options():
     ]
     options.sort(key=lambda o: o["name"] or "")
     return jsonify({"options": options})
+
+
+@app.route("/api/inverter-options", methods=["POST"])
+def create_inverter_option():
+    """在「採購-逆變器」表新增一筆新型號記錄，讓「填寫規格」選單裡可以選到。
+    body: {name}"""
+    body = request.get_json(force=True)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少 name"}), 400
+    try:
+        resp = requests.post(
+            INVERTER_API_URL,
+            headers=airtable_headers(),
+            json={"fields": {INVERTER_MODEL_FIELD: name}},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "record_id": result["id"], "name": name})
+
+
+def _find_field_schema(table_id, field_id):
+    """透過 Airtable Meta API 找到指定欄位目前的完整定義（含 Single select 的選項清單）。
+    這支 API 需要 Token 有 schema.bases:read 這個範圍的權限，跟平常讀寫資料的權限不同，
+    如果權限不夠，Airtable 會回傳 403，呼叫端要處理這種情況並提示使用者去檢查 Token 設定。"""
+    resp = requests.get(
+        f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables",
+        headers=airtable_headers(),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    for table in data.get("tables", []):
+        if table.get("id") != table_id:
+            continue
+        for field in table.get("fields", []):
+            if field.get("id") == field_id:
+                return field
+    return None
+
+
+@app.route("/api/module-options")
+def module_options():
+    """回傳「專案細節」表「模組型號」欄位目前的選項清單，假設這是一個 Single select
+    （固定選項）欄位。需要 Token 有 schema.bases:read 權限，讀不到的話回傳明確錯誤，
+    前端應該要退回成一般文字輸入框，不要整個卡住。"""
+    try:
+        field = _find_field_schema(CASE_TABLE_ID, FIELD_MODULE_MODEL)
+    except Exception as e:
+        return jsonify({"error": "讀取 Airtable 欄位結構失敗，Token 可能沒有 schema.bases:read 權限",
+                         "detail": str(e)}), 502
+    if not field:
+        return jsonify({"error": "在 Airtable 找不到「模組型號」這個欄位"}), 404
+    field_type = field.get("type")
+    if field_type not in ("singleSelect",):
+        return jsonify({"error": f"「模組型號」欄位目前是 {field_type} 類型，不是固定選項欄位，"
+                                  f"無法提供選單，請直接用文字輸入", "field_type": field_type}), 200
+    choices = field.get("options", {}).get("choices", [])
+    names = [c.get("name") for c in choices if c.get("name")]
+    return jsonify({"field_type": field_type, "options": names})
+
+
+@app.route("/api/module-options", methods=["POST"])
+def create_module_option():
+    """幫「模組型號」這個 Single select 欄位新增一個選項。需要 Token 有
+    schema.bases:write 權限。body: {name}"""
+    body = request.get_json(force=True)
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少 name"}), 400
+    try:
+        field = _find_field_schema(CASE_TABLE_ID, FIELD_MODULE_MODEL)
+        if not field:
+            return jsonify({"error": "在 Airtable 找不到「模組型號」這個欄位"}), 404
+        if field.get("type") != "singleSelect":
+            return jsonify({"error": "「模組型號」欄位不是固定選項欄位，不需要（也無法）新增選項"}), 400
+        choices = field.get("options", {}).get("choices", [])
+        if any(c.get("name") == name for c in choices):
+            return jsonify({"ok": True, "message": "這個選項已經存在"})
+        new_choices = choices + [{"name": name}]
+        resp = requests.patch(
+            f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables/{CASE_TABLE_ID}/fields/{FIELD_MODULE_MODEL}",
+            headers=airtable_headers(),
+            json={"options": {"choices": new_choices}},
+            timeout=20,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": "新增選項失敗，Token 可能沒有 schema.bases:write 權限",
+                         "detail": str(e)}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/api/case-spec", methods=["POST"])
