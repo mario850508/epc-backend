@@ -109,6 +109,13 @@ EPC 出貨／進場排程 後端 API
     會自動清空 issue_note/issue_date（等同「已排除異常」），並把取得日期存進
     waiting_doc_date，但保留 waiting_doc_type，讓案件回到「待安排出貨&植筋」
     清單時，「觸發依據」欄位可以顯示這份函文的日期，而不是原本的同意備案日期。
+
+===================================================================
+2026-08-27 修改（七）：未使用料件可以事後修改案號／內容／出貨日期
+===================================================================
+  - update_note() 從只能改 content，擴充成 content/case_text/ship_date
+    三個欄位都可以選擇性更新，用於「未使用料件」清單補填漏掉的出貨日期、
+    或修正打錯的內容/案號，不用整筆刪除重建。
 """
 
 import os
@@ -1021,14 +1028,28 @@ def delete_app_data_row(record_id):
 
 @app.route("/api/app-data/note/<record_id>", methods=["PATCH"])
 def update_note(record_id):
-    """修改一筆註記清單項目的內容（例如「未使用料件」被部分使用後，更新剩餘數量說明）。
-    body: {content}"""
+    """修改一筆註記清單項目（例如「未使用料件」被部分使用後更新剩餘數量說明，
+    或事後補填出貨日期、修正案號）。body 裡的欄位都是選填，只會更新有帶到的欄位：
+    body: {content, case_text, ship_date}
+    ship_date 給空字串代表清空該欄位（例如填錯了要清掉重填）。"""
     body = request.get_json(force=True)
-    content = (body.get("content") or "").strip()
-    if not content:
-        return jsonify({"error": "缺少 content"}), 400
+    fields = {}
+    if "content" in body:
+        content = (body.get("content") or "").strip()
+        if not content:
+            return jsonify({"error": "content 不能是空字串"}), 400
+        fields["內容"] = content
+    if "case_text" in body:
+        case_text = (body.get("case_text") or "").strip()
+        if not case_text:
+            return jsonify({"error": "case_text 不能是空字串"}), 400
+        fields["案號或別名"] = case_text
+    if "ship_date" in body:
+        fields["出貨日期"] = body.get("ship_date") or None
+    if not fields:
+        return jsonify({"error": "沒有帶任何要更新的欄位"}), 400
     try:
-        result = app_data_update(record_id, {"內容": content})
+        result = app_data_update(record_id, fields)
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
     return jsonify({"ok": True, "record": result})
