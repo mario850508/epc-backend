@@ -160,9 +160,25 @@ EPC 出貨／進場排程 後端 API
     同時打 Airtable）。GET 這兩支 API 現在直接讀記憶體，秒回；新增型號
     （POST）成功後另外觸發一次立即刷新，讓新選項馬上可以選到，不用等下一輪。
   - 注意：_find_field_schema() 這個輔助函式被 refresh_model_options_cache()
-    在啟動階段的背景執行緒呼叫，所以它的定義必須放在啟動該執行緒的程式碼「之前」
-    （檔案裡由上到下的順序），不能放在後面才定義，不然背景執行緒可能會搶在
-    主執行緒還沒執行到那個 def 之前就先呼叫，導致 NameError。
+    呼叫，所以它的定義必須放在呼叫它的程式碼「之前」（檔案裡由上到下的順序）。
+
+===================================================================
+2026-08-28 修改（十二）：健康檢查頁面加上型號快取狀態 + 修正啟動卡死
+===================================================================
+  - / 健康檢查頁面加上 model_options_cache 區塊（updated_at、兩份選項數量、
+    module_options_available、last_error），不用翻 log 就能直接看出型號快取
+    是否正常刷新、卡在哪一步。
+  - refresh_model_options_cache() 補上 last_error 記錄，讀取失敗時把明確的
+    錯誤原因存進快取，透過健康檢查頁面就看得到，不用猜。
+  - 新增 POST /api/refresh-model-options，可以手動觸發型號快取重新整理，
+    不用等排程、也不用重新部署。
+  - 修正啟動時卡死的問題：原本伺服器啟動時會「同時」開兩個背景執行緒
+    （一個刷 DATA_CACHE、一個刷 MODEL_OPTIONS_CACHE），結果兩個執行緒
+    同時做「第一次」Airtable 呼叫，疑似又踩到本檔案先前就記錄過的
+    「多執行緒同時第一次呼叫 requests 會卡死」的坑，導致兩份快取都卡住
+    完全跑不完。改成合併成一個背景執行緒，兩份快取「依序」刷新（先案件池，
+    再型號清單），不要同時搶。之後排程觸發時因為 import 已經熱過了，
+    各自獨立的排程工作就沒有這個風險。
 """
 
 import os
@@ -781,8 +797,18 @@ scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
 scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5))
 scheduler.start()
 
-threading.Thread(target=refresh_cache, daemon=True).start()
-threading.Thread(target=refresh_model_options_cache, daemon=True).start()
+
+def _startup_refresh_all():
+    """伺服器啟動時的背景初始化，兩份快取「依序」做，不要同時開兩個執行緒。
+    這個專案先前就踩過「多執行緒同時第一次呼叫 requests」會卡死的坑（見上面
+    2026-08-28 修改十一的說明跟暖機那段），一次只讓一個背景執行緒去做「第一次」
+    網路呼叫比較保險；等之後排程真的觸發時，import 早就熱過了，兩個排程工作
+    各自獨立執行就沒有這個風險，不需要也一起依序做。"""
+    refresh_cache()
+    refresh_model_options_cache()
+
+
+threading.Thread(target=_startup_refresh_all, daemon=True).start()
 
 
 @app.after_request
