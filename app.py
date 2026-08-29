@@ -722,6 +722,7 @@ MODEL_OPTIONS_CACHE = {
     "module_options": [],
     "module_options_available": True,
     "updated_at": None,
+    "last_error": None,  # 記錄最近一次刷新時任何一邊失敗的錯誤訊息，方便從 / 健康檢查頁面直接看到原因
 }
 _model_cache_lock = threading.Lock()
 
@@ -729,6 +730,7 @@ _model_cache_lock = threading.Lock()
 def refresh_model_options_cache():
     tag = "[refresh_model_options_cache]"
     print(f"{tag} 開始…", flush=True)
+    errors = []
 
     try:
         records = airtable_get_all(INVERTER_API_URL, "TRUE()", [INVERTER_MODEL_FIELD])
@@ -738,7 +740,9 @@ def refresh_model_options_cache():
         ]
         inverter_options.sort(key=lambda o: o["name"] or "")
     except Exception as e:
-        print(f"{tag} 逆變器選項讀取失敗（沿用舊快取）：{e}", flush=True)
+        msg = f"逆變器選項讀取失敗：{e}"
+        print(f"{tag} {msg}（沿用舊快取）", flush=True)
+        errors.append(msg)
         inverter_options = MODEL_OPTIONS_CACHE.get("inverter_options") or []
 
     module_options_available = True
@@ -747,12 +751,19 @@ def refresh_model_options_cache():
         if field and field.get("type") == "singleSelect":
             choices = field.get("options", {}).get("choices", [])
             module_options = [c.get("name") for c in choices if c.get("name")]
+        elif field:
+            module_options_available = False
+            module_options = []
+            errors.append(f"「模組型號」欄位目前是 {field.get('type')} 類型，不是固定選項欄位")
         else:
             module_options_available = False
             module_options = []
+            errors.append("在 Airtable 找不到「模組型號」這個欄位（FIELD_MODULE_MODEL 設定可能不對）")
     except Exception as e:
-        print(f"{tag} 模組型號選項讀取失敗（沿用舊快取，可能是 Token 缺 schema.bases:read 權限）：{e}", flush=True)
-        module_options_available = MODEL_OPTIONS_CACHE.get("module_options_available", True)
+        msg = f"模組型號選項讀取失敗：{e}（可能是 Token 缺 schema.bases:read 權限）"
+        print(f"{tag} {msg}", flush=True)
+        errors.append(msg)
+        module_options_available = False
         module_options = MODEL_OPTIONS_CACHE.get("module_options") or []
 
     with _model_cache_lock:
@@ -760,6 +771,7 @@ def refresh_model_options_cache():
         MODEL_OPTIONS_CACHE["module_options"] = module_options
         MODEL_OPTIONS_CACHE["module_options_available"] = module_options_available
         MODEL_OPTIONS_CACHE["updated_at"] = datetime.now().isoformat()
+        MODEL_OPTIONS_CACHE["last_error"] = " ／ ".join(errors) if errors else None
     print(f"{tag} 完成，inverter_options={len(inverter_options)} "
           f"module_options={len(module_options)} available={module_options_available}", flush=True)
 
@@ -833,6 +845,15 @@ def completed_cases():
 def manual_refresh():
     threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "message": "已在背景開始重新整理"})
+
+
+@app.route("/api/refresh-model-options", methods=["POST"])
+def manual_refresh_model_options():
+    """手動觸發一次模組／逆變器型號選項快取的重新整理，不用等排程、也不用重新部署。
+    刷新完的結果（含錯誤訊息，如果有的話）可以到 / 健康檢查頁面的 model_options_cache
+    裡看到。"""
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
+    return jsonify({"ok": True, "message": "已在背景開始重新整理型號選項，完成後可到 / 健康檢查頁面查看結果"})
 
 
 @app.route("/api/schedule", methods=["POST"])
@@ -1325,6 +1346,13 @@ def health():
         "pending_count": len(DATA_CACHE["pending"]),
         "entry_count": len(DATA_CACHE["entry"]),
         "completed_count": len(DATA_CACHE["completed"]),
+        "model_options_cache": {
+            "updated_at": MODEL_OPTIONS_CACHE.get("updated_at"),
+            "inverter_options_count": len(MODEL_OPTIONS_CACHE.get("inverter_options") or []),
+            "module_options_count": len(MODEL_OPTIONS_CACHE.get("module_options") or []),
+            "module_options_available": MODEL_OPTIONS_CACHE.get("module_options_available"),
+            "last_error": MODEL_OPTIONS_CACHE.get("last_error"),
+        },
     })
 
 
