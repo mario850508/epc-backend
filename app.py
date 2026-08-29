@@ -147,6 +147,22 @@ EPC 出貨／進場排程 後端 API
     沒開的話會回傳明確的錯誤訊息，前端要能優雅降級（退回文字輸入），不能整個卡死。
   - 新增 POST /api/inverter-options：在「採購-逆變器」表新增一筆新記錄，
     對應前端「新增逆變器型號」的管理功能。
+
+===================================================================
+2026-08-28 修改（十一）：模組／逆變器型號選項改成記憶體快取
+===================================================================
+  - 原本 /api/inverter-options、/api/module-options 這兩支 API 每次被呼叫
+    都直接即時打 Airtable（逆變器要撈整張表；模組型號要打較慢的 Meta API 查
+    欄位結構），前端開「填寫規格」視窗時兩支疊在一起，實測要 20 秒以上。
+  - 新增 MODEL_OPTIONS_CACHE + refresh_model_options_cache()，做法比照
+    DATA_CACHE：伺服器啟動時背景跑一次、之後跟著 DATA_CACHE 同樣的
+    00:00／06:00／12:00／18:00 排程更新（錯開 5 分鐘避免跟主要那份快取
+    同時打 Airtable）。GET 這兩支 API 現在直接讀記憶體，秒回；新增型號
+    （POST）成功後另外觸發一次立即刷新，讓新選項馬上可以選到，不用等下一輪。
+  - 注意：_find_field_schema() 這個輔助函式被 refresh_model_options_cache()
+    在啟動階段的背景執行緒呼叫，所以它的定義必須放在啟動該執行緒的程式碼「之前」
+    （檔案裡由上到下的順序），不能放在後面才定義，不然背景執行緒可能會搶在
+    主執行緒還沒執行到那個 def 之前就先呼叫，導致 NameError。
 """
 
 import os
@@ -310,6 +326,26 @@ def app_data_delete(record_id):
     resp = requests.delete(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
     resp.raise_for_status()
     return resp.json()
+
+
+def _find_field_schema(table_id, field_id):
+    """透過 Airtable Meta API 找到指定欄位目前的完整定義（含 Single select 的選項清單）。
+    這支 API 需要 Token 有 schema.bases:read 這個範圍的權限，跟平常讀寫資料的權限不同，
+    如果權限不夠，Airtable 會回傳 403，呼叫端要處理這種情況並提示使用者去檢查 Token 設定。"""
+    resp = requests.get(
+        f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables",
+        headers=airtable_headers(),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    for table in data.get("tables", []):
+        if table.get("id") != table_id:
+            continue
+        for field in table.get("fields", []):
+            if field.get("id") == field_id:
+                return field
+    return None
 
 
 def ensure_milestone_record(case_record_id, milestone_type):
@@ -673,11 +709,68 @@ except Exception as e:
     print(f"[startup] 暖機請求本身失敗（沒關係，目的已達成）：{e}", flush=True)
 
 
+# ===================================================================
+# 模組／逆變器型號選項快取
+# ===================================================================
+# 「填寫規格」視窗要用的兩份選項清單（模組型號、逆變器型號），原本是每次開視窗
+# 都直接打 Airtable（逆變器要撈整張表，模組型號要打比較慢的 Meta API 查欄位結構），
+# 疊在一起單次要 20 秒以上。改成跟 DATA_CACHE 一樣的記憶體快取模式：背景排程
+# 定期刷新，前端請求直接讀記憶體，秒回；新增型號成功後額外觸發一次立即刷新，
+# 讓新選項馬上出現，不用等下一輪排程。
+MODEL_OPTIONS_CACHE = {
+    "inverter_options": [],
+    "module_options": [],
+    "module_options_available": True,
+    "updated_at": None,
+}
+_model_cache_lock = threading.Lock()
+
+
+def refresh_model_options_cache():
+    tag = "[refresh_model_options_cache]"
+    print(f"{tag} 開始…", flush=True)
+
+    try:
+        records = airtable_get_all(INVERTER_API_URL, "TRUE()", [INVERTER_MODEL_FIELD])
+        inverter_options = [
+            {"record_id": r["id"], "name": r["fields"].get(INVERTER_MODEL_FIELD, r["id"])}
+            for r in records
+        ]
+        inverter_options.sort(key=lambda o: o["name"] or "")
+    except Exception as e:
+        print(f"{tag} 逆變器選項讀取失敗（沿用舊快取）：{e}", flush=True)
+        inverter_options = MODEL_OPTIONS_CACHE.get("inverter_options") or []
+
+    module_options_available = True
+    try:
+        field = _find_field_schema(CASE_TABLE_ID, FIELD_MODULE_MODEL)
+        if field and field.get("type") == "singleSelect":
+            choices = field.get("options", {}).get("choices", [])
+            module_options = [c.get("name") for c in choices if c.get("name")]
+        else:
+            module_options_available = False
+            module_options = []
+    except Exception as e:
+        print(f"{tag} 模組型號選項讀取失敗（沿用舊快取，可能是 Token 缺 schema.bases:read 權限）：{e}", flush=True)
+        module_options_available = MODEL_OPTIONS_CACHE.get("module_options_available", True)
+        module_options = MODEL_OPTIONS_CACHE.get("module_options") or []
+
+    with _model_cache_lock:
+        MODEL_OPTIONS_CACHE["inverter_options"] = inverter_options
+        MODEL_OPTIONS_CACHE["module_options"] = module_options
+        MODEL_OPTIONS_CACHE["module_options_available"] = module_options_available
+        MODEL_OPTIONS_CACHE["updated_at"] = datetime.now().isoformat()
+    print(f"{tag} 完成，inverter_options={len(inverter_options)} "
+          f"module_options={len(module_options)} available={module_options_available}", flush=True)
+
+
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
+scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5))
 scheduler.start()
 
 threading.Thread(target=refresh_cache, daemon=True).start()
+threading.Thread(target=refresh_model_options_cache, daemon=True).start()
 
 
 @app.after_request
@@ -867,22 +960,16 @@ def schedule_hang_meter():
 def inverter_options():
     """回傳「採購-逆變器」表所有型號選項（record_id + 名稱），給前端做逆變器選單用。
     逆變器欄位在案件表上是連結欄位，前端不能自己亂打型號名稱，必須從這裡回傳的
-    現有選項裡選，才能正確連結到 Airtable 的記錄。"""
-    try:
-        records = airtable_get_all(INVERTER_API_URL, "TRUE()", [INVERTER_MODEL_FIELD])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-    options = [
-        {"record_id": r["id"], "name": r["fields"].get(INVERTER_MODEL_FIELD, r["id"])}
-        for r in records
-    ]
-    options.sort(key=lambda o: o["name"] or "")
-    return jsonify({"options": options})
+    現有選項裡選，才能正確連結到 Airtable 的記錄。直接讀記憶體快取（見
+    MODEL_OPTIONS_CACHE / refresh_model_options_cache），不用每次都重新查
+    Airtable，秒回。"""
+    return jsonify({"options": MODEL_OPTIONS_CACHE.get("inverter_options") or []})
 
 
 @app.route("/api/inverter-options", methods=["POST"])
 def create_inverter_option():
     """在「採購-逆變器」表新增一筆新型號記錄，讓「填寫規格」選單裡可以選到。
+    寫入成功後立刻在背景刷新一次選項快取，讓新型號馬上出現，不用等下一輪排程。
     body: {name}"""
     body = request.get_json(force=True)
     name = (body.get("name") or "").strip()
@@ -899,54 +986,29 @@ def create_inverter_option():
         result = resp.json()
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
     return jsonify({"ok": True, "record_id": result["id"], "name": name})
-
-
-def _find_field_schema(table_id, field_id):
-    """透過 Airtable Meta API 找到指定欄位目前的完整定義（含 Single select 的選項清單）。
-    這支 API 需要 Token 有 schema.bases:read 這個範圍的權限，跟平常讀寫資料的權限不同，
-    如果權限不夠，Airtable 會回傳 403，呼叫端要處理這種情況並提示使用者去檢查 Token 設定。"""
-    resp = requests.get(
-        f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables",
-        headers=airtable_headers(),
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    for table in data.get("tables", []):
-        if table.get("id") != table_id:
-            continue
-        for field in table.get("fields", []):
-            if field.get("id") == field_id:
-                return field
-    return None
 
 
 @app.route("/api/module-options")
 def module_options():
-    """回傳「專案細節」表「模組型號」欄位目前的選項清單，假設這是一個 Single select
-    （固定選項）欄位。需要 Token 有 schema.bases:read 權限，讀不到的話回傳明確錯誤，
-    前端應該要退回成一般文字輸入框，不要整個卡住。"""
-    try:
-        field = _find_field_schema(CASE_TABLE_ID, FIELD_MODULE_MODEL)
-    except Exception as e:
-        return jsonify({"error": "讀取 Airtable 欄位結構失敗，Token 可能沒有 schema.bases:read 權限",
-                         "detail": str(e)}), 502
-    if not field:
-        return jsonify({"error": "在 Airtable 找不到「模組型號」這個欄位"}), 404
-    field_type = field.get("type")
-    if field_type not in ("singleSelect",):
-        return jsonify({"error": f"「模組型號」欄位目前是 {field_type} 類型，不是固定選項欄位，"
-                                  f"無法提供選單，請直接用文字輸入", "field_type": field_type}), 200
-    choices = field.get("options", {}).get("choices", [])
-    names = [c.get("name") for c in choices if c.get("name")]
-    return jsonify({"field_type": field_type, "options": names})
+    """回傳「專案細節」表「模組型號」欄位目前的選項清單（假設是 Single select 固定
+    選項欄位）。直接讀記憶體快取，不用每次都重新打 Airtable Meta API（那支比較慢）。
+    如果快取顯示這個欄位不可用（例如 Token 沒有 schema.bases:read 權限、或欄位其實
+    不是 Single select），回傳空選項清單，前端要能優雅退回文字輸入框。"""
+    available = MODEL_OPTIONS_CACHE.get("module_options_available", True)
+    if not available:
+        return jsonify({"error": "模組型號選項目前無法使用（可能是 Token 缺 schema.bases:read 權限，"
+                                  "或欄位不是固定選項類型），請改用文字輸入",
+                         "options": []}), 200
+    return jsonify({"options": MODEL_OPTIONS_CACHE.get("module_options") or []})
 
 
 @app.route("/api/module-options", methods=["POST"])
 def create_module_option():
     """幫「模組型號」這個 Single select 欄位新增一個選項。需要 Token 有
-    schema.bases:write 權限。body: {name}"""
+    schema.bases:write 權限。寫入成功後立刻在背景刷新一次選項快取。
+    body: {name}"""
     body = request.get_json(force=True)
     name = (body.get("name") or "").strip()
     if not name:
@@ -971,6 +1033,7 @@ def create_module_option():
     except Exception as e:
         return jsonify({"error": "新增選項失敗，Token 可能沒有 schema.bases:write 權限",
                          "detail": str(e)}), 502
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
     return jsonify({"ok": True})
 
 
