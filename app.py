@@ -284,6 +284,42 @@ APP_DATA_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{APP_DATA_TABLE_ID}"
 # 避免兩邊各自寫一次、改一邊忘了改另一邊。
 NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件", "料件使用")
 
+# 2026-08-30 新增：模組／逆變器型號「隱藏清單」，也存在 APP資料 表，用獨立的
+# 類型「隱藏型號」跟上面 NOTE_TYPES 那些區分開（不會出現在前端「註記清單」裡）。
+# 這是「軟隱藏」——完全不動 Airtable「專案細節」的 Single Select 選項、也不刪除
+# 「採購-逆變器」表的任何記錄，只是讓 refresh_model_options_cache() 在組出最終
+# 選項清單前，把使用者標記過的型號從清單中濾掉。這樣舊案件不管以前用的是哪個
+# 型號都完全不受影響，之後想恢復顯示也只要把隱藏記錄刪掉即可，是可逆的操作。
+# 借用 APP資料 表既有欄位存這筆記錄：
+#   案號或別名 → 存 "module" 或 "inverter"，代表這筆隱藏的是哪一種型號
+#   內容       → 模組型號：直接存型號名稱；
+#                逆變器型號：因為要比對的是 record_id，但畫面上要顯示名稱給使用者看，
+#                所以存成 "record_id::名稱" 這種組合格式，用的時候用 "::" 切開。
+HIDDEN_MODEL_TYPE = "隱藏型號"
+
+
+def get_hidden_models():
+    """讀取目前所有被隱藏的模組／逆變器型號。
+    回傳 (hidden_module_names: set, hidden_inverter_ids: set, hidden_list: list)，
+    hidden_list 是給 /api/hidden-models 這支 API 直接組裝回傳用的原始清單
+    （含 app_record_id，才能讓前端顯示「恢復」按鈕）。"""
+    formula = f"{{類型}}='{HIDDEN_MODEL_TYPE}'"
+    recs = app_data_get_all(formula)
+    hidden_module_names = set()
+    hidden_inverter_ids = set()
+    hidden_list = []
+    for r in recs:
+        f = r["fields"]
+        category = f.get("案號或別名")
+        value = f.get("內容") or ""
+        hidden_list.append({"app_record_id": r["id"], "category": category, "value": value})
+        if category == "module":
+            hidden_module_names.add(value)
+        elif category == "inverter":
+            # 逆變器存的是 "record_id::名稱"，比對時只需要 record_id 那一段
+            hidden_inverter_ids.add(value.split("::", 1)[0])
+    return hidden_module_names, hidden_inverter_ids, hidden_list
+
 
 def airtable_headers():
     return {
@@ -812,6 +848,18 @@ def refresh_model_options_cache():
         module_options_available = False
         module_options = MODEL_OPTIONS_CACHE.get("module_options") or []
 
+    # 2026-08-30 新增：套用隱藏清單，把使用者標記過不想再看到的型號從最終結果濾掉。
+    # 這一步刻意放在快取真正寫入之前的最後一步，且失敗時只印 log、不影響其他部分
+    # （沿用未過濾的結果），避免因為這個新功能本身的問題連累原本已經在跑的型號快取。
+    try:
+        hidden_module_names, hidden_inverter_ids, _ = get_hidden_models()
+        if hidden_module_names:
+            module_options = [m for m in module_options if m not in hidden_module_names]
+        if hidden_inverter_ids:
+            inverter_options = [o for o in inverter_options if o["record_id"] not in hidden_inverter_ids]
+    except Exception as e:
+        print(f"{tag} 讀取隱藏型號清單失敗（沿用未過濾的完整清單）：{e}", flush=True)
+
     with _model_cache_lock:
         MODEL_OPTIONS_CACHE["inverter_options"] = inverter_options
         MODEL_OPTIONS_CACHE["module_options"] = module_options
@@ -1117,6 +1165,66 @@ def create_module_option():
     except Exception as e:
         return jsonify({"error": "新增選項失敗，Token 可能沒有 schema.bases:write 權限",
                          "detail": str(e)}), 502
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hidden-models")
+def get_hidden_models_api():
+    """回傳目前所有被隱藏的型號，給「管理型號清單」視窗顯示「已隱藏」清單、
+    讓使用者可以選擇恢復。逆變器型號存的原始格式是 "record_id::名稱"，這裡
+    直接拆好只回傳給前端顯示用的名稱，不用前端自己處理格式。"""
+    try:
+        _, _, hidden_list = get_hidden_models()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    result = []
+    for h in hidden_list:
+        if h["category"] == "inverter":
+            parts = h["value"].split("::", 1)
+            name = parts[1] if len(parts) > 1 else parts[0]
+        else:
+            name = h["value"]
+        result.append({"app_record_id": h["app_record_id"], "category": h["category"], "name": name})
+    return jsonify({"hidden": result})
+
+
+@app.route("/api/hidden-models", methods=["POST"])
+def add_hidden_model():
+    """把一個模組或逆變器型號加入隱藏清單（軟隱藏，不動 Airtable 原始資料）。
+    body: {category: "module" | "inverter", value: string}
+    module 的 value 直接是型號名稱；inverter 的 value 必須是 "record_id::名稱"
+    這種組合格式（前端呼叫時要自己組好），因為實際比對用的是 record_id，
+    名稱只是存起來給畫面顯示用。寫入成功後立刻在背景刷新一次型號快取，
+    讓隱藏立刻生效，不用等下一輪排程。"""
+    body = request.get_json(force=True)
+    category = body.get("category")
+    value = (body.get("value") or "").strip()
+    if category not in ("module", "inverter"):
+        return jsonify({"error": "category 必須是 module 或 inverter"}), 400
+    if not value:
+        return jsonify({"error": "缺少 value"}), 400
+    try:
+        app_data_create({
+            "類型": HIDDEN_MODEL_TYPE,
+            "案號或別名": category,
+            "內容": value,
+            "記錄日期": datetime.now().strftime("%Y-%m-%d"),
+        })
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hidden-models/<record_id>", methods=["DELETE"])
+def remove_hidden_model(record_id):
+    """把一筆隱藏記錄刪掉，等於「恢復顯示」這個型號。刪除成功後立刻在背景
+    刷新一次型號快取，讓恢復立刻生效。"""
+    try:
+        app_data_delete(record_id)
+    except Exception as e:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": str(e)}), 502
     threading.Thread(target=refresh_model_options_cache, daemon=True).start()
     return jsonify({"ok": True})
 
