@@ -179,6 +179,31 @@ EPC 出貨／進場排程 後端 API
     完全跑不完。改成合併成一個背景執行緒，兩份快取「依序」刷新（先案件池，
     再型號清單），不要同時搶。之後排程觸發時因為 import 已經熱過了，
     各自獨立的排程工作就沒有這個風險。
+
+===================================================================
+2026-08-30 修改（十三）：修正背景初始化在 gunicorn master process 裡跑，
+                        worker 完全看不到快取結果的重大問題
+===================================================================
+  - 發現健康檢查頁面 / 顯示的 pid 跟 log 裡 refresh_cache 完成時印出的 pid
+    對不起來（例如健康檢查頁面顯示 pid=63，但 log 裡完成的是 pid=40）。
+    對照 gunicorn 開機 log：40 是 master process，63 才是真正處理 HTTP
+    請求的 worker process。
+  - 根本原因：原本 threading.Thread(target=_startup_refresh_all).start()
+    跟 scheduler.start() 都寫在模組最外層（import 時就執行），而 gunicorn
+    是先在 master process import 一次 app.py（這時背景執行緒就在 master
+    裡啟動、跑完），然後才 fork 出 worker。Unix fork() 的規則是「只有呼叫
+    fork 的那個執行緒會延續到子行程，其他背景執行緒不會」，所以 worker
+    自己的 DATA_CACHE / MODEL_OPTIONS_CACHE 永遠停留在 fork 那一刻的空白
+    狀態，不管 master 那邊背景執行緒或排程再怎麼刷新都沒用（worker 才是
+    真正回應前端請求的行程，前端永遠看到空/舊資料）。
+  - 修正方式：把 threading.Thread(...).start() 跟 scheduler.start() 從模組
+    最外層拿掉，改成定義但不呼叫；實際啟動移到同目錄新增的
+    gunicorn.conf.py 的 post_fork(server, worker) hook 裡呼叫。
+    post_fork 保證是在 fork 完成、worker process 自己的記憶體空間裡執行，
+    背景執行緒跟排程就會真的在 worker 裡跑、worker 自己的快取也才會被更新。
+  - 這個檔案本身 `python app.py` 直接執行（本機開發模式，不透過 gunicorn）
+    時不會有 fork 這個步驟，所以額外保留 `if __name__ == "__main__"` 區塊
+    自己呼叫一次啟動邏輯，確保本機開發體驗不受影響。
 """
 
 import os
@@ -716,6 +741,11 @@ def refresh_cache():
 # 先真的發一次 HTTPS 請求出去（就算失敗也沒關係，重點是強迫底層所有
 # 這些模組把 import 走過一輪、放進 sys.modules 快取），這樣之後不管多少
 # 執行緒同時打 requests.*，都不會再搶著做「第一次 import」而卡死。
+#
+# 注意：這段暖機請求留在模組最外層執行沒關係（不涉及背景執行緒/排程），
+# gunicorn master process 在 import 時會跑一次、worker fork 之後 import
+# 快取已經熱過，不會重複造成問題；即使重複執行也只是多發一次 HTTP 請求，
+# 沒有副作用。
 try:
     print("[startup] 暖機中：預先發送一次 HTTPS 請求，避免多執行緒 import 死結…", flush=True)
     requests.get("https://api.airtable.com/", timeout=10)
@@ -795,7 +825,12 @@ def refresh_model_options_cache():
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
 scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5))
-scheduler.start()
+# 注意（2026-08-30 修改十三）：這裡刻意不呼叫 scheduler.start()。
+# 實際啟動移到 gunicorn.conf.py 的 post_fork() hook 裡呼叫，確保排程是在
+# 真正處理請求的 worker process 裡執行，而不是 gunicorn 的 master process
+# （master 裡執行的話，worker 自己的 DATA_CACHE/MODEL_OPTIONS_CACHE 永遠
+# 不會被更新，因為兩者是 fork() 之後各自獨立的記憶體空間）。
+# 詳細原因見檔案最上方「2026-08-30 修改（十三）」的說明。
 
 
 def _startup_refresh_all():
@@ -803,12 +838,14 @@ def _startup_refresh_all():
     這個專案先前就踩過「多執行緒同時第一次呼叫 requests」會卡死的坑（見上面
     2026-08-28 修改十一的說明跟暖機那段），一次只讓一個背景執行緒去做「第一次」
     網路呼叫比較保險；等之後排程真的觸發時，import 早就熱過了，兩個排程工作
-    各自獨立執行就沒有這個風險，不需要也一起依序做。"""
+    各自獨立執行就沒有這個風險，不需要也一起依序做。
+
+    注意（2026-08-30 修改十三）：這個函式本身「定義」在這裡沒問題，但「呼叫」
+    這個函式的地方，已經從模組最外層移到 gunicorn.conf.py 的 post_fork() hook
+    裡（正式部署走 gunicorn 時），以及本檔案最下方 __main__ 區塊（本機開發
+    直接 `python app.py` 執行時），確保一定是在真正服務請求的 process 裡執行。"""
     refresh_cache()
     refresh_model_options_cache()
-
-
-threading.Thread(target=_startup_refresh_all, daemon=True).start()
 
 
 @app.after_request
@@ -1379,9 +1416,14 @@ def health():
             "module_options_available": MODEL_OPTIONS_CACHE.get("module_options_available"),
             "last_error": MODEL_OPTIONS_CACHE.get("last_error"),
         },
+        "scheduler_running": scheduler.running,
     })
 
 
 if __name__ == "__main__":
+    # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
+    # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
+    scheduler.start()
+    threading.Thread(target=_startup_refresh_all, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
