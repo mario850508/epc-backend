@@ -267,6 +267,16 @@ MILESTONE_TYPE_METER = "掛表"
 # （尤其「台電契約」，Airtable 裡可能叫「台電購售契約」），要一併修改這裡。
 DOCUMENT_MILESTONE_TYPES = ["免雜", "細部協商", "台電購售契約"]
 
+# 2026-08-30 新增：「筆記本」功能（/api/case-lookup）要一次查詢的函文／審查
+# 進度種類。跟上面 DOCUMENT_MILESTONE_TYPES 分開列一份，因為「待取得函文」
+# 功能跟「筆記本快速查詢」用途不同、選項範圍也不完全一樣（筆記本多了「併聯審查」
+# 跟「同意備案」）：
+#   - 同意備案：其實案件表（專案細節）上就有 lookup 欄位（FIELD_AGREE_DATE），
+#     但這裡為了讓 /api/case-lookup 回傳格式統一（案件基本資料 + 一份完整的
+#     里程碑字典），還是一併從「進度管理」表查一次里程碑的實際日期，跟其他
+#     幾種一樣處理，不用另外寫特殊分支。
+NOTEBOOK_MILESTONE_TYPES = ["併聯審查", "同意備案", "細部協商", "台電購售契約", "免雜"]
+
 CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
 INVERTER_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
@@ -279,10 +289,11 @@ INVERTER_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
 APP_DATA_TABLE_ID = "tblafnN1qFDoLgTx1"
 APP_DATA_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{APP_DATA_TABLE_ID}"
 
-# 註記清單允許的「類型」。2026-08-27 新增「未使用料件」——
+# 註記清單允許的「類型」。2026-08-27 新增「未使用料件」，2026-08-30 新增「電話紀錄」
+# （給前端「筆記本」功能的線上紀錄用）——
 # create_note() 的驗證跟 get_app_data() 組裝 notes 的判斷都要用這份同一份清單，
 # 避免兩邊各自寫一次、改一邊忘了改另一邊。
-NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件", "料件使用")
+NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件", "料件使用", "電話紀錄")
 
 # 2026-08-30 新增：模組／逆變器型號「隱藏清單」，也存在 APP資料 表，用獨立的
 # 類型「隱藏型號」跟上面 NOTE_TYPES 那些區分開（不會出現在前端「註記清單」裡）。
@@ -425,6 +436,54 @@ def _find_field_schema(table_id, field_id):
     return None
 
 
+def _find_field_id_by_name(table_id, field_name):
+    """透過 Airtable Meta API，用欄位「名稱」找到對應的欄位 ID（跟 _find_field_schema
+    用 ID 找欄位剛好相反）。2026-08-30 新增，給「筆記本」功能查詢「業務」欄位用——
+    因為當時不確定這個欄位實際的 field ID，用名稱動態查找可以省去手動去 Airtable
+    後台翻找 ID 的步驟；如果 Airtable 上這個欄位不叫這個名字，會找不到、回傳 None，
+    呼叫端要能優雅處理（顯示「未設定」而不是整支 API 壞掉）。"""
+    resp = requests.get(
+        f"https://api.airtable.com/v0/meta/bases/{BASE_ID}/tables",
+        headers=airtable_headers(),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    for table in data.get("tables", []):
+        if table.get("id") != table_id:
+            continue
+        for field in table.get("fields", []):
+            if field.get("name") == field_name:
+                return field.get("id")
+    return None
+
+
+# 2026-08-30 新增：「業務」（負責業務員）欄位的 ID，給「筆記本」功能
+# （/api/case-lookup）顯示案件基本資料用。因為一開始不確定這個欄位實際的
+# field ID，改成「用名稱動態查一次、記在記憶體快取」的做法——第一次呼叫
+# /api/case-lookup 時，會去 Airtable Meta API 找「專案細節」表裡名稱剛好叫
+# 「業務」的欄位，找到後把 ID 存起來，之後就不用每次都重新查。如果 Airtable
+# 上這個欄位的實際名稱不是「業務」兩個字（例如叫「承辦業務」「業務員」等），
+# 這裡會找不到、sales_person 會一律回傳 None，前端會顯示「尚未設定業務欄位」
+# 提示，不會讓整支 API 掛掉——之後只要把下面 SALES_FIELD_NAME 改成正確的
+# 欄位名稱，或直接把 SALES_FIELD_ID_CACHE["id"] 换成正確的 field ID 常數即可。
+SALES_FIELD_NAME = "綠點業務"
+SALES_FIELD_ID_CACHE = {"id": None, "resolved": False}
+
+
+def get_sales_field_id():
+    if not SALES_FIELD_ID_CACHE["resolved"]:
+        try:
+            SALES_FIELD_ID_CACHE["id"] = _find_field_id_by_name(CASE_TABLE_ID, SALES_FIELD_NAME)
+            if SALES_FIELD_ID_CACHE["id"] is None:
+                print(f"[get_sales_field_id] 在「專案細節」表找不到名稱是「{SALES_FIELD_NAME}」的欄位，"
+                      f"「業務」資訊將無法顯示，需要確認 Airtable 實際欄位名稱", flush=True)
+        except Exception as e:
+            print(f"[get_sales_field_id] 查詢「業務」欄位 ID 失敗：{e}", flush=True)
+        SALES_FIELD_ID_CACHE["resolved"] = True
+    return SALES_FIELD_ID_CACHE["id"]
+
+
 def ensure_milestone_record(case_record_id, milestone_type):
     """如果案件在「進度管理」表裡缺少指定種類的里程碑記錄（例如舊案件建立時
     範本還沒有這個種類、或人工建立時漏掉了），就自動新增一筆，種類設為
@@ -443,9 +502,21 @@ def ensure_milestone_record(case_record_id, milestone_type):
 
 def fetch_case_snapshot_for_archive(case_record_id):
     """針對已經離開排程池的案件（掛表已確認完成），直接用 record_id 查案件本身跟相關里程碑，
-    補齊「歷史紀錄」要顯示的資料。查不到就回傳 None（可能案件被刪除，或 record_id 有誤）。"""
+    補齊「歷史紀錄」要顯示的資料。查不到就回傳 None（可能案件被刪除，或 record_id 有誤）。
+
+    2026-08-31 修正：這裡原本呼叫單筆記錄的 GET API 時沒有加
+    returnFieldsByFieldId=true，導致回傳的 fields 是用「欄位名稱」當 key，
+    但下面全部用欄位 ID（FIELD_CASE_NO 等常數）去讀，兩邊對不起來，實際上
+    一直讀不到值（f.get(FIELD_CASE_NO) 會是 None）。這裡補上這個參數，
+    修正後歷史紀錄的欄位才會正確顯示；本檔案其他地方的 airtable_get_all()
+    批次查詢因為本來就有加這個參數，不受影響。"""
     try:
-        resp = requests.get(f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(), timeout=15)
+        resp = requests.get(
+            f"{CASE_API_URL}/{case_record_id}",
+            headers=airtable_headers(),
+            params={"returnFieldsByFieldId": "true"},
+            timeout=15,
+        )
         if resp.status_code >= 400:
             return None
         f = resp.json().get("fields", {})
@@ -456,6 +527,8 @@ def fetch_case_snapshot_for_archive(case_record_id):
     inverter_ids = f.get(FIELD_INVERTER) or []
     inverter_name_map = resolve_inverter_names(inverter_ids)
     inverter = format_inverter(f, inverter_name_map)
+    sales_field_id = get_sales_field_id()
+    sales_person = f.get(sales_field_id) if sales_field_id else None
 
     ms_ids = f.get(FIELD_MS_LINK_ON_CASE) or []
     ship_date = entry_date = meter_date = None
@@ -489,6 +562,7 @@ def fetch_case_snapshot_for_archive(case_record_id):
         "address": f.get(FIELD_ADDRESS, ""),
         "module": module,
         "inverter": inverter,
+        "sales_person": sales_person,
         "ship_date": ship_date,
         "entry_date": entry_date,
         "meter_date": meter_date,
@@ -622,6 +696,9 @@ def compute_case_pool():
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_AGREE_DATE,
               FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
               FIELD_MS_LINK_ON_CASE]
+    sales_field_id = get_sales_field_id()
+    if sales_field_id:
+        fields.append(sales_field_id)
     print("[步驟1] 開始查詢案件池…", flush=True)
     records = airtable_get_all(CASE_API_URL, formula, fields)
     print(f"[步驟1] 完成，案件池共 {len(records)} 筆", flush=True)
@@ -640,6 +717,7 @@ def compute_pending_and_entry():
     for r in case_records:
         all_inverter_ids.update(r["fields"].get(FIELD_INVERTER) or [])
     inverter_name_map = resolve_inverter_names(all_inverter_ids)
+    sales_field_id = get_sales_field_id()
     print("[步驟4] 開始整理清單…", flush=True)
 
     pending, entry, completed = [], [], []
@@ -659,6 +737,7 @@ def compute_pending_and_entry():
             "address": f.get(FIELD_ADDRESS, ""),
             "module": module,
             "inverter": inverter,
+            "sales_person": f.get(sales_field_id) if sales_field_id else None,
         }
 
         if not (ship_info and ship_info.get("actual_date")):
@@ -1280,6 +1359,71 @@ def update_case_spec():
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
     threading.Thread(target=refresh_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
+
+
+@app.route("/api/case-lookup")
+def case_lookup():
+    """給前端「筆記本」功能用：輸入案號，一次回傳這個案件的基本資料（案號／別名／
+    廠商／地址／模組／逆變器／業務）跟關鍵進度日期（併聯審查／同意備案／細部協商／
+    台電購售契約／免雜）。即時查 Airtable，不走整批快取（跟 /api/milestone-status
+    一樣，只有使用者主動查詢時才會用到，不需要整批處理）。方便使用者在跟廠商講電話
+    當下，直接在筆記本裡輸入案號就能快速看到案件現況，不用另外切換分頁去 Airtable
+    或翻案件列表比對。
+    query params: case_no（完整案號，需完全相符）"""
+    case_no = (request.args.get("case_no") or "").strip()
+    if not case_no:
+        return jsonify({"error": "缺少 case_no"}), 400
+    try:
+        escaped = case_no.replace("'", "\\'")
+        formula = f"{{{FIELD_CASE_NO}}}='{escaped}'"
+        sales_field_id = get_sales_field_id()
+        fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS,
+                  FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
+                  FIELD_MS_LINK_ON_CASE]
+        if sales_field_id:
+            fields.append(sales_field_id)
+        records = airtable_get_all(CASE_API_URL, formula, fields)
+        if not records:
+            return jsonify({"found": False})
+
+        r = records[0]
+        f = r["fields"]
+        module = format_module(f)
+        inverter_ids = f.get(FIELD_INVERTER) or []
+        inverter_name_map = resolve_inverter_names(inverter_ids)
+        inverter = format_inverter(f, inverter_name_map)
+        sales_person = f.get(sales_field_id) if sales_field_id else None
+
+        ms_ids = f.get(FIELD_MS_LINK_ON_CASE) or []
+        milestones = {t: None for t in NOTEBOOK_MILESTONE_TYPES}
+        if ms_ids:
+            id_formula = "OR(" + ",".join(f"RECORD_ID()='{mid}'" for mid in ms_ids) + ")"
+            type_formula = "OR(" + ",".join(
+                f"{{{FIELD_MS_TYPE}}}='{t}'" for t in NOTEBOOK_MILESTONE_TYPES
+            ) + ")"
+            ms_formula = f"AND({id_formula},{type_formula})"
+            ms_records = airtable_get_all(MILESTONE_API_URL, ms_formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE])
+            for mr in ms_records:
+                mf = mr["fields"]
+                mtype = mf.get(FIELD_MS_TYPE)
+                if mtype in milestones:
+                    milestones[mtype] = mf.get(FIELD_MS_ACTUAL_DATE)
+
+        return jsonify({
+            "found": True,
+            "record_id": r["id"],
+            "case": f.get(FIELD_CASE_NO, ""),
+            "alias": f.get(FIELD_ALIAS, ""),
+            "vendor": f.get(FIELD_VENDOR, ""),
+            "address": f.get(FIELD_ADDRESS, ""),
+            "module": module,
+            "inverter": inverter,
+            "sales_person": sales_person,
+            "sales_field_configured": sales_field_id is not None,
+            "milestones": milestones,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/milestone-status")
