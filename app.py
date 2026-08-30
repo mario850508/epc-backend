@@ -821,6 +821,21 @@ def refresh_model_options_cache():
             for r in records
         ]
         inverter_options.sort(key=lambda o: o["name"] or "")
+        # 2026-08-30 新增：「採購-逆變器」表裡存在同名重複記錄（同一型號被建立成
+        # 好幾筆獨立的 Airtable 記錄），下拉選單如果整表照列，使用者會看到同一個
+        # 型號名稱重複出現好幾次，選哪一筆都分不清楚差異在哪。這裡依名稱去重，
+        # 同名只保留第一筆（用哪一筆的 record_id 不影響顯示名稱，寫入時只要
+        # record_id 對應得到一筆有效記錄即可）。這只影響「下拉選單顯示」，
+        # 不會刪除 Airtable 裡任何重複的原始記錄，既有案件連結的舊 record_id
+        # 也完全不受影響。
+        seen_names = set()
+        deduped_inverter_options = []
+        for o in inverter_options:
+            if o["name"] in seen_names:
+                continue
+            seen_names.add(o["name"])
+            deduped_inverter_options.append(o)
+        inverter_options = deduped_inverter_options
     except Exception as e:
         msg = f"逆變器選項讀取失敗：{e}"
         print(f"{tag} {msg}（沿用舊快取）", flush=True)
