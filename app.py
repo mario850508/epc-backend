@@ -1330,7 +1330,16 @@ def update_case_spec():
     body 裡要帶 /api/inverter-options 回傳的 record_id，不能只給名稱。
     body: {case_record_id, module_model, module_qty, inverters: [{record_id, qty}, ...]}
     module_model/module_qty/inverters 都是選填，只會更新有帶到的欄位；
-    inverters 給空陣列代表清空逆變器（連同數量欄位一起清空）。"""
+    inverters 給空陣列代表清空逆變器（連同數量欄位一起清空）。
+
+    2026-08-31 修正：body 裡即使帶了 module_qty，也不會真的寫進 Airtable。
+    實測發現 FIELD_MODULE_QTY 對應的「電廠模組片數」欄位在 Airtable 裡其實是
+    計算欄位（公式／rollup 算出來的），外部一律不能寫入，Airtable 會直接拒絕
+    整筆 PATCH（連同一起送的模組型號也會跟著存不進去，因為 Airtable 的欄位
+    更新是整包成功或整包失敗）。既然這個欄位本來就不可能寫入成功，這裡乾脆
+    完全不送這個欄位，只更新真正能改的「模組型號」，避免每次都因為這個欄位
+    整包失敗。前端也已經把「數量」輸入框改成唯讀顯示，不會再讓使用者以為
+    可以在這裡修改片數。"""
     body = request.get_json(force=True)
     case_record_id = body.get("case_record_id")
     if not case_record_id:
@@ -1339,8 +1348,8 @@ def update_case_spec():
     fields = {}
     if "module_model" in body:
         fields[FIELD_MODULE_MODEL] = (body.get("module_model") or "").strip() or None
-    if "module_qty" in body:
-        fields[FIELD_MODULE_QTY] = body.get("module_qty")
+    # module_qty 刻意不處理：對應的 Airtable 欄位是計算欄位，寫入必定被拒絕，
+    # 詳見上方 2026-08-31 修正說明。
     if "inverters" in body:
         inverters = body.get("inverters") or []
         fields[FIELD_INVERTER] = [inv["record_id"] for inv in inverters if inv.get("record_id")]
