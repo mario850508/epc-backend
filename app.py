@@ -1361,33 +1361,98 @@ def update_case_spec():
     return jsonify({"ok": True, "record": resp.json()})
 
 
+@app.route("/api/case-search")
+def case_search():
+    """給前端「筆記本」功能用：模糊搜尋案件，輸入案號、別名（案場常常把屋主姓名
+    寫在別名裡）或地址的其中一段關鍵字，就能列出符合的候選案件，讓使用者從清單
+    裡點選正確的那一筆，不用打完整、一字不差的案號。只回傳輕量欄位（案號／別名／
+    廠商／地址）給清單顯示用，選定之後前端再呼叫 /api/case-lookup（帶
+    case_record_id）查詢完整規格跟函文進度，這樣使用者一個字一個字打的時候，
+    每次查詢都很輕量、不會卡頓。
+    query params: q（至少 1 個字，會同時比對案號／別名／地址，比對不分大小寫）"""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"results": []})
+    try:
+        escaped = q.replace("'", "\\'").replace('"', '\\"')
+        formula = (
+            f"OR("
+            f"FIND(LOWER('{escaped}'),LOWER({{{FIELD_CASE_NO}}}))>0,"
+            f"FIND(LOWER('{escaped}'),LOWER({{{FIELD_ALIAS}}}))>0,"
+            f"FIND(LOWER('{escaped}'),LOWER({{{FIELD_ADDRESS}}}))>0"
+            f")"
+        )
+        resp = requests.get(
+            CASE_API_URL,
+            headers=airtable_headers(),
+            params={
+                "filterByFormula": formula,
+                "fields[]": [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS],
+                "maxRecords": 8,  # 只是打字時的候選清單，不需要撈全部符合的筆數
+                "returnFieldsByFieldId": "true",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        records = resp.json().get("records", [])
+        results = []
+        for r in records:
+            f = r["fields"]
+            results.append({
+                "record_id": r["id"],
+                "case": f.get(FIELD_CASE_NO, ""),
+                "alias": f.get(FIELD_ALIAS, ""),
+                "vendor": f.get(FIELD_VENDOR, ""),
+                "address": f.get(FIELD_ADDRESS, ""),
+            })
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/api/case-lookup")
 def case_lookup():
-    """給前端「筆記本」功能用：輸入案號，一次回傳這個案件的基本資料（案號／別名／
-    廠商／地址／模組／逆變器／業務）跟關鍵進度日期（併聯審查／同意備案／細部協商／
+    """給前端「筆記本」功能用：查詢單一案件的完整基本資料（案號／別名／廠商／
+    地址／模組／逆變器／業務）跟關鍵進度日期（併聯審查／同意備案／細部協商／
     台電購售契約／免雜）。即時查 Airtable，不走整批快取（跟 /api/milestone-status
-    一樣，只有使用者主動查詢時才會用到，不需要整批處理）。方便使用者在跟廠商講電話
-    當下，直接在筆記本裡輸入案號就能快速看到案件現況，不用另外切換分頁去 Airtable
-    或翻案件列表比對。
-    query params: case_no（完整案號，需完全相符）"""
+    一樣，只有使用者主動查詢時才會用到，不需要整批處理）。
+    query params（擇一提供即可，優先用 case_record_id）：
+      - case_record_id：使用者從 /api/case-search 的候選清單裡點選後，直接帶
+        record_id 查，最準確也最快（不用另外打公式比對）。
+      - case_no：完整案號，需完全相符（保留給還沒有 record_id 的呼叫端用，
+        例如舊版前端或其他直接輸入完整案號的情境）。"""
+    case_record_id = (request.args.get("case_record_id") or "").strip()
     case_no = (request.args.get("case_no") or "").strip()
-    if not case_no:
-        return jsonify({"error": "缺少 case_no"}), 400
+    if not case_record_id and not case_no:
+        return jsonify({"error": "缺少 case_record_id 或 case_no"}), 400
     try:
-        escaped = case_no.replace("'", "\\'")
-        formula = f"{{{FIELD_CASE_NO}}}='{escaped}'"
         sales_field_id = get_sales_field_id()
-        fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS,
-                  FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
-                  FIELD_MS_LINK_ON_CASE]
-        if sales_field_id:
-            fields.append(sales_field_id)
-        records = airtable_get_all(CASE_API_URL, formula, fields)
-        if not records:
-            return jsonify({"found": False})
 
-        r = records[0]
-        f = r["fields"]
+        if case_record_id:
+            resp = requests.get(
+                f"{CASE_API_URL}/{case_record_id}",
+                headers=airtable_headers(),
+                params={"returnFieldsByFieldId": "true"},
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                return jsonify({"found": False})
+            f = resp.json().get("fields", {})
+            record_id = case_record_id
+        else:
+            escaped = case_no.replace("'", "\\'")
+            formula = f"{{{FIELD_CASE_NO}}}='{escaped}'"
+            fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS,
+                      FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY,
+                      FIELD_MS_LINK_ON_CASE]
+            if sales_field_id:
+                fields.append(sales_field_id)
+            records = airtable_get_all(CASE_API_URL, formula, fields)
+            if not records:
+                return jsonify({"found": False})
+            f = records[0]["fields"]
+            record_id = records[0]["id"]
+
         module = format_module(f)
         inverter_ids = f.get(FIELD_INVERTER) or []
         inverter_name_map = resolve_inverter_names(inverter_ids)
@@ -1411,7 +1476,7 @@ def case_lookup():
 
         return jsonify({
             "found": True,
-            "record_id": r["id"],
+            "record_id": record_id,
             "case": f.get(FIELD_CASE_NO, ""),
             "alias": f.get(FIELD_ALIAS, ""),
             "vendor": f.get(FIELD_VENDOR, ""),
