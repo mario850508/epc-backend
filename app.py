@@ -484,6 +484,35 @@ def get_sales_field_id():
     return SALES_FIELD_ID_CACHE["id"]
 
 
+# 2026-08-31 新增：「採購-逆變器」表裡的「專案」欄位 ID——這個欄位把每一筆
+# 逆變器記錄（一筆＝一顆實體逆變器）連結回「專案細節」表的案件。發現案件表上
+# 「逆變器數量」是 rollup（加總所有連結到這個案件的逆變器記錄），不是能直接
+# 填數字的欄位；要讓某個案件「有 2 顆 CPSPV6600ETL1」，正確做法是讓 2 筆
+# 型號＝CPSPV6600ETL1 的獨立記錄，把各自的「專案」欄位連到這個案件（原本
+# 使用者是透過另一個 Airtable Extension，選好案件、型號、數量後，由那支
+# script 自動建立對應筆數的新記錄）。這裡比照 SALES_FIELD_ID_CACHE 的做法，
+# 用名稱「專案」動態查一次 ID、記在記憶體快取，避免要手動去 Airtable 後台
+# 翻找確切的 field ID。
+INVERTER_PROJECT_FIELD_NAME = "專案"
+INVERTER_PROJECT_FIELD_ID_CACHE = {"id": None, "resolved": False}
+
+
+def get_inverter_project_field_id():
+    if not INVERTER_PROJECT_FIELD_ID_CACHE["resolved"]:
+        try:
+            INVERTER_PROJECT_FIELD_ID_CACHE["id"] = _find_field_id_by_name(
+                INVERTER_TABLE_ID, INVERTER_PROJECT_FIELD_NAME
+            )
+            if INVERTER_PROJECT_FIELD_ID_CACHE["id"] is None:
+                print(f"[get_inverter_project_field_id] 在「採購-逆變器」表找不到名稱是"
+                      f"「{INVERTER_PROJECT_FIELD_NAME}」的欄位，新增逆變器數量功能將無法使用，"
+                      f"需要確認 Airtable 實際欄位名稱", flush=True)
+        except Exception as e:
+            print(f"[get_inverter_project_field_id] 查詢「專案」欄位 ID 失敗：{e}", flush=True)
+        INVERTER_PROJECT_FIELD_ID_CACHE["resolved"] = True
+    return INVERTER_PROJECT_FIELD_ID_CACHE["id"]
+
+
 def ensure_milestone_record(case_record_id, milestone_type):
     """如果案件在「進度管理」表裡缺少指定種類的里程碑記錄（例如舊案件建立時
     範本還沒有這個種類、或人工建立時漏掉了），就自動新增一筆，種類設為
@@ -1323,23 +1352,92 @@ def remove_hidden_model(record_id):
     return jsonify({"ok": True})
 
 
+def _fetch_case_current_inverter_ids(case_record_id):
+    """讀取這個案件目前實際連結的逆變器 record_id 清單（直接查案件本身的
+    FIELD_INVERTER 欄位，不是查快取），給 sync_inverter_units_for_case() 用來
+    比對「這個型號目前已經連了幾筆」。"""
+    resp = requests.get(
+        f"{CASE_API_URL}/{case_record_id}",
+        headers=airtable_headers(),
+        params={"returnFieldsByFieldId": "true"},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    f = resp.json().get("fields", {})
+    return f.get(FIELD_INVERTER) or []
+
+
+def sync_inverter_units_for_case(case_record_id, desired):
+    """把案件的逆變器連結，同步成使用者想要的「型號＋數量」組合。
+
+    背景：案件上的「逆變器數量」是 rollup（加總所有連結到這個案件的逆變器記錄），
+    不是能直接填數字的欄位；「採購-逆變器」表裡一筆記錄＝一顆實體逆變器（數量
+    固定是 1）。要讓案件「有 2 顆 CPSPV6600ETL1」，正確做法是讓 2 筆型號＝
+    CPSPV6600ETL1 的獨立記錄，把「專案」欄位連到這個案件——這裡就是在做這件事：
+    比對案件目前已經連結的逆變器記錄（依型號分組），數量不夠的型號就自動新增
+    對應筆數的新記錄補齊，數量給的比現有的少（或整個型號被拿掉不要了）則不去
+    刪除那些實體記錄本身，只是不再把它們連回這個案件（案件的逆變器數量 rollup
+    因此會自動跟著減少）。
+
+    desired: [{"name": 型號名稱, "qty": 想要的總數量}, ...]
+    回傳最終應該連到這個案件的完整 record_id 清單（給呼叫端拿去 PATCH 案件的
+    FIELD_INVERTER 用）。"""
+    existing_ids = _fetch_case_current_inverter_ids(case_record_id)
+    existing_name_map = resolve_inverter_names(existing_ids) if existing_ids else {}
+    # 依型號把「目前已連結」的 record_id 分組，方便逐一比對夠不夠
+    existing_by_name = {}
+    for rid in existing_ids:
+        name = existing_name_map.get(rid, rid)
+        existing_by_name.setdefault(name, []).append(rid)
+
+    project_field_id = get_inverter_project_field_id()
+    final_ids = []
+    for item in desired:
+        name = (item.get("name") or "").strip()
+        qty = item.get("qty")
+        if not name or not qty or qty < 1:
+            continue
+        pool = existing_by_name.get(name, [])
+        keep = pool[:qty]
+        final_ids.extend(keep)
+        shortfall = qty - len(keep)
+        for _ in range(shortfall):
+            create_fields = {INVERTER_MODEL_FIELD: name}
+            if project_field_id:
+                create_fields[project_field_id] = [case_record_id]
+            resp = requests.post(
+                INVERTER_API_URL,
+                headers=airtable_headers(),
+                json={"fields": create_fields},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            final_ids.append(resp.json()["id"])
+    return final_ids
+
+
 @app.route("/api/case-spec", methods=["POST"])
 def update_case_spec():
     """直接在網站上補填/修改案件的模組、逆變器規格，寫回 Airtable「專案細節」表，
-    不用再回 Airtable 手動填。模組型號是純文字欄位，可以自由輸入；逆變器是連結欄位，
-    body 裡要帶 /api/inverter-options 回傳的 record_id，不能只給名稱。
-    body: {case_record_id, module_model, module_qty, inverters: [{record_id, qty}, ...]}
-    module_model/module_qty/inverters 都是選填，只會更新有帶到的欄位；
-    inverters 給空陣列代表清空逆變器（連同數量欄位一起清空）。
+    不用再回 Airtable 手動填。模組型號是純文字欄位，可以自由輸入。
+    body: {case_record_id, module_model, inverters: [{name, qty}, ...]}
+    module_model/inverters 都是選填，只會更新有帶到的欄位；
+    inverters 給空陣列代表清空所有逆變器連結。
 
     2026-08-31 修正：body 裡即使帶了 module_qty，也不會真的寫進 Airtable。
     實測發現 FIELD_MODULE_QTY 對應的「電廠模組片數」欄位在 Airtable 裡其實是
-    計算欄位（公式／rollup 算出來的），外部一律不能寫入，Airtable 會直接拒絕
-    整筆 PATCH（連同一起送的模組型號也會跟著存不進去，因為 Airtable 的欄位
-    更新是整包成功或整包失敗）。既然這個欄位本來就不可能寫入成功，這裡乾脆
-    完全不送這個欄位，只更新真正能改的「模組型號」，避免每次都因為這個欄位
-    整包失敗。前端也已經把「數量」輸入框改成唯讀顯示，不會再讓使用者以為
-    可以在這裡修改片數。"""
+    計算欄位（公式／rollup 算出來的，依系統容量換算），外部一律不能寫入，
+    Airtable 會直接拒絕整筆 PATCH（連同一起送的模組型號也會跟著存不進去，
+    因為 Airtable 的欄位更新是整包成功或整包失敗）。這裡完全不送這個欄位，
+    只更新真正能改的「模組型號」。
+
+    2026-08-31 追加修正：逆變器的處理方式整個改掉了。原本以為 FIELD_INVERTER_QTY
+    （「逆變器數量」）可以直接寫入一個數字，但實測它也是計算欄位（rollup，加總
+    所有連結到這個案件的逆變器記錄）——「數量」的來源其實是「連結了幾筆逆變器
+    記錄」，不是一個獨立可填的數字。所以 inverters 現在改成 {name, qty} 的格式
+    （型號名稱＋想要的總數量），實際處理交給 sync_inverter_units_for_case()：
+    比對案件目前已連結幾筆該型號、不夠的話自動新增對應筆數的新記錄補齊，這樣
+    案件上的逆變器數量 rollup 才會自動變成使用者想要的數字。"""
     body = request.get_json(force=True)
     case_record_id = body.get("case_record_id")
     if not case_record_id:
@@ -1350,10 +1448,12 @@ def update_case_spec():
         fields[FIELD_MODULE_MODEL] = (body.get("module_model") or "").strip() or None
     # module_qty 刻意不處理：對應的 Airtable 欄位是計算欄位，寫入必定被拒絕，
     # 詳見上方 2026-08-31 修正說明。
+
     if "inverters" in body:
-        inverters = body.get("inverters") or []
-        fields[FIELD_INVERTER] = [inv["record_id"] for inv in inverters if inv.get("record_id")]
-        fields[FIELD_INVERTER_QTY] = [inv.get("qty") for inv in inverters if inv.get("record_id")]
+        try:
+            fields[FIELD_INVERTER] = sync_inverter_units_for_case(case_record_id, body.get("inverters") or [])
+        except Exception as e:
+            return jsonify({"error": "建立／比對逆變器記錄失敗", "detail": str(e)}), 502
 
     if not fields:
         return jsonify({"error": "沒有帶任何要更新的欄位"}), 400
@@ -1367,6 +1467,7 @@ def update_case_spec():
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
     threading.Thread(target=refresh_cache, daemon=True).start()
+    threading.Thread(target=refresh_model_options_cache, daemon=True).start()
     return jsonify({"ok": True, "record": resp.json()})
 
 
