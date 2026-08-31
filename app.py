@@ -513,6 +513,32 @@ def get_inverter_project_field_id():
     return INVERTER_PROJECT_FIELD_ID_CACHE["id"]
 
 
+# 2026-08-31 追加修正：案件上的「逆變器數量」rollup 實測是加總每一筆連結記錄
+# 自己的「數量」欄位（不是單純算連結了幾筆），所以新建立的逆變器記錄如果沒有
+# 順便把它自己的「數量」欄位設成 1，這筆記錄雖然連結上了，但因為自己的數量是
+# 空值，rollup 加總時不會被計入，案件上顯示的逆變器數量就不會增加——這就是
+# 「型號存進去了、但數量沒變」的原因。跟「專案」欄位一樣，用名稱動態查一次 ID。
+INVERTER_UNIT_QTY_FIELD_NAME = "數量"
+INVERTER_UNIT_QTY_FIELD_ID_CACHE = {"id": None, "resolved": False}
+
+
+def get_inverter_unit_qty_field_id():
+    if not INVERTER_UNIT_QTY_FIELD_ID_CACHE["resolved"]:
+        try:
+            INVERTER_UNIT_QTY_FIELD_ID_CACHE["id"] = _find_field_id_by_name(
+                INVERTER_TABLE_ID, INVERTER_UNIT_QTY_FIELD_NAME
+            )
+            if INVERTER_UNIT_QTY_FIELD_ID_CACHE["id"] is None:
+                print(f"[get_inverter_unit_qty_field_id] 在「採購-逆變器」表找不到名稱是"
+                      f"「{INVERTER_UNIT_QTY_FIELD_NAME}」的欄位，新建立的逆變器記錄將不會"
+                      f"帶入數量，案件上的逆變器數量 rollup 可能不會正確增加，"
+                      f"需要確認 Airtable 實際欄位名稱", flush=True)
+        except Exception as e:
+            print(f"[get_inverter_unit_qty_field_id] 查詢「數量」欄位 ID 失敗：{e}", flush=True)
+        INVERTER_UNIT_QTY_FIELD_ID_CACHE["resolved"] = True
+    return INVERTER_UNIT_QTY_FIELD_ID_CACHE["id"]
+
+
 def ensure_milestone_record(case_record_id, milestone_type):
     """如果案件在「進度管理」表裡缺少指定種類的里程碑記錄（例如舊案件建立時
     範本還沒有這個種類、或人工建立時漏掉了），就自動新增一筆，種類設為
@@ -1391,6 +1417,7 @@ def sync_inverter_units_for_case(case_record_id, desired):
         existing_by_name.setdefault(name, []).append(rid)
 
     project_field_id = get_inverter_project_field_id()
+    unit_qty_field_id = get_inverter_unit_qty_field_id()
     final_ids = []
     for item in desired:
         name = (item.get("name") or "").strip()
@@ -1405,6 +1432,12 @@ def sync_inverter_units_for_case(case_record_id, desired):
             create_fields = {INVERTER_MODEL_FIELD: name}
             if project_field_id:
                 create_fields[project_field_id] = [case_record_id]
+            if unit_qty_field_id:
+                # 案件上的「逆變器數量」是加總每一筆連結記錄自己的「數量」欄位，
+                # 不是單純算連結了幾筆，所以新記錄一定要把自己的數量設成 1，
+                # 不然雖然連結上了，但因為自己的數量是空值，rollup 不會計入，
+                # 案件上看到的逆變器數量就不會增加。
+                create_fields[unit_qty_field_id] = 1
             resp = requests.post(
                 INVERTER_API_URL,
                 headers=airtable_headers(),
