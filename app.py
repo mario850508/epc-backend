@@ -245,7 +245,11 @@ FIELD_CLOSE_STATUS = "fldrnWIhxkZzJ7Got"
 FIELD_HANG_METER_DATE = "fldNS6vTbnDtmQG0X"
 FIELD_MS_LINK_ON_CASE = "fldEs9vLzY416tTHo"  # 「進度管理」連結欄位（在專案細節表上）
 
-VENDOR_NAMES = ["三創", "尚展", "曙光", "光鼎"]
+# 2026-08-31 新增 8 間廠商（宇陽達、聚曜、澄品、大昇、展亦、凰太竹、國欽、振庭）。
+# 這份清單直接決定 compute_case_pool() 查詢 Airtable 時的篩選條件——不在這份
+# 清單裡的廠商，案件從一開始就不會被抓進案件池，之後不管前端怎麼篩選都看不到，
+# 所以新增廠商一定要先加進這裡。
+VENDOR_NAMES = ["三創", "尚展", "曙光", "光鼎", "宇陽達", "聚曜", "澄品", "大昇", "展亦", "凰太竹", "國欽", "振庭"]
 
 # ---- 採購-逆變器 ----
 INVERTER_TABLE_ID = "tbl7l7OM63jo3pxDN"
@@ -736,7 +740,7 @@ def fetch_milestones_for_case_pool(case_records):
 
 
 def compute_case_pool():
-    """抓一次基礎案件池：進行中 + 同意備案已填 + 掛表日期空 + 三創/尚展/曙光。
+    """抓一次基礎案件池：進行中 + 同意備案已填 + 掛表日期空 + VENDOR_NAMES 清單裡的廠商。
     這批案件同時涵蓋『待安排出貨』跟『已出貨待進場』兩種狀態（因為兩者都還沒掛表），
     後面再依「大料出貨時間」「進場屋主預約」是否已填分流，不用分兩次查案件表。"""
     vendor_formula = "OR(" + ",".join(f"{{{FIELD_VENDOR}}}='{v}'" for v in VENDOR_NAMES) + ")"
