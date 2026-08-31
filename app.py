@@ -661,6 +661,12 @@ def resolve_inverter_names(record_ids):
         print(f"[步驟3] 第 {batch_no}/{total_batches} 批完成，取得 {len(records)} 筆", flush=True)
         for r in records:
             name_map[r["id"]] = r["fields"].get(INVERTER_MODEL_FIELD, r["id"])
+        # 2026-08-31 新增：廠商清單擴增到 12 間後案件量變多，批次數也跟著變多，
+        # 這裡刻意加一個小間隔（Airtable 官方限制每秒 5 次請求，沒有間隔的話
+        # 案件量一大很容易連續撞到這個限制被拒絕）。0.25 秒等於每秒最多 4 次，
+        # 留一點安全餘裕。
+        if batch_no < total_batches:
+            time.sleep(0.25)
     return name_map
 
 
@@ -734,6 +740,10 @@ def fetch_milestones_for_case_pool(case_records):
                     entry_map[cid] = entry
                 elif ms_type == MILESTONE_TYPE_METER:
                     meter_map[cid] = entry
+        # 2026-08-31 新增：理由同 resolve_inverter_names() 那邊的說明——廠商清單
+        # 擴增後批次數變多，加一點間隔避免連續撞到 Airtable 每秒 5 次請求的限制。
+        if batch_no < total_batches:
+            time.sleep(0.25)
     print(f"[步驟2] 全部完成，ship_map={len(ship_map)} entry_map={len(entry_map)} "
           f"meter_map={len(meter_map)}", flush=True)
     return ship_map, entry_map, meter_map
@@ -849,7 +859,12 @@ _cache_lock = threading.Lock()
 # process 之間狀態不同步的情況（懷疑跟 Render 平台的 worker 生命週期/健康檢查機制有關，
 # 不是單純的程式邏輯問題），因此把門檻從 5 分鐘縮短到 1 分鐘，讓系統能更快自動恢復，
 # 把使用者最長等待時間壓在可接受範圍內。
-STALE_REFRESH_SECONDS = 60
+# 2026-08-31 調整：廠商清單從 4 間擴增到 12 間後，案件池變大，單輪刷新
+# 需要的時間也會跟著變長（更多案件 → 更多里程碑批次查詢 → 更多 Airtable API
+# 呼叫）。門檻拉長到 3 分鐘，避免案件量變多之後，正常但比較久的一輪刷新被
+# 誤判成「卡死」而被強制中斷重跑；這個數字仍然安全地小於 gunicorn.conf.py
+# 裡 worker 的 --timeout 300 秒設定，不會反過來造成 worker 被砍。
+STALE_REFRESH_SECONDS = 180
 
 
 def refresh_cache():
