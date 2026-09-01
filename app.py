@@ -413,21 +413,30 @@ def app_data_find_case_row(case_record_id):
 
 
 def app_data_create(fields):
+    """2026-09-01 修正：原本用 resp.raise_for_status() 拋出例外，訊息只有
+    「422 Client Error: ...」這種通用文字，看不到 Airtable 真正回傳的錯誤內容
+    （例如是哪個欄位、什麼原因被拒絕）。改成失敗時直接把 resp.text（Airtable
+    原始回應內容）當作例外訊息拋出，這樣 create_note() 等呼叫端的
+    except Exception as e 抓到的 str(e) 就會是真正有用的錯誤細節，不用再靠
+    使用者一步步用瀏覽器開發者工具去對照猜測。"""
     resp = requests.post(APP_DATA_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
     return resp.json()
 
 
 def app_data_update(record_id, fields):
     resp = requests.patch(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(),
                            json={"fields": fields}, timeout=20)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
     return resp.json()
 
 
 def app_data_delete(record_id):
     resp = requests.delete(f"{APP_DATA_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
     return resp.json()
 
 
