@@ -207,6 +207,8 @@ EPC 出貨／進場排程 後端 API
 """
 
 import os
+import io
+import json
 import time
 import uuid
 import threading
@@ -315,6 +317,414 @@ NOTE_TYPES = ("併聯取得時備貨", "其他狀況備住", "未使用料件", 
 #                逆變器型號：因為要比對的是 record_id，但畫面上要顯示名稱給使用者看，
 #                所以存成 "record_id::名稱" 這種組合格式，用的時候用 "::" 切開。
 HIDDEN_MODEL_TYPE = "隱藏型號"
+
+# ===================================================================
+# 維運驗收（維運團隊現場驗收，2026-09-08 新增）
+# ===================================================================
+# 這張表跟「廠商資料」表都是全新建立，一律用欄位 ID 存取（跟「專案細節」
+# 「進度管理」等舊表一致的慣例），欄位 ID 直接來自建表當下 Airtable 回傳的結果。
+OPS_TABLE_ID = "tbl0qVhhjkwj200RP"
+OPS_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{OPS_TABLE_ID}"
+
+OPS_FIELD_CASE_NAME = "fld9egTx0mfs94wIr"          # 案場名稱（primary field）
+OPS_FIELD_CASE_NO = "fldocN9NDjgCymWkz"            # 案號
+OPS_FIELD_CASE_LINK = "fld500oePwtRY9JpP"          # 關聯案件（連結到 專案細節）
+OPS_FIELD_VENDOR = "fld8xjiEsIaYj2fIf"             # 廠商（簡稱，快照）
+OPS_FIELD_VENDOR_FULLNAME = "fldK2kuu5Vdx3DXrr"    # 系統商單位全名
+OPS_FIELD_OWNER_COMPANY = "fldQ1LwFOK82xBr5K"      # 業主單位
+OPS_FIELD_PLANNED_METER_DATE = "fldpqZvxSWPANgN51"  # 預計掛表日期
+OPS_FIELD_CHECKLIST_JSON = "flda5pq5f33TcSs38"     # 檢查項目JSON
+OPS_FIELD_OTHER_ISSUES = "fldZycOWm4ZrzmnGA"       # 其他缺失
+OPS_FIELD_RESULT = "flduHCx5T9wNwvIif"             # 驗收結果（multipleSelects）
+OPS_FIELD_EQUIPMENT_JSON = "fldkbi9CSbI9NayFC"     # 設備清單JSON
+OPS_FIELD_OWNER_SIGNER_NAME = "fld1qIuXxhh7Cdy5L"  # 業主代表姓名
+OPS_FIELD_OWNER_SIGNATURE = "fldYjfMYVHkwKCe9C"    # 業主簽名（attachment）
+OPS_FIELD_OWNER_SIGN_DATE = "fldPGEZtKYZcmRkJP"    # 業主簽名日期
+OPS_FIELD_VENDOR_SIGNER_NAME = "fldLI1dfYyoUkhNM8"  # 系統商代表姓名
+OPS_FIELD_VENDOR_SIGNATURE = "fldkfJUSFsBUSzp9W"   # 系統商簽名（attachment）
+OPS_FIELD_VENDOR_SIGN_DATE = "fldVCZ61YlZXpWO9F"   # 系統商簽名日期
+OPS_FIELD_STATUS = "fldRGN4AsqexXxLDn"             # 狀態（singleSelect）
+OPS_FIELD_PDF = "fldHYRHed1WT48pBy"                # PDF檔案（attachment）
+
+OPS_STATUS_PENDING = "待填寫"
+OPS_STATUS_DONE = "已完成驗收"
+OPS_STATUS_PDF = "已產生PDF"
+
+# ---- 廠商資料（廠商簡稱 -> 公司全名 對照表，2026-09-08 新增）----
+VENDOR_INFO_TABLE_ID = "tblAbT7VocQUIj3zW"
+VENDOR_INFO_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{VENDOR_INFO_TABLE_ID}"
+VENDOR_INFO_FIELD_SHORT = "fldStStiYvwNdzVnj"   # 廠商簡稱
+VENDOR_INFO_FIELD_FULL = "fld2wpGkRKBSzS29D"    # 公司全名
+
+DEFAULT_OWNER_COMPANY = "綠點能創股份有限公司"
+
+# 驗收單「太陽光電系統完工驗收細項表」預設 8 大類 44 小項，對照紙本驗收單。
+# 每次幫案件新建一筆「維運驗收」記錄時，用這份樣板產生初始的「檢查項目JSON」，
+# 現場人員在手機上針對每一項勾選「正常/異常」，異常的話可以填備註、勾選是否
+# 現場修復。之後如果驗收單項目有調整，只要改這裡一份，不用同時改前端。
+DEFAULT_CHECKLIST_TEMPLATE = [
+    {"category": "變流器", "items": [
+        "變流器輸出是否正常", "變流器線路溫度是否異常", "變流器安裝是否確實",
+        "變流器進線標示是否正確", "變流器接地是否確實（O型端子）", "變流器鎖固是否確實",
+        "變流器是否有遮陽措施", "變流器位置現場是否按審迄圖施工",
+    ]},
+    {"category": "交流箱與內部接線", "items": [
+        "交流接線箱溫度是否異常", "交流開關是否正常", "交流配電箱內配線是否整齊",
+        "交流配電箱標示是否正確", "交流配電箱是否確實接地（O型端子）",
+        "交流配電箱線材規格、開關規格是否符合審迄圖", "交流配電箱現場是否按審迄圖施工",
+    ]},
+    {"category": "直流箱與內部接線", "items": [
+        "直流箱內部溫度是否異常", "直流箱內配線是否整齊", "直流箱標示是否正確",
+        "直流箱是否確實接地（O型端子）", "直流箱線路、保險絲、突波吸收器 是否正常",
+        "模組串列開路電壓是否異常", "直流箱內線路絕緣是否異常",
+        "直流箱內線材規格、開關規格、突波吸收器、保險絲規格是否符合審迄圖",
+        "直流箱位置現場是否按審迄圖施工",
+    ]},
+    {"category": "監控箱", "items": [
+        "監控電源插座是否完成", "監控與逆變器之通訊線路是否完成", "監控接地是否完成",
+    ]},
+    {"category": "支架結構", "items": [
+        "支架鎖固是否確實", "支架是否按結構計算書施工", "支架防鏽是否確實",
+        "支架是否確實接地", "支架規格材質否符合出廠證明與工程合約",
+        "螺絲、壓塊 規格材質否符合承攬明細", "棚架型系統之水泥墩、平鋪型系統之角座 是否完整",
+        "棚架型系統之水泥墩、平鋪型系統之角座 防水完整",
+    ]},
+    {"category": "模組", "items": [
+        "模組鎖固是否確實", "模組線路固定是否確實", "模組溫度是否異常",
+        "模組線路溫度是否異常", "模組接地是否確實（O型端子）", "模組是否破損",
+        "模組表面是否有髒污異物(不含動物排泄物與沙塵)", "模組排佈現場是否按審迄圖施工",
+    ]},
+    {"category": "其他", "items": [
+        "線槽是否固定確實", "線槽出口是否填補確實", "管材材質是否符合審迄圖",
+        "箱體（直流箱、交流箱、監控箱）材質規格是否符合承攬明細",
+    ]},
+    {"category": "系統其他", "items": [
+        "約定事項是否確實執行（例：水塔移動、結構補強）", "系統是否無（直接/潛在）遮陰",
+        "施作標的物是否有因施工所造成之損壞",
+    ]},
+]
+
+# 設備清單除了模組/變流器可以從案件既有規格自動帶出之外，其餘 5 項固定先給
+# 空白列，讓現場人員手動填寫（見交接需求：模組/逆變器自動帶入，其餘手動輸入）。
+DEFAULT_EQUIPMENT_EXTRA_NAMES = ["箱體", "電表", "監控", "分享器", "支架"]
+
+
+def build_default_checklist():
+    """展開 DEFAULT_CHECKLIST_TEMPLATE，補上流水編號（對照紙本 1.1、1.2...），
+    回傳給新建的「維運驗收」記錄當作「檢查項目JSON」初始內容。"""
+    checklist = []
+    for cat_index, cat in enumerate(DEFAULT_CHECKLIST_TEMPLATE, start=1):
+        for item_index, item_text in enumerate(cat["items"], start=1):
+            checklist.append({
+                "no": f"{cat_index}.{item_index}",
+                "category": cat["category"],
+                "item": item_text,
+                "result": None,       # "正常" / "異常" / None(未填)
+                "note": "",
+                "onsite_fix": False,
+            })
+    return checklist
+
+
+def ops_get_all(filter_formula=None, field_ids=None):
+    return airtable_get_all(OPS_API_URL, filter_formula, field_ids) if field_ids else \
+        airtable_get_all(OPS_API_URL, filter_formula, [])
+
+
+def get_vendor_fullname(vendor_short_name):
+    """用廠商簡稱查「廠商資料」表拿公司全名；查不到就直接回傳簡稱本身，
+    不會讓呼叫端因為漏填全名而整支壞掉。"""
+    if not vendor_short_name:
+        return vendor_short_name
+    escaped = vendor_short_name.replace("'", "\\'")
+    formula = f"{{{VENDOR_INFO_FIELD_SHORT}}}='{escaped}'"
+    try:
+        records = airtable_get_all(VENDOR_INFO_API_URL, formula, [VENDOR_INFO_FIELD_FULL])
+        if records:
+            return records[0]["fields"].get(VENDOR_INFO_FIELD_FULL) or vendor_short_name
+    except Exception as e:
+        print(f"[get_vendor_fullname] 查詢廠商全名失敗（不影響主要流程）：{e}", flush=True)
+    return vendor_short_name
+
+
+def fetch_case_basic_info(case_record_id):
+    """輕量版的案件基本資料查詢，只拿維運驗收單需要的欄位（案號、別名、廠商、
+    模組、逆變器），不像 fetch_case_snapshot_for_archive 那樣還要多查一輪
+    里程碑資料——這裡用不到出貨/進場/掛表日期，沒必要多花那些查詢時間。"""
+    try:
+        resp = requests.get(
+            f"{CASE_API_URL}/{case_record_id}",
+            headers=airtable_headers(),
+            params={"returnFieldsByFieldId": "true"},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return None
+        f = resp.json().get("fields", {})
+    except Exception:
+        return None
+
+    module = format_module(f)
+    inverter_ids = f.get(FIELD_INVERTER) or []
+    inverter_name_map = resolve_inverter_names(inverter_ids)
+    inverter = format_inverter(f, inverter_name_map)
+
+    return {
+        "case_no": f.get(FIELD_CASE_NO, ""),
+        "alias": f.get(FIELD_ALIAS, ""),
+        "vendor": f.get(FIELD_VENDOR, ""),
+        "address": f.get(FIELD_ADDRESS, ""),
+        "module": module,
+        "inverter": inverter,
+    }
+
+
+def build_default_equipment_list(case_info):
+    """組出設備清單JSON 的初始內容：模組/變流器從案件既有規格帶出（唯讀性質，
+    但允許現場人員之後覆寫），其餘 5 項給空白列讓現場人員手動輸入。"""
+    equipment = []
+    if case_info and case_info.get("module"):
+        equipment.append({"name": "模組", "brand": "", "model": case_info["module"], "qty": "", "unit": "片", "note": ""})
+    else:
+        equipment.append({"name": "模組", "brand": "", "model": "", "qty": "", "unit": "片", "note": ""})
+    if case_info and case_info.get("inverter"):
+        equipment.append({"name": "變流器", "brand": "", "model": case_info["inverter"], "qty": "", "unit": "台", "note": ""})
+    else:
+        equipment.append({"name": "變流器", "brand": "", "model": "", "qty": "", "unit": "台", "note": ""})
+    for name in DEFAULT_EQUIPMENT_EXTRA_NAMES:
+        equipment.append({"name": name, "brand": "", "model": "", "qty": "", "unit": "", "note": ""})
+    return equipment
+
+
+def ops_find_by_case(case_record_id):
+    """找這個案件目前在「維運驗收」表裡對應的那一筆記錄（如果有的話）。"""
+    escaped = case_record_id.replace("'", "\\'")
+    formula = f"FIND('{escaped}', ARRAYJOIN({{{OPS_FIELD_CASE_LINK}}}))"
+    records = airtable_get_all(OPS_API_URL, formula, [OPS_FIELD_CASE_NAME])
+    return records[0] if records else None
+
+
+def sync_ops_case_on_meter_planned(case_record_id, case_no, meter_planned_date):
+    """「掛表安排」頁設定/修改「預計掛表日期」時呼叫：確保這個案件在「維運驗收」
+    表裡有一筆對應記錄，讓維運團隊模組能看到這個案場。已經存在就只更新日期
+    （不動使用者已經填寫的檢查項目/簽名等內容），第一次才建立完整的初始資料
+    （含 44 項檢查清單樣板、設備清單、廠商全名查詢）。
+    任何失敗都只印 log、不拋出例外，不能因為這個同步動作失敗就讓「掛表安排」
+    頁原本的「設定預計掛表日期」功能連帶掛掉。"""
+    try:
+        existing = ops_find_by_case(case_record_id)
+        if existing:
+            resp = requests.patch(
+                f"{OPS_API_URL}/{existing['id']}",
+                headers=airtable_headers(),
+                json={"fields": {OPS_FIELD_PLANNED_METER_DATE: meter_planned_date}},
+                timeout=20,
+            )
+            if resp.status_code >= 400:
+                print(f"[sync_ops_case] 更新既有維運驗收記錄失敗：{resp.text}", flush=True)
+            return
+
+        case_info = fetch_case_basic_info(case_record_id) or {}
+        vendor_short = case_info.get("vendor", "")
+        vendor_full = get_vendor_fullname(vendor_short)
+        case_name = case_info.get("alias") or case_no or ""
+        checklist = build_default_checklist()
+        equipment = build_default_equipment_list(case_info)
+
+        create_fields = {
+            OPS_FIELD_CASE_NAME: case_name,
+            OPS_FIELD_CASE_NO: case_no,
+            OPS_FIELD_CASE_LINK: [case_record_id],
+            OPS_FIELD_VENDOR: vendor_short,
+            OPS_FIELD_VENDOR_FULLNAME: vendor_full,
+            OPS_FIELD_OWNER_COMPANY: DEFAULT_OWNER_COMPANY,
+            OPS_FIELD_PLANNED_METER_DATE: meter_planned_date,
+            OPS_FIELD_CHECKLIST_JSON: json.dumps(checklist, ensure_ascii=False),
+            OPS_FIELD_EQUIPMENT_JSON: json.dumps(equipment, ensure_ascii=False),
+            OPS_FIELD_STATUS: OPS_STATUS_PENDING,
+        }
+        resp = requests.post(
+            OPS_API_URL, headers=airtable_headers(),
+            json={"fields": create_fields}, timeout=20,
+        )
+        if resp.status_code >= 400:
+            print(f"[sync_ops_case] 建立維運驗收記錄失敗：{resp.text}", flush=True)
+    except Exception as e:
+        print(f"[sync_ops_case] 同步維運驗收記錄失敗（不影響掛表安排主要流程）：{e}", flush=True)
+
+
+def upload_attachment_to_ops_record(ops_record_id, field_id, base64_data, filename, content_type="image/png"):
+    """把一張 base64 圖片（簽名畫布 canvas.toDataURL() 產生的內容）上傳成
+    Airtable 附件欄位。Airtable 附件上傳走的是另一個 domain（content.airtable.com），
+    跟平常讀寫記錄資料的 api.airtable.com 不是同一個 API，欄位/記錄都要先存在，
+    上傳成功後那個欄位會多一筆附件（不會覆蓋原本已有的附件，是用「新增」的方式）。"""
+    url = f"https://content.airtable.com/v0/{BASE_ID}/{ops_record_id}/{field_id}/uploadAttachment"
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {AIRTABLE_TOKEN}"},
+        json={"contentType": content_type, "filename": filename, "file": base64_data},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
+    return resp.json()
+
+
+def _pdf_fetch_image_flowable(url, max_width, max_height):
+    """從一個網址（通常是 Airtable 附件網址）下載圖片，包成 reportlab 的
+    Image flowable，並依比例縮放到不超過 max_width x max_height。
+    下載失敗時回傳 None，呼叫端要能優雅處理（顯示空白而不是整份 PDF 產生失敗）。"""
+    from reportlab.platypus import Image as RLImage
+    from PIL import Image as PILImage
+
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        buf = io.BytesIO(resp.content)
+        with PILImage.open(buf) as im:
+            w, h = im.size
+        buf.seek(0)
+        scale = min(max_width / w, max_height / h, 1.0)
+        return RLImage(buf, width=w * scale, height=h * scale)
+    except Exception as e:
+        print(f"[build_acceptance_pdf] 下載簽名圖片失敗（{url}）：{e}", flush=True)
+        return None
+
+
+def build_acceptance_pdf(data):
+    """把一筆「維運驗收」記錄的內容排版成跟紙本「太陽光電系統完工驗收細項表」
+    一樣的格式（案場資訊 → 8大類44小項檢查表格 → 其他缺失/驗收結果 →
+    雙方單位/簽名/日期 → 設備清單），回傳 PDF 檔案的 bytes。
+    用 reportlab platypus 組版；中文字型用 reportlab 內建的 CID 字型
+    STSong-Light（不需要額外字型檔，中文顯示沒問題，但字重比較單一，
+    不是追求跟原始 PDF 完全像素級一致，重點是資訊完整、方便列印歸檔）。"""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
+    )
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    font_name = "STSong-Light"
+
+    styles = {
+        "title": ParagraphStyle("title", fontName=font_name, fontSize=14, leading=18, alignment=1),
+        "h": ParagraphStyle("h", fontName=font_name, fontSize=9, leading=12),
+        "cell": ParagraphStyle("cell", fontName=font_name, fontSize=8, leading=11),
+        "small": ParagraphStyle("small", fontName=font_name, fontSize=8, leading=11),
+    }
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        topMargin=12 * mm, bottomMargin=12 * mm, leftMargin=10 * mm, rightMargin=10 * mm,
+    )
+    story = []
+
+    # ---- 標題列：案場名稱 + 表格標題 ----
+    header_tbl = Table(
+        [[Paragraph(f"案場名稱：{data.get('case_name') or data.get('case_no') or ''}", styles["h"]),
+          Paragraph("太陽光電系統完工驗收細項表", styles["title"])]],
+        colWidths=[60 * mm, 125 * mm],
+    )
+    header_tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
+        ("INNERGRID", (0, 0), (-1, -1), 0.8, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(header_tbl)
+    story.append(Spacer(1, 4 * mm))
+
+    # ---- 44 項檢查清單表格 ----
+    rows = [[
+        Paragraph("編號", styles["cell"]), Paragraph("檢查項目", styles["cell"]),
+        Paragraph("業主確認", styles["cell"]), Paragraph("備註", styles["cell"]),
+        Paragraph("現場修復", styles["cell"]),
+    ]]
+    for item in data.get("checklist", []):
+        result = item.get("result") or ""
+        confirm_text = "[V]正常　[　]異常" if result == "正常" else \
+            ("[　]正常　[V]異常" if result == "異常" else "[　]正常　[　]異常")
+        onsite_fix = "[V]" if item.get("onsite_fix") else "[　]"
+        rows.append([
+            Paragraph(item.get("no", ""), styles["cell"]),
+            Paragraph(f"{item.get('category', '')}　{item.get('item', '')}", styles["cell"]),
+            Paragraph(confirm_text, styles["cell"]),
+            Paragraph(item.get("note") or "", styles["cell"]),
+            Paragraph(onsite_fix, styles["cell"]),
+        ])
+    checklist_tbl = Table(rows, colWidths=[12 * mm, 90 * mm, 30 * mm, 33 * mm, 20 * mm], repeatRows=1)
+    checklist_tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(checklist_tbl)
+    story.append(Spacer(1, 3 * mm))
+
+    # ---- 其他缺失 / 驗收結果 ----
+    result_choices = data.get("result") or []
+    result_text = "　".join(f"[V]{r}" for r in result_choices) or "[　]合格　[　]照片複驗　[　]現場複驗"
+    other_tbl = Table([
+        [Paragraph("其他缺失", styles["cell"]), Paragraph(data.get("other_issues") or "", styles["cell"])],
+        [Paragraph("驗收結果", styles["cell"]), Paragraph(result_text, styles["cell"])],
+    ], colWidths=[25 * mm, 160 * mm])
+    other_tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(other_tbl)
+    story.append(Spacer(1, 4 * mm))
+
+    # ---- 雙方單位 / 簽名 / 日期 ----
+    owner_sig = _pdf_fetch_image_flowable(data.get("owner_signature_url"), 55 * mm, 18 * mm) \
+        if data.get("owner_signature_url") else ""
+    vendor_sig = _pdf_fetch_image_flowable(data.get("vendor_signature_url"), 55 * mm, 18 * mm) \
+        if data.get("vendor_signature_url") else ""
+
+    sign_tbl = Table([
+        [Paragraph(f"業主單位：{data.get('owner_company') or ''}", styles["h"]),
+         Paragraph(f"系統商單位：{data.get('vendor_fullname') or ''}", styles["h"])],
+        [Paragraph(f"業主代表簽名：{data.get('owner_signer_name') or ''}", styles["small"]), owner_sig or ""],
+        [Paragraph(f"系統商代表簽名：{data.get('vendor_signer_name') or ''}", styles["small"]), vendor_sig or ""],
+        [Paragraph(f"簽名日期：{data.get('owner_sign_date') or ''}", styles["small"]),
+         Paragraph(f"簽名日期：{data.get('vendor_sign_date') or ''}", styles["small"])],
+    ], colWidths=[92 * mm, 93 * mm])
+    sign_tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("SPAN", (0, 0), (0, 0)), ("SPAN", (1, 0), (1, 0)),
+    ]))
+    story.append(sign_tbl)
+    story.append(Spacer(1, 4 * mm))
+
+    # ---- 設備清單 ----
+    story.append(Paragraph(f"設備清單　案場名稱：{data.get('case_name') or data.get('case_no') or ''}", styles["h"]))
+    story.append(Spacer(1, 2 * mm))
+    eq_rows = [[Paragraph(t, styles["cell"]) for t in ["設備名稱", "品牌", "型號", "數量", "單位", "備註"]]]
+    for eq in data.get("equipment", []):
+        eq_rows.append([
+            Paragraph(str(eq.get("name") or ""), styles["cell"]),
+            Paragraph(str(eq.get("brand") or ""), styles["cell"]),
+            Paragraph(str(eq.get("model") or ""), styles["cell"]),
+            Paragraph(str(eq.get("qty") or ""), styles["cell"]),
+            Paragraph(str(eq.get("unit") or ""), styles["cell"]),
+            Paragraph(str(eq.get("note") or ""), styles["cell"]),
+        ])
+    eq_tbl = Table(eq_rows, colWidths=[30 * mm, 30 * mm, 55 * mm, 20 * mm, 20 * mm, 30 * mm], repeatRows=1)
+    eq_tbl.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(eq_tbl)
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 def get_hidden_models():
@@ -1851,6 +2261,17 @@ def upsert_case_status():
             result = app_data_create(create_fields)
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+
+    # 2026-09-08 新增：「掛表安排」頁設定/修改「預計掛表日期」時，同步讓這個
+    # 案件出現在「維運團隊」模組。背景執行緒處理，不拖慢這支 API 原本的回應速度，
+    # 失敗也不影響「設定預計掛表日期」這個主要動作本身有沒有成功。
+    if "meter_planned_date" in patch and patch.get("meter_planned_date"):
+        threading.Thread(
+            target=sync_ops_case_on_meter_planned,
+            args=(case_record_id, case_no, patch["meter_planned_date"]),
+            daemon=True,
+        ).start()
+
     return jsonify({"ok": True, "record": result})
 
 
@@ -1950,6 +2371,207 @@ def update_note(record_id):
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
     return jsonify({"ok": True, "record": result})
+
+
+# ===================================================================
+# 維運團隊（維運驗收，2026-09-08 新增）
+# ===================================================================
+
+def _ops_record_to_dict(rec, full=False):
+    """把「維運驗收」表一筆 Airtable record 轉成前端好用的格式，把兩個 JSON
+    長文字欄位解析成陣列/物件；full=False 時只回傳清單頁需要的精簡欄位。"""
+    f = rec["fields"]
+
+    def parse_json(field_id, default):
+        raw = f.get(field_id)
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except Exception:
+            return default
+
+    result = {
+        "id": rec["id"],
+        "case_name": f.get(OPS_FIELD_CASE_NAME, ""),
+        "case_no": f.get(OPS_FIELD_CASE_NO, ""),
+        "case_record_id": (f.get(OPS_FIELD_CASE_LINK) or [None])[0],
+        "vendor": f.get(OPS_FIELD_VENDOR, ""),
+        "vendor_fullname": f.get(OPS_FIELD_VENDOR_FULLNAME, ""),
+        "owner_company": f.get(OPS_FIELD_OWNER_COMPANY, ""),
+        "planned_meter_date": f.get(OPS_FIELD_PLANNED_METER_DATE),
+        "result": f.get(OPS_FIELD_RESULT) or [],
+        "status": f.get(OPS_FIELD_STATUS) or OPS_STATUS_PENDING,
+    }
+    if not full:
+        return result
+
+    owner_sig = f.get(OPS_FIELD_OWNER_SIGNATURE) or []
+    vendor_sig = f.get(OPS_FIELD_VENDOR_SIGNATURE) or []
+    pdf = f.get(OPS_FIELD_PDF) or []
+    result.update({
+        "checklist": parse_json(OPS_FIELD_CHECKLIST_JSON, []),
+        "other_issues": f.get(OPS_FIELD_OTHER_ISSUES, ""),
+        "equipment": parse_json(OPS_FIELD_EQUIPMENT_JSON, []),
+        "owner_signer_name": f.get(OPS_FIELD_OWNER_SIGNER_NAME, ""),
+        "owner_signature_url": owner_sig[-1]["url"] if owner_sig else None,
+        "owner_sign_date": f.get(OPS_FIELD_OWNER_SIGN_DATE),
+        "vendor_signer_name": f.get(OPS_FIELD_VENDOR_SIGNER_NAME, ""),
+        "vendor_signature_url": vendor_sig[-1]["url"] if vendor_sig else None,
+        "vendor_sign_date": f.get(OPS_FIELD_VENDOR_SIGN_DATE),
+        "pdf_url": pdf[-1]["url"] if pdf else None,
+    })
+    return result
+
+
+@app.route("/api/ops-cases")
+def ops_cases():
+    """維運團隊模組的案件清單。回傳所有「維運驗收」記錄的精簡資訊，前端可以
+    自行依「狀態」分區（待填寫/已完成驗收/已產生PDF）。"""
+    try:
+        records = airtable_get_all(OPS_API_URL, None, [
+            OPS_FIELD_CASE_NAME, OPS_FIELD_CASE_NO, OPS_FIELD_CASE_LINK,
+            OPS_FIELD_VENDOR, OPS_FIELD_VENDOR_FULLNAME, OPS_FIELD_OWNER_COMPANY,
+            OPS_FIELD_PLANNED_METER_DATE, OPS_FIELD_RESULT, OPS_FIELD_STATUS,
+        ])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"cases": [_ops_record_to_dict(r) for r in records]})
+
+
+@app.route("/api/ops-acceptance/<record_id>")
+def ops_acceptance_detail(record_id):
+    """讀取單一案件的完整驗收單內容（給驗收表單頁用）。"""
+    try:
+        resp = requests.get(
+            f"{OPS_API_URL}/{record_id}",
+            headers=airtable_headers(),
+            params={"returnFieldsByFieldId": "true"},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            return jsonify({"error": "找不到這筆維運驗收記錄", "detail": resp.text}), 404
+        rec = resp.json()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify(_ops_record_to_dict(rec, full=True))
+
+
+@app.route("/api/ops-acceptance/<record_id>", methods=["POST"])
+def save_ops_acceptance(record_id):
+    """儲存驗收單內容（可以只存部分欄位，隨時可以按儲存，不用一次填完）。
+    body 可包含：owner_company, vendor_fullname, checklist(陣列), other_issues,
+    result(陣列), equipment(陣列), owner_signer_name, owner_sign_date,
+    vendor_signer_name, vendor_sign_date, status,
+    owner_signature_base64/owner_signature_filename（簽名圖片，可省略）,
+    vendor_signature_base64/vendor_signature_filename（同上）。
+    簽名圖片走 Airtable 附件上傳 API，跟其他欄位是分開兩次呼叫，其中一個
+    失敗不影響另一個，最後統一回傳整體是否成功。"""
+    body = request.get_json(force=True)
+    fields = {}
+
+    simple_field_map = {
+        "owner_company": OPS_FIELD_OWNER_COMPANY,
+        "vendor_fullname": OPS_FIELD_VENDOR_FULLNAME,
+        "other_issues": OPS_FIELD_OTHER_ISSUES,
+        "owner_signer_name": OPS_FIELD_OWNER_SIGNER_NAME,
+        "owner_sign_date": OPS_FIELD_OWNER_SIGN_DATE,
+        "vendor_signer_name": OPS_FIELD_VENDOR_SIGNER_NAME,
+        "vendor_sign_date": OPS_FIELD_VENDOR_SIGN_DATE,
+        "status": OPS_FIELD_STATUS,
+    }
+    for key, field_id in simple_field_map.items():
+        if key in body:
+            fields[field_id] = body[key]
+
+    if "checklist" in body:
+        fields[OPS_FIELD_CHECKLIST_JSON] = json.dumps(body["checklist"], ensure_ascii=False)
+    if "equipment" in body:
+        fields[OPS_FIELD_EQUIPMENT_JSON] = json.dumps(body["equipment"], ensure_ascii=False)
+    if "result" in body:
+        fields[OPS_FIELD_RESULT] = body["result"] or []
+
+    if fields:
+        resp = requests.patch(
+            f"{OPS_API_URL}/{record_id}",
+            headers=airtable_headers(),
+            json={"fields": fields},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+
+    signature_errors = []
+    if body.get("owner_signature_base64"):
+        try:
+            upload_attachment_to_ops_record(
+                record_id, OPS_FIELD_OWNER_SIGNATURE,
+                body["owner_signature_base64"],
+                body.get("owner_signature_filename", "owner_signature.png"),
+            )
+        except Exception as e:
+            signature_errors.append(f"業主簽名上傳失敗：{e}")
+    if body.get("vendor_signature_base64"):
+        try:
+            upload_attachment_to_ops_record(
+                record_id, OPS_FIELD_VENDOR_SIGNATURE,
+                body["vendor_signature_base64"],
+                body.get("vendor_signature_filename", "vendor_signature.png"),
+            )
+        except Exception as e:
+            signature_errors.append(f"系統商簽名上傳失敗：{e}")
+
+    if signature_errors:
+        return jsonify({"ok": False, "errors": signature_errors}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ops-acceptance/<record_id>/generate-pdf", methods=["POST"])
+def generate_ops_pdf(record_id):
+    """讀取這筆驗收單目前存好的資料，排版成跟紙本「太陽光電系統完工驗收細項表」
+    一樣格式的 PDF，上傳回「維運驗收」表的 PDF檔案 欄位，並把狀態改成「已產生PDF」。
+    回傳 Airtable 附件網址給前端顯示/下載連結（Airtable 附件網址有時效性，
+    如果之後要長期保存連結，建議前端拿到網址後提示使用者另外下載存檔）。"""
+    try:
+        resp = requests.get(
+            f"{OPS_API_URL}/{record_id}",
+            headers=airtable_headers(),
+            params={"returnFieldsByFieldId": "true"},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            return jsonify({"error": "找不到這筆維運驗收記錄"}), 404
+        data = _ops_record_to_dict(resp.json(), full=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    try:
+        pdf_bytes = build_acceptance_pdf(data)
+    except Exception as e:
+        return jsonify({"error": "PDF 產生失敗", "detail": str(e)}), 500
+
+    import base64
+    b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    filename = f"{data['case_name'] or data['case_no'] or record_id}_驗收單.pdf"
+    try:
+        upload_resp = upload_attachment_to_ops_record(
+            record_id, OPS_FIELD_PDF, b64, filename, content_type="application/pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": "PDF 上傳 Airtable 失敗", "detail": str(e)}), 502
+
+    requests.patch(
+        f"{OPS_API_URL}/{record_id}",
+        headers=airtable_headers(),
+        json={"fields": {OPS_FIELD_STATUS: OPS_STATUS_PDF}},
+        timeout=20,
+    )
+
+    pdf_url = None
+    attachments = upload_resp.get("fields", {}).get(OPS_FIELD_PDF, [])
+    if attachments:
+        pdf_url = attachments[-1].get("url")
+    return jsonify({"ok": True, "pdf_url": pdf_url})
 
 
 @app.route("/")
