@@ -570,6 +570,51 @@ def upload_attachment_to_ops_record(ops_record_id, field_id, base64_data, filena
     return resp.json()
 
 
+def _pdf_checkbox_flowable(checked, size=7):
+    """畫一個真正的方框 checkbox（不依賴字型有沒有 ☐☑ 這種符號的字），
+    用 reportlab 的 Flowable 直接畫矩形＋打勾時畫一個 X，任何電腦、任何
+    PDF 閱讀器開起來都長一樣，不會有字型缺字/兩種符號長得一樣分不出來的問題。"""
+    from reportlab.platypus import Flowable
+
+    class _CheckBox(Flowable):
+        def __init__(self, checked, size):
+            super().__init__()
+            self.checked = checked
+            self.width = size
+            self.height = size
+
+        def draw(self):
+            c = self.canv
+            s = self.width
+            c.setLineWidth(0.8)
+            c.rect(0.5, 0.5, s - 1, s - 1)
+            if self.checked:
+                c.line(1.6, 1.6, s - 1.6, s - 1.6)
+                c.line(1.6, s - 1.6, s - 1.6, 1.6)
+
+    return _CheckBox(checked, size)
+
+
+def _pdf_checkbox_with_label(checked, label, font_name, font_size, cb_size=7, label_width=26):
+    """checkbox + 文字標籤（例如「☐正常」）組成一個小 flowable，用一個
+    無邊框的內嵌 mini table 讓 checkbox 跟文字對齊在同一行。"""
+    from reportlab.platypus import Table as _MiniTable, TableStyle as _MiniStyle
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import Paragraph
+
+    style = ParagraphStyle("cb_label", fontName=font_name, fontSize=font_size, leading=font_size + 2)
+    t = _MiniTable(
+        [[_pdf_checkbox_flowable(checked, cb_size), Paragraph(label, style)]],
+        colWidths=[cb_size + 3, label_width],
+    )
+    t.setStyle(_MiniStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1), ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return t
+
+
 def _pdf_fetch_image_flowable(url, max_width, max_height):
     """從一個網址（通常是 Airtable 附件網址）下載圖片，包成 reportlab 的
     Image flowable，並依比例縮放到不超過 max_width x max_height。
@@ -592,12 +637,15 @@ def _pdf_fetch_image_flowable(url, max_width, max_height):
 
 
 def build_acceptance_pdf(data):
-    """把一筆「維運驗收」記錄的內容排版成跟紙本「太陽光電系統完工驗收細項表」
-    一樣的格式（案場資訊 → 8大類44小項檢查表格 → 其他缺失/驗收結果 →
-    雙方單位/簽名/日期 → 設備清單），回傳 PDF 檔案的 bytes。
-    用 reportlab platypus 組版；中文字型用 reportlab 內建的 CID 字型
-    STSong-Light（不需要額外字型檔，中文顯示沒問題，但字重比較單一，
-    不是追求跟原始 PDF 完全像素級一致，重點是資訊完整、方便列印歸檔）。"""
+    """把一筆「維運驗收」記錄的內容排版成跟公司紙本「太陽光電系統完工驗收
+    細項表」一模一樣的格式：
+      案場名稱／表頭 → 編號｜子項｜檢查項目｜正常☐｜異常☐｜備註｜現場修復☐
+      （同一大類的「編號」「子項」直向合併儲存格）→ 其他缺失／驗收結果
+      （3 個 checkbox）→ 業主/系統商單位 → 雙方代表簽名（含簽名圖片）／
+      簽名日期 → 設備清單（含流水編號）。
+    回傳 PDF 檔案的 bytes。checkbox 一律用向量繪製（見 _pdf_checkbox_flowable），
+    不依賴字型是否有方框符號的字。中文用 reportlab 內建 CID 字型
+    STSong-Light，不需要額外字型檔。"""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.lib import colors
@@ -612,102 +660,144 @@ def build_acceptance_pdf(data):
     font_name = "STSong-Light"
 
     styles = {
-        "title": ParagraphStyle("title", fontName=font_name, fontSize=14, leading=18, alignment=1),
-        "h": ParagraphStyle("h", fontName=font_name, fontSize=9, leading=12),
+        "title": ParagraphStyle("title", fontName=font_name, fontSize=15, leading=19, alignment=1),
+        "h": ParagraphStyle("h", fontName=font_name, fontSize=9.5, leading=13),
+        "h_bold": ParagraphStyle("h_bold", fontName=font_name, fontSize=9.5, leading=13),
         "cell": ParagraphStyle("cell", fontName=font_name, fontSize=8, leading=11),
+        "cat": ParagraphStyle("cat", fontName=font_name, fontSize=8, leading=11, alignment=1),
         "small": ParagraphStyle("small", fontName=font_name, fontSize=8, leading=11),
     }
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
-        topMargin=12 * mm, bottomMargin=12 * mm, leftMargin=10 * mm, rightMargin=10 * mm,
+        topMargin=10 * mm, bottomMargin=10 * mm, leftMargin=10 * mm, rightMargin=10 * mm,
     )
     story = []
+    case_label = data.get("case_name") or data.get("case_no") or ""
 
-    # ---- 標題列：案場名稱 + 表格標題 ----
+    # ---- 表頭：案場名稱｜案場值｜大標題 ----
     header_tbl = Table(
-        [[Paragraph(f"案場名稱：{data.get('case_name') or data.get('case_no') or ''}", styles["h"]),
+        [[Paragraph("案場名稱", styles["h_bold"]), Paragraph(case_label, styles["h"]),
           Paragraph("太陽光電系統完工驗收細項表", styles["title"])]],
-        colWidths=[60 * mm, 125 * mm],
+        colWidths=[22 * mm, 48 * mm, 117 * mm],
     )
     header_tbl.setStyle(TableStyle([
         ("BOX", (0, 0), (-1, -1), 0.8, colors.black),
         ("INNERGRID", (0, 0), (-1, -1), 0.8, colors.black),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (0, 0), colors.whitesmoke),
     ]))
     story.append(header_tbl)
-    story.append(Spacer(1, 4 * mm))
 
-    # ---- 44 項檢查清單表格 ----
-    rows = [[
-        Paragraph("編號", styles["cell"]), Paragraph("檢查項目", styles["cell"]),
-        Paragraph("業主確認", styles["cell"]), Paragraph("備註", styles["cell"]),
-        Paragraph("現場修復", styles["cell"]),
-    ]]
+    # ---- 44 項檢查清單表格：編號｜子項｜檢查項目｜正常｜異常｜備註｜現場修復 ----
+    col_widths = [9 * mm, 23 * mm, 62 * mm, 22 * mm, 22 * mm, 32 * mm, 17 * mm]
+    header_row = ["編號", "子項", "檢查項目", "業主確認", "", "備註", "現場修復"]
+    rows = [[Paragraph(t, styles["cell"]) if t else "" for t in header_row]]
+    span_cmds = []
+    prev_cat_no = None
+    cat_start_row = 1
+
     for item in data.get("checklist", []):
+        cat_no = (item.get("no") or "").split(".")[0]
         result = item.get("result") or ""
-        confirm_text = "[V]正常　[　]異常" if result == "正常" else \
-            ("[　]正常　[V]異常" if result == "異常" else "[　]正常　[　]異常")
-        onsite_fix = "[V]" if item.get("onsite_fix") else "[　]"
+        row_index = len(rows)
+        if cat_no != prev_cat_no:
+            if prev_cat_no is not None and row_index - 1 > cat_start_row:
+                span_cmds.append(("SPAN", (0, cat_start_row), (0, row_index - 1)))
+                span_cmds.append(("SPAN", (1, cat_start_row), (1, row_index - 1)))
+            prev_cat_no = cat_no
+            cat_start_row = row_index
         rows.append([
-            Paragraph(item.get("no", ""), styles["cell"]),
-            Paragraph(f"{item.get('category', '')}　{item.get('item', '')}", styles["cell"]),
-            Paragraph(confirm_text, styles["cell"]),
+            Paragraph(cat_no, styles["cat"]),
+            Paragraph(item.get("category", ""), styles["cat"]),
+            Paragraph(item.get("item", ""), styles["cell"]),
+            _pdf_checkbox_with_label(result == "正常", "正常", font_name, 8),
+            _pdf_checkbox_with_label(result == "異常", "異常", font_name, 8),
             Paragraph(item.get("note") or "", styles["cell"]),
-            Paragraph(onsite_fix, styles["cell"]),
+            _pdf_checkbox_flowable(bool(item.get("onsite_fix")), size=8),
         ])
-    checklist_tbl = Table(rows, colWidths=[12 * mm, 90 * mm, 30 * mm, 33 * mm, 20 * mm], repeatRows=1)
-    checklist_tbl.setStyle(TableStyle([
+    # 收尾：最後一個分類也要補上合併
+    last_row = len(rows) - 1
+    if last_row > cat_start_row:
+        span_cmds.append(("SPAN", (0, cat_start_row), (0, last_row)))
+        span_cmds.append(("SPAN", (1, cat_start_row), (1, last_row)))
+
+    checklist_tbl = Table(rows, colWidths=col_widths, repeatRows=1)
+    checklist_style = [
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+        ("SPAN", (3, 0), (4, 0)),  # 表頭「業主確認」橫跨 正常/異常 兩欄
         ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-    ]))
+        ("ALIGN", (0, 0), (1, -1), "CENTER"),
+        ("ALIGN", (3, 0), (4, -1), "CENTER"),
+        ("ALIGN", (6, 0), (6, -1), "CENTER"),
+    ] + span_cmds
+    checklist_tbl.setStyle(TableStyle(checklist_style))
     story.append(checklist_tbl)
-    story.append(Spacer(1, 3 * mm))
 
-    # ---- 其他缺失 / 驗收結果 ----
+    # ---- 其他缺失 / 驗收結果（3 個 checkbox） ----
     result_choices = data.get("result") or []
-    result_text = "　".join(f"[V]{r}" for r in result_choices) or "[　]合格　[　]照片複驗　[　]現場複驗"
+    result_row_content = Table(
+        [[
+            _pdf_checkbox_with_label("合格" in result_choices, "合格", font_name, 8, label_width=22),
+            _pdf_checkbox_with_label("照片複驗" in result_choices, "照片複驗", font_name, 8, label_width=32),
+            _pdf_checkbox_with_label("現場複驗" in result_choices, "現場複驗", font_name, 8, label_width=32),
+        ]],
+        colWidths=[30, 42, 42],
+    )
+    result_row_content.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 2), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+    ]))
     other_tbl = Table([
         [Paragraph("其他缺失", styles["cell"]), Paragraph(data.get("other_issues") or "", styles["cell"])],
-        [Paragraph("驗收結果", styles["cell"]), Paragraph(result_text, styles["cell"])],
-    ], colWidths=[25 * mm, 160 * mm])
+        [Paragraph("驗收結果", styles["cell"]), result_row_content],
+    ], colWidths=[22 * mm, 165 * mm])
     other_tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
     ]))
     story.append(other_tbl)
-    story.append(Spacer(1, 4 * mm))
+    story.append(Spacer(1, 5 * mm))
 
-    # ---- 雙方單位 / 簽名 / 日期 ----
-    owner_sig = _pdf_fetch_image_flowable(data.get("owner_signature_url"), 55 * mm, 18 * mm) \
+    # ---- 業主/系統商單位 → 代表簽名（含簽名圖片）→ 簽名日期 ----
+    owner_sig = _pdf_fetch_image_flowable(data.get("owner_signature_url"), 50 * mm, 16 * mm) \
         if data.get("owner_signature_url") else ""
-    vendor_sig = _pdf_fetch_image_flowable(data.get("vendor_signature_url"), 55 * mm, 18 * mm) \
+    vendor_sig = _pdf_fetch_image_flowable(data.get("vendor_signature_url"), 50 * mm, 16 * mm) \
         if data.get("vendor_signature_url") else ""
 
+    def sign_row_cell(label, content):
+        t = Table([[Paragraph(label, styles["small"]), content or ""]], colWidths=[24 * mm, 60 * mm])
+        t.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        return t
+
     sign_tbl = Table([
-        [Paragraph(f"業主單位：{data.get('owner_company') or ''}", styles["h"]),
-         Paragraph(f"系統商單位：{data.get('vendor_fullname') or ''}", styles["h"])],
-        [Paragraph(f"業主代表簽名：{data.get('owner_signer_name') or ''}", styles["small"]), owner_sig or ""],
-        [Paragraph(f"系統商代表簽名：{data.get('vendor_signer_name') or ''}", styles["small"]), vendor_sig or ""],
-        [Paragraph(f"簽名日期：{data.get('owner_sign_date') or ''}", styles["small"]),
-         Paragraph(f"簽名日期：{data.get('vendor_sign_date') or ''}", styles["small"])],
-    ], colWidths=[92 * mm, 93 * mm])
+        [Paragraph(f"業主單位 : {data.get('owner_company') or ''}", styles["h"]),
+         Paragraph(f"系統商單位 : {data.get('vendor_fullname') or ''}", styles["h"])],
+        [sign_row_cell("業主代表簽名 :", owner_sig), sign_row_cell("系統商代表簽名 :", vendor_sig)],
+        [Paragraph(f"簽名日期 : {data.get('owner_sign_date') or ''}", styles["small"]),
+         Paragraph(f"簽名日期 : {data.get('vendor_sign_date') or ''}", styles["small"])],
+    ], colWidths=[93.5 * mm, 93.5 * mm])
     sign_tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("SPAN", (0, 0), (0, 0)), ("SPAN", (1, 0), (1, 0)),
     ]))
     story.append(sign_tbl)
-    story.append(Spacer(1, 4 * mm))
+    story.append(Spacer(1, 5 * mm))
 
-    # ---- 設備清單 ----
-    story.append(Paragraph(f"設備清單　案場名稱：{data.get('case_name') or data.get('case_no') or ''}", styles["h"]))
+    # ---- 設備清單（含流水編號） ----
+    story.append(Paragraph(f"設備清單　案場名稱 : {case_label}", styles["h"]))
     story.append(Spacer(1, 2 * mm))
-    eq_rows = [[Paragraph(t, styles["cell"]) for t in ["設備名稱", "品牌", "型號", "數量", "單位", "備註"]]]
-    for eq in data.get("equipment", []):
+    eq_rows = [[Paragraph(t, styles["cell"]) for t in ["", "設備名稱", "品牌", "型號", "數量", "單位", "備註"]]]
+    for i, eq in enumerate(data.get("equipment", []), start=1):
         eq_rows.append([
+            Paragraph(str(i), styles["cell"]),
             Paragraph(str(eq.get("name") or ""), styles["cell"]),
             Paragraph(str(eq.get("brand") or ""), styles["cell"]),
             Paragraph(str(eq.get("model") or ""), styles["cell"]),
@@ -715,11 +805,12 @@ def build_acceptance_pdf(data):
             Paragraph(str(eq.get("unit") or ""), styles["cell"]),
             Paragraph(str(eq.get("note") or ""), styles["cell"]),
         ])
-    eq_tbl = Table(eq_rows, colWidths=[30 * mm, 30 * mm, 55 * mm, 20 * mm, 20 * mm, 30 * mm], repeatRows=1)
+    eq_tbl = Table(eq_rows, colWidths=[8 * mm, 26 * mm, 26 * mm, 50 * mm, 16 * mm, 16 * mm, 45 * mm], repeatRows=1)
     eq_tbl.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
         ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (0, -1), "CENTER"),
     ]))
     story.append(eq_tbl)
 
