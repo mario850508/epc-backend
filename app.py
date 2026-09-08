@@ -2439,6 +2439,72 @@ def ops_cases():
     return jsonify({"cases": [_ops_record_to_dict(r) for r in records]})
 
 
+@app.route("/api/ops-cases/manual", methods=["POST"])
+def create_ops_case_manual():
+    """手動新增一筆「維運驗收」記錄（給沒有走「掛表安排」自動同步流程的案件用，
+    例如補登舊案件、或案號還沒建進「專案細節」表的特殊情況）。
+    body: {case_record_id（選填，前端用 /api/case-search 選到候選案件時帶入，
+    有帶的話會自動查案件既有的模組/逆變器/廠商資料覆蓋掉手動輸入的同名欄位）,
+    case_no, case_name（案場名稱/別名）, vendor（廠商簡稱，選填）,
+    planned_meter_date（選填）}。
+    如果 case_record_id 已經有對應的維運驗收記錄，直接回傳既有那筆的 id，
+    不會重複建立（避免跟「掛表安排」自動同步流程打架，出現同一案件兩筆記錄）。"""
+    body = request.get_json(force=True)
+    case_record_id = body.get("case_record_id")
+    case_no = (body.get("case_no") or "").strip()
+    case_name = (body.get("case_name") or "").strip()
+    vendor_short = (body.get("vendor") or "").strip()
+    planned_meter_date = body.get("planned_meter_date") or None
+
+    if not case_no and not case_name:
+        return jsonify({"error": "請至少填寫案號或案場名稱"}), 400
+
+    if case_record_id:
+        existing = ops_find_by_case(case_record_id)
+        if existing:
+            return jsonify({"ok": True, "id": existing["id"], "already_existed": True})
+
+    case_info = fetch_case_basic_info(case_record_id) if case_record_id else None
+    if case_info:
+        vendor_short = case_info.get("vendor") or vendor_short
+        case_name = case_info.get("alias") or case_name
+        case_no = case_info.get("case_no") or case_no
+    vendor_full = get_vendor_fullname(vendor_short) if vendor_short else ""
+
+    checklist = build_default_checklist()
+    equipment = build_default_equipment_list(case_info)
+
+    create_fields = {
+        OPS_FIELD_CASE_NAME: case_name or case_no,
+        OPS_FIELD_CASE_NO: case_no,
+        OPS_FIELD_VENDOR: vendor_short,
+        OPS_FIELD_VENDOR_FULLNAME: vendor_full,
+        OPS_FIELD_OWNER_COMPANY: DEFAULT_OWNER_COMPANY,
+        OPS_FIELD_CHECKLIST_JSON: json.dumps(checklist, ensure_ascii=False),
+        OPS_FIELD_EQUIPMENT_JSON: json.dumps(equipment, ensure_ascii=False),
+        OPS_FIELD_STATUS: OPS_STATUS_PENDING,
+    }
+    if case_record_id:
+        create_fields[OPS_FIELD_CASE_LINK] = [case_record_id]
+    if planned_meter_date:
+        create_fields[OPS_FIELD_PLANNED_METER_DATE] = planned_meter_date
+
+    resp = requests.post(OPS_API_URL, headers=airtable_headers(), json={"fields": create_fields}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True, "id": resp.json()["id"]})
+
+
+@app.route("/api/ops-acceptance/<record_id>", methods=["DELETE"])
+def delete_ops_acceptance(record_id):
+    """刪除一筆「維運驗收」記錄（例如手動誤觸新增、或重複記錄）。這是整筆刪除，
+    前端要在按下之前先跳出確認提示，不能誤觸就刪掉。"""
+    resp = requests.delete(f"{OPS_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True})
+
+
 @app.route("/api/ops-acceptance/<record_id>")
 def ops_acceptance_detail(record_id):
     """讀取單一案件的完整驗收單內容（給驗收表單頁用）。"""
