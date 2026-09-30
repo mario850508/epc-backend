@@ -2216,7 +2216,16 @@ def milestone_status():
     if milestone_type not in DOCUMENT_MILESTONE_TYPES:
         return jsonify({"error": f"type 必須是以下其中之一：{'、'.join(DOCUMENT_MILESTONE_TYPES)}"}), 400
     try:
-        resp = requests.get(f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(), timeout=15)
+        # 2026-09-30 修正：這裡原本沒帶 returnFieldsByFieldId=true，但 FIELD_MS_LINK_ON_CASE
+        # 是欄位 ID（fldEs9vLzY416tTHo）不是欄位名稱，導致 f.get(FIELD_MS_LINK_ON_CASE) 永遠
+        # 抓不到值（Airtable 預設用欄位顯示名稱當 key），ms_ids 永遠是空陣列，這支 API 對任何
+        # 案件、任何函文類型都會回傳 found_milestone:false，「異常案件」的「待取得函文」自動
+        # 偵測功能實際上從來沒有真的生效過。加上這個參數後，讀 fields 才會用跟其他函式
+        # （例如 case_lookup()）一致的欄位 ID 當 key。
+        resp = requests.get(
+            f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(),
+            params={"returnFieldsByFieldId": "true"}, timeout=15,
+        )
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 找不到這筆案件"}), 404
         f = resp.json().get("fields", {})
