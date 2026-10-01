@@ -341,6 +341,197 @@ SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID
 CANCELLED_CASE_CACHE = {"case_nos": set(), "updated_at": None}
 BIZ_SHEET_SYNC_KEY = os.environ.get("BIZ_SHEET_SYNC_KEY")
 
+# ---- 廠商時段協調（2026-10-01 新增）----
+# 廠商會開放幾個日期讓我們安排現場作業（掛表／植筋／放樣／場勘），業務各自去
+# 幫自己的案子卡時段，同一個廠商同一天不能有兩筆預約時間重疊（同一組工班）。
+# 這張表跟其他案件 Airtable 表不太一樣，不是「一案一列」，而是「一筆時段一列」，
+# 所以獨立開一張新表，不跟 APP資料 混在一起。
+# 資料量不大（一次大概就是幾個廠商、幾天、幾個案子），不用像 pending/entry/
+# completed 或場勘安排那樣做背景快取，直接即時查 Airtable 就好。
+SLOT_TABLE_ID = "tbl4paq7aP2itEOk0"
+FIELD_SLOT_TITLE = "fld4zSws0QYIpgiZE"       # 標題（後端自動產生，純顯示用）
+FIELD_SLOT_KIND = "flds9FOlX6Z4vS2YS"        # 記錄類型：開放時段／已預約
+FIELD_SLOT_VENDOR = "fldx0GNtq5juS4itt"      # 廠商
+FIELD_SLOT_DATE = "fldmCEruO814y2TZY"        # 日期
+FIELD_SLOT_START = "fldpHOWg6uebcs8Xe"       # 開始時間（"HH:MM" 字串，只有已預約會填）
+FIELD_SLOT_END = "fldu0ZxMUnMtxy09d"         # 結束時間（同上）
+FIELD_SLOT_CASE_NO = "fldbeFm5WoQG5J6Xn"     # 案號（只有已預約會填）
+FIELD_SLOT_ALIAS = "fldqBDfAcb0r7pAPB"       # 案場別名（只有已預約會填）
+FIELD_SLOT_TYPE = "fldXYG2HPHWYI1NVk"        # 項目類型：掛表／植筋／放樣／場勘
+FIELD_SLOT_REGISTRANT = "fldgzpUmVlN51Abf6"  # 登記人
+FIELD_SLOT_NOTE = "fld0l1iExfCns0iNa"        # 備註
+SLOT_KIND_WINDOW = "開放時段"
+SLOT_KIND_BOOKING = "已預約"
+SLOT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{SLOT_TABLE_ID}"
+
+
+def _parse_hhmm(s):
+    h, m = (s or "").strip().split(":")
+    return int(h) * 60 + int(m)
+
+
+def _slots_overlap(start_a, end_a, start_b, end_b):
+    """時間區間是否重疊（半開區間，10:00-11:00 跟 11:00-12:00 算不重疊，
+    銜接得剛剛好）。輸入格式驗證（HH:MM、開始早於結束）由呼叫端先做好。"""
+    return _parse_hhmm(start_a) < _parse_hhmm(end_b) and _parse_hhmm(start_b) < _parse_hhmm(end_a)
+
+
+@app.route("/api/vendor-slots")
+def list_vendor_slots():
+    """「廠商時段協調」頁用：回傳所有「開放時段」跟「已預約」記錄（資料量小，
+    不分頁、不做日期範圍篩選，前端自己依日期分組顯示）。"""
+    try:
+        fields = [
+            FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START,
+            FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
+            FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE,
+        ]
+        records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    windows, bookings = [], []
+    for r in records:
+        f = r["fields"]
+        item = {
+            "record_id": r["id"],
+            "vendor": f.get(FIELD_SLOT_VENDOR),
+            "date": f.get(FIELD_SLOT_DATE),
+        }
+        if f.get(FIELD_SLOT_KIND) == SLOT_KIND_BOOKING:
+            item.update({
+                "start_time": f.get(FIELD_SLOT_START),
+                "end_time": f.get(FIELD_SLOT_END),
+                "case": f.get(FIELD_SLOT_CASE_NO, ""),
+                "alias": f.get(FIELD_SLOT_ALIAS, ""),
+                "type": f.get(FIELD_SLOT_TYPE),
+                "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
+                "note": f.get(FIELD_SLOT_NOTE, ""),
+            })
+            bookings.append(item)
+        else:
+            item["note"] = f.get(FIELD_SLOT_NOTE, "")
+            windows.append(item)
+    windows.sort(key=lambda w: (w.get("date") or "", w.get("vendor") or ""))
+    bookings.sort(key=lambda b: (b.get("date") or "", b.get("start_time") or ""))
+    return jsonify({"windows": windows, "bookings": bookings})
+
+
+@app.route("/api/vendor-slots/windows", methods=["POST"])
+def create_vendor_slot_windows():
+    """開放時段：一次可以傳多個日期（同一個廠商一口氣開放禮拜一二四這種情境）。
+    body: {vendor, dates: ["2026-10-06", "2026-10-07", ...], note}"""
+    body = request.get_json(force=True)
+    vendor = (body.get("vendor") or "").strip()
+    dates = body.get("dates") or []
+    note = (body.get("note") or "").strip()
+    if not vendor or not dates:
+        return jsonify({"error": "缺少 vendor 或 dates"}), 400
+    try:
+        for d in dates:
+            fields = {
+                FIELD_SLOT_TITLE: f"{vendor} {d} 開放時段",
+                FIELD_SLOT_KIND: SLOT_KIND_WINDOW,
+                FIELD_SLOT_VENDOR: vendor,
+                FIELD_SLOT_DATE: d,
+            }
+            if note:
+                fields[FIELD_SLOT_NOTE] = note
+            resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+            if resp.status_code >= 400:
+                return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "count": len(dates)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/vendor-slots/bookings", methods=["POST"])
+def create_vendor_slot_booking():
+    """預約時段：寫入前先查同廠商、同日期的既有「已預約」記錄，時間重疊就擋下來
+    （回傳 409 跟衝突到的那筆資料），不讓兩個業務卡到同一段時間。
+    body: {vendor, date, start_time, end_time, case, alias, type, registrant, note}
+    start_time/end_time 格式 "HH:MM"（24 小時制）。"""
+    body = request.get_json(force=True)
+    vendor = (body.get("vendor") or "").strip()
+    date = (body.get("date") or "").strip()
+    start_time = (body.get("start_time") or "").strip()
+    end_time = (body.get("end_time") or "").strip()
+    case_no = (body.get("case") or "").strip()
+    slot_type = (body.get("type") or "").strip()
+    registrant = (body.get("registrant") or "").strip()
+    if not all([vendor, date, start_time, end_time, case_no, slot_type, registrant]):
+        return jsonify({"error": "缺少必填欄位（廠商/日期/開始時間/結束時間/案號/項目類型/登記人）"}), 400
+    try:
+        _parse_hhmm(start_time)
+        _parse_hhmm(end_time)
+    except Exception:
+        return jsonify({"error": "時間格式錯誤，要是 HH:MM（例如 10:00）"}), 400
+    if _parse_hhmm(start_time) >= _parse_hhmm(end_time):
+        return jsonify({"error": "開始時間要早於結束時間"}), 400
+
+    try:
+        escaped_vendor = vendor.replace("'", "\\'")
+        formula = (
+            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',"
+            f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',"
+            f"IS_SAME({{{FIELD_SLOT_DATE}}},'{date}','day'))"
+        )
+        existing = airtable_get_all(
+            SLOT_API_URL, formula,
+            [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
+        )
+        for r in existing:
+            ef = r["fields"]
+            es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
+            if not es or not ee:
+                continue
+            if _slots_overlap(start_time, end_time, es, ee):
+                return jsonify({
+                    "error": "這個時段已經被佔用了",
+                    "conflict": {
+                        "case": ef.get(FIELD_SLOT_CASE_NO, ""),
+                        "alias": ef.get(FIELD_SLOT_ALIAS, ""),
+                        "type": ef.get(FIELD_SLOT_TYPE),
+                        "start_time": es,
+                        "end_time": ee,
+                        "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
+                    },
+                }), 409
+    except Exception as e:
+        return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+
+    try:
+        fields = {
+            FIELD_SLOT_TITLE: f"{vendor} {date} {start_time}-{end_time} {slot_type}",
+            FIELD_SLOT_KIND: SLOT_KIND_BOOKING,
+            FIELD_SLOT_VENDOR: vendor,
+            FIELD_SLOT_DATE: date,
+            FIELD_SLOT_START: start_time,
+            FIELD_SLOT_END: end_time,
+            FIELD_SLOT_CASE_NO: case_no,
+            FIELD_SLOT_ALIAS: (body.get("alias") or "").strip(),
+            FIELD_SLOT_TYPE: slot_type,
+            FIELD_SLOT_REGISTRANT: registrant,
+            FIELD_SLOT_NOTE: (body.get("note") or "").strip(),
+        }
+        resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "record": resp.json()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/vendor-slots/<record_id>", methods=["DELETE"])
+def delete_vendor_slot(record_id):
+    """刪掉一筆開放時段或已預約記錄（登記錯誤時用）。"""
+    try:
+        resp = requests.delete(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
 
 @app.route("/api/site-survey-cancelled-sync", methods=["POST"])
 def site_survey_cancelled_sync():
