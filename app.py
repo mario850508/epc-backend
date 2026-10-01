@@ -315,6 +315,12 @@ SURVEY_FIELD_SALES = "fldAKCKzWyhrXDMY2"  # 責任業務1
 SURVEY_FIELD_PROVIDED_DATE = "fldmhn7FUE8eoxKiW"  # 案件提供日（確定由哪間 EPC 承接的日期）
 SURVEY_FIELD_PLANNED_DATE = "fldmmvw9v099ebhSv"  # 預計場勘日
 SURVEY_FIELD_ACTUAL_DATE = "fldvgJUT55WLX4EiW"  # 實際場勘日
+# 2026-10-01 新增（透過 Airtable MCP 建立）：勾選後，隔天的自動回填排程會跳過
+# 這筆案件，不會把預計場勘日當成實際場勘日寫回去。使用者確認日期本身的調整
+# 直接改「預計場勘日」就好（自動回填本來就只處理「日期已過」的案件，改成未來
+# 日期自然就不會被處理到），只有「有異常但先不改日期」這種情況才需要這個獨立
+# 的勾選欄位。
+SURVEY_FIELD_EXCEPTION = "fldPzjPSpLdpUMJCg"  # 場勘異常
 SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID}"
 
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
@@ -2291,7 +2297,7 @@ def site_survey_pending():
         survey_fields = [
             SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
             SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
-            SURVEY_FIELD_PLANNED_DATE,
+            SURVEY_FIELD_PLANNED_DATE, SURVEY_FIELD_EXCEPTION,
         ]
         candidate_formula = (
             f"AND(NOT({{{SURVEY_FIELD_PROVIDED_DATE}}}=BLANK()),"
@@ -2340,9 +2346,91 @@ def site_survey_pending():
             "sales_person": f.get(SURVEY_FIELD_SALES),
             "provided_date": f.get(SURVEY_FIELD_PROVIDED_DATE),
             "planned_date": f.get(SURVEY_FIELD_PLANNED_DATE),
+            "exception": bool(f.get(SURVEY_FIELD_EXCEPTION)),
         })
     cases.sort(key=lambda c: c.get("provided_date") or "")
     return jsonify({"cases": cases, "excluded_count": len(candidates) - len(cases)})
+
+
+@app.route("/api/site-survey-pending/<record_id>", methods=["POST"])
+def update_site_survey_case(record_id):
+    """「場勘安排」頁用：填寫/修改單一案件的「預計場勘日」，以及切換「場勘異常」
+    勾選（勾選後隔天的自動回填排程會跳過這筆）。直接寫回另一個 Airtable base
+    （SURVEY_BASE_ID）的 Table 1，不經過 APP資料 表——跟這頁其他表格不同，
+    這份資料本來就不是陽光管理主控台原本那個 base 的案件，沒有案件 RecordID
+    可以對應，record_id 這裡指的就是 SURVEY_BASE_ID 這個 base 裡的記錄 id。
+    body: {planned_date: "YYYY-MM-DD" 或 null（選填）, exception: true/false（選填）}
+    兩個都是選填，只會更新有帶的欄位。"""
+    body = request.get_json(force=True)
+    fields = {}
+    if "planned_date" in body:
+        fields[SURVEY_FIELD_PLANNED_DATE] = body.get("planned_date") or None
+    if "exception" in body:
+        fields[SURVEY_FIELD_EXCEPTION] = bool(body.get("exception"))
+    if not fields:
+        return jsonify({"error": "缺少 planned_date 或 exception"}), 400
+    try:
+        resp = requests.patch(
+            f"{SURVEY_API_URL}/{record_id}", headers=airtable_headers(),
+            json={"fields": fields}, timeout=20,
+        )
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "record": resp.json()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+def auto_fill_survey_actual_dates():
+    """每天固定時間自動執行（排程見 scheduler.add_job）：「預計場勘日」已經是
+    過去的日期、「實際場勘日」還空白、而且沒有勾選「場勘異常」的案件，視為
+    「場勘當天如期完成、沒人回報異常」，自動把實際場勘日寫成預計場勘日。
+    使用者確認的規則：日期有調整就直接改預計場勘日（本來就只處理「日期已過」
+    的案件，改成未來日期自然不會被這裡處理到）；有異常但先不改日期的，要手動
+    勾選「場勘異常」，這裡會跳過。失敗只印 log，不拋出例外——排程本身不能因為
+    這個失敗就整個掛掉，之後排程換下一輪、或使用者手動在畫面上處理都還有
+    機會補救。"""
+    try:
+        formula = (
+            f"AND(NOT({{{SURVEY_FIELD_PLANNED_DATE}}}=BLANK()),"
+            f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK(),"
+            f"{{{SURVEY_FIELD_PLANNED_DATE}}}<TODAY(),"
+            f"NOT({{{SURVEY_FIELD_EXCEPTION}}}))"
+        )
+        records = airtable_get_all(
+            SURVEY_API_URL, formula, [SURVEY_FIELD_CASE_NO, SURVEY_FIELD_PLANNED_DATE]
+        )
+    except Exception as e:
+        print(f"[auto_fill_survey_actual_dates] 查詢失敗：{e}", flush=True)
+        return
+    ok_count, fail_count = 0, 0
+    for r in records:
+        planned = r["fields"].get(SURVEY_FIELD_PLANNED_DATE)
+        if not planned:
+            continue
+        try:
+            resp = requests.patch(
+                f"{SURVEY_API_URL}/{r['id']}", headers=airtable_headers(),
+                json={"fields": {SURVEY_FIELD_ACTUAL_DATE: planned}}, timeout=20,
+            )
+            if resp.status_code >= 400:
+                fail_count += 1
+                print(f"[auto_fill_survey_actual_dates] {r['id']} 寫入失敗：{resp.text}", flush=True)
+            else:
+                ok_count += 1
+        except Exception as e:
+            fail_count += 1
+            print(f"[auto_fill_survey_actual_dates] {r['id']} 寫入例外：{e}", flush=True)
+    print(f"[auto_fill_survey_actual_dates] 完成，成功 {ok_count} 筆、失敗 {fail_count} 筆", flush=True)
+
+
+# 排到每天早上 7:30（Asia/Taipei，跟 scheduler 建立時設定的時區一致）執行。
+# 這支函式定義在 scheduler 物件建立（第 1616 行附近）之後，所以沒有跟
+# refresh_cache／refresh_model_options_cache 那兩個排程放在一起註冊，但
+# add_job() 只是把工作登記進 scheduler 的 job store，呼叫的時間點不影響
+# 排程本身何時真正執行（實際啟動是 gunicorn.conf.py 的 post_fork 裡呼叫
+# scheduler.start()，那時候這裡一定已經執行完畢、job 已經登記好了）。
+scheduler.add_job(auto_fill_survey_actual_dates, CronTrigger(hour=7, minute=30))
 
 
 # ===================================================================
