@@ -671,14 +671,35 @@ def _find_task_by_token(token):
 def get_vendor_slot_task_by_token(token):
     """給 book.html（業務自助預約頁，不用登入）用：用 token 查任務內容。這支 API
     本身沒有登入驗證——「知道連結」就是通行碼，所以 token 一定要夠長夠隨機
-    （secrets.token_urlsafe(16)，產生時就決定了，這裡不用再額外加密碼）。"""
+    （secrets.token_urlsafe(16)，產生時就決定了，這裡不用再額外加密碼）。
+    如果任務已經完成，額外把對應那筆「已預約」記錄的日期/時間/登記人撈出來
+    放進 booked，book.html 才能顯示「已經安排在幾點」，不用只顯示「已完成」
+    四個字。撈不到（例如那筆記錄被手動刪了）也不報錯，booked 就是 null，
+    前端會顯示「請直接聯絡窗口確認」。"""
     try:
         r = _find_task_by_token(token)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     if not r:
         return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
-    return jsonify({"task": _task_to_dict(r)})
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE and task["booking_id"]:
+        try:
+            resp = requests.get(
+                f"{SLOT_API_URL}/{task['booking_id']}", headers=airtable_headers(),
+                params={"returnFieldsByFieldId": "true"}, timeout=15,
+            )
+            if resp.status_code < 400:
+                bf = resp.json().get("fields", {})
+                task["booked"] = {
+                    "date": bf.get(FIELD_SLOT_DATE),
+                    "start_time": bf.get(FIELD_SLOT_START),
+                    "end_time": bf.get(FIELD_SLOT_END),
+                    "registrant": bf.get(FIELD_SLOT_REGISTRANT),
+                }
+        except Exception:
+            pass
+    return jsonify({"task": task})
 
 
 @app.route("/api/vendor-slots/public-task/<token>/book", methods=["POST"])
