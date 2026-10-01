@@ -211,6 +211,7 @@ import io
 import json
 import time
 import uuid
+import secrets
 import threading
 import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前先 import 一次，避免 requests 內部
               # 的 get_netrc_auth() 在多執行緒同時第一次 import 這個模組時卡死（曾造成
@@ -364,6 +365,28 @@ SLOT_KIND_WINDOW = "開放時段"
 SLOT_KIND_BOOKING = "已預約"
 SLOT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{SLOT_TABLE_ID}"
 
+# ---- 廠商時段任務（2026-10-01 新增，「廠商時段協調」的延伸）----
+# PM 幫某個案子建一個「待業務安排」的任務（廠商提供候選日期，業務點免登入
+# 連結、自己跟屋主喬好時間後進去完成預約），避免 PM 自己要一筆一筆去問每個
+# 業務的時間、再手動登記。Token 就是這個連結的通行碼（/book.html?token=xxx），
+# 沒有帳號密碼，知道連結就能用，所以 token 本身要夠長、夠隨機。
+TASK_TABLE_ID = "tblgNebQ0zj2Sg2Cy"
+FIELD_TASK_TITLE = "fldU4lK1ioIwC37El"
+FIELD_TASK_VENDOR = "fldUuLlcmoPYH6D2v"
+FIELD_TASK_CASE_NO = "fldBWRBOQAnLrOAQx"
+FIELD_TASK_ALIAS = "fld415LlbNJEXLSXd"
+FIELD_TASK_TYPE = "fldskbG78tge7sZ4d"
+FIELD_TASK_CANDIDATE_DATES = "fldtlJv4YEt2tH6nD"  # 逗號分隔 YYYY-MM-DD 字串
+FIELD_TASK_ASSIGNEE = "fldsNoYvammA9I5E3"
+FIELD_TASK_STATUS = "fldX4K5SBqwNtw6wm"
+FIELD_TASK_TOKEN = "fldF8tofB4Ohsmmzj"
+FIELD_TASK_BOOKING_ID = "fldjI1Lofz85R0qlA"
+FIELD_TASK_CREATOR = "fldhlpfrSacYaGFsH"
+FIELD_TASK_NOTE = "fldgyScZS4sEU85L3"
+TASK_STATUS_PENDING = "待業務安排"
+TASK_STATUS_DONE = "已完成"
+TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
+
 
 def _parse_hhmm(s):
     h, m = (s or "").strip().split(":")
@@ -444,29 +467,30 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
-@app.route("/api/vendor-slots/bookings", methods=["POST"])
-def create_vendor_slot_booking():
-    """預約時段：寫入前先查同廠商、同日期的既有「已預約」記錄，時間重疊就擋下來
-    （回傳 409 跟衝突到的那筆資料），不讓兩個業務卡到同一段時間。
-    body: {vendor, date, start_time, end_time, case, alias, type, registrant, note}
-    start_time/end_time 格式 "HH:MM"（24 小時制）。"""
-    body = request.get_json(force=True)
-    vendor = (body.get("vendor") or "").strip()
-    date = (body.get("date") or "").strip()
-    start_time = (body.get("start_time") or "").strip()
-    end_time = (body.get("end_time") or "").strip()
-    case_no = (body.get("case") or "").strip()
-    slot_type = (body.get("type") or "").strip()
-    registrant = (body.get("registrant") or "").strip()
+def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note):
+    """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
+    有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
+      1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
+      2. POST /api/vendor-slots/tasks/<token>/book（業務透過免登入連結自助預約）
+    兩邊共用同一套衝突偵測，不要各自重寫一份（容易兩邊邏輯兜不起來）。
+    回傳 (record_dict, None) 表示成功；(None, (body_dict, status_code)) 表示失敗，
+    呼叫端直接 return jsonify(body), status 就好。"""
+    vendor = (vendor or "").strip()
+    date = (date or "").strip()
+    start_time = (start_time or "").strip()
+    end_time = (end_time or "").strip()
+    case_no = (case_no or "").strip()
+    slot_type = (slot_type or "").strip()
+    registrant = (registrant or "").strip()
     if not all([vendor, date, start_time, end_time, case_no, slot_type, registrant]):
-        return jsonify({"error": "缺少必填欄位（廠商/日期/開始時間/結束時間/案號/項目類型/登記人）"}), 400
+        return None, ({"error": "缺少必填欄位（廠商/日期/開始時間/結束時間/案號/項目類型/登記人）"}, 400)
     try:
         _parse_hhmm(start_time)
         _parse_hhmm(end_time)
     except Exception:
-        return jsonify({"error": "時間格式錯誤，要是 HH:MM（例如 10:00）"}), 400
+        return None, ({"error": "時間格式錯誤，要是 HH:MM（例如 10:00）"}, 400)
     if _parse_hhmm(start_time) >= _parse_hhmm(end_time):
-        return jsonify({"error": "開始時間要早於結束時間"}), 400
+        return None, ({"error": "開始時間要早於結束時間"}, 400)
 
     try:
         escaped_vendor = vendor.replace("'", "\\'")
@@ -485,7 +509,7 @@ def create_vendor_slot_booking():
             if not es or not ee:
                 continue
             if _slots_overlap(start_time, end_time, es, ee):
-                return jsonify({
+                return None, ({
                     "error": "這個時段已經被佔用了",
                     "conflict": {
                         "case": ef.get(FIELD_SLOT_CASE_NO, ""),
@@ -495,9 +519,9 @@ def create_vendor_slot_booking():
                         "end_time": ee,
                         "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
                     },
-                }), 409
+                }, 409)
     except Exception as e:
-        return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+        return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
 
     try:
         fields = {
@@ -508,17 +532,34 @@ def create_vendor_slot_booking():
             FIELD_SLOT_START: start_time,
             FIELD_SLOT_END: end_time,
             FIELD_SLOT_CASE_NO: case_no,
-            FIELD_SLOT_ALIAS: (body.get("alias") or "").strip(),
+            FIELD_SLOT_ALIAS: (alias or "").strip(),
             FIELD_SLOT_TYPE: slot_type,
             FIELD_SLOT_REGISTRANT: registrant,
-            FIELD_SLOT_NOTE: (body.get("note") or "").strip(),
+            FIELD_SLOT_NOTE: (note or "").strip(),
         }
         resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
-            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
-        return jsonify({"ok": True, "record": resp.json()})
+            return None, ({"error": "Airtable 寫入失敗", "detail": resp.text}, 502)
+        return resp.json(), None
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        return None, ({"error": str(e)}, 502)
+
+
+@app.route("/api/vendor-slots/bookings", methods=["POST"])
+def create_vendor_slot_booking():
+    """預約時段：寫入前先查同廠商、同日期的既有「已預約」記錄，時間重疊就擋下來
+    （回傳 409 跟衝突到的那筆資料），不讓兩個業務卡到同一段時間。
+    body: {vendor, date, start_time, end_time, case, alias, type, registrant, note}
+    start_time/end_time 格式 "HH:MM"（24 小時制）。實際邏輯見 _book_vendor_slot()。"""
+    body = request.get_json(force=True)
+    record, err = _book_vendor_slot(
+        body.get("vendor"), body.get("date"), body.get("start_time"), body.get("end_time"),
+        body.get("case"), body.get("alias"), body.get("type"), body.get("registrant"), body.get("note"),
+    )
+    if err:
+        err_body, status = err
+        return jsonify(err_body), status
+    return jsonify({"ok": True, "record": record})
 
 
 @app.route("/api/vendor-slots/<record_id>", methods=["DELETE"])
@@ -531,6 +572,158 @@ def delete_vendor_slot(record_id):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+def _task_fields():
+    return [
+        FIELD_TASK_VENDOR, FIELD_TASK_CASE_NO, FIELD_TASK_ALIAS, FIELD_TASK_TYPE,
+        FIELD_TASK_CANDIDATE_DATES, FIELD_TASK_ASSIGNEE, FIELD_TASK_STATUS,
+        FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
+    ]
+
+
+def _task_to_dict(r):
+    f = r["fields"]
+    dates_raw = f.get(FIELD_TASK_CANDIDATE_DATES, "") or ""
+    return {
+        "record_id": r["id"],
+        "vendor": f.get(FIELD_TASK_VENDOR),
+        "case": f.get(FIELD_TASK_CASE_NO, ""),
+        "alias": f.get(FIELD_TASK_ALIAS, ""),
+        "type": f.get(FIELD_TASK_TYPE),
+        "candidate_dates": [d.strip() for d in dates_raw.split(",") if d.strip()],
+        "assignee": f.get(FIELD_TASK_ASSIGNEE, ""),
+        "status": f.get(FIELD_TASK_STATUS, TASK_STATUS_PENDING),
+        "token": f.get(FIELD_TASK_TOKEN, ""),
+        "booking_id": f.get(FIELD_TASK_BOOKING_ID, ""),
+        "creator": f.get(FIELD_TASK_CREATOR, ""),
+        "note": f.get(FIELD_TASK_NOTE, ""),
+    }
+
+
+@app.route("/api/vendor-slots/tasks")
+def list_vendor_slot_tasks():
+    """主控台用：列出所有「待業務安排」任務（不分狀態，前端自己分組顯示）。"""
+    try:
+        records = airtable_get_all(TASK_API_URL, "TRUE()", _task_fields())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    tasks = [_task_to_dict(r) for r in records]
+    tasks.sort(key=lambda t: (t.get("status") == TASK_STATUS_DONE, t.get("vendor") or ""))
+    return jsonify({"tasks": tasks})
+
+
+@app.route("/api/vendor-slots/tasks", methods=["POST"])
+def create_vendor_slot_task():
+    """PM 建立一個待業務安排的任務。body: {vendor, case, alias, type, candidate_dates: [...],
+    assignee, creator, note}。產生一組隨機 token，回傳連結路徑 /book.html?token=xxx
+    讓前端組出完整網址、產生要貼給業務的訊息文字。"""
+    body = request.get_json(force=True)
+    vendor = (body.get("vendor") or "").strip()
+    case_no = (body.get("case") or "").strip()
+    slot_type = (body.get("type") or "").strip()
+    candidate_dates = [d.strip() for d in (body.get("candidate_dates") or []) if d.strip()]
+    if not vendor or not case_no or not slot_type or not candidate_dates:
+        return jsonify({"error": "缺少必填欄位（廠商/案號/項目類型/候選日期至少一天）"}), 400
+    token = secrets.token_urlsafe(16)
+    try:
+        fields = {
+            FIELD_TASK_TITLE: f"{vendor} {case_no} {slot_type} 待業務安排",
+            FIELD_TASK_VENDOR: vendor,
+            FIELD_TASK_CASE_NO: case_no,
+            FIELD_TASK_ALIAS: (body.get("alias") or "").strip(),
+            FIELD_TASK_TYPE: slot_type,
+            FIELD_TASK_CANDIDATE_DATES: ",".join(candidate_dates),
+            FIELD_TASK_ASSIGNEE: (body.get("assignee") or "").strip(),
+            FIELD_TASK_STATUS: TASK_STATUS_PENDING,
+            FIELD_TASK_TOKEN: token,
+            FIELD_TASK_CREATOR: (body.get("creator") or "").strip(),
+            FIELD_TASK_NOTE: (body.get("note") or "").strip(),
+        }
+        resp = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "token": token, "path": f"/book.html?token={token}"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/vendor-slots/tasks/<record_id>", methods=["DELETE"])
+def delete_vendor_slot_task(record_id):
+    """刪掉一個任務（連結會立刻失效）。"""
+    try:
+        resp = requests.delete(f"{TASK_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+def _find_task_by_token(token):
+    escaped = (token or "").replace("'", "\\'")
+    formula = f"{{{FIELD_TASK_TOKEN}}}='{escaped}'"
+    records = airtable_get_all(TASK_API_URL, formula, _task_fields())
+    return records[0] if records else None
+
+
+@app.route("/api/vendor-slots/public-task/<token>")
+def get_vendor_slot_task_by_token(token):
+    """給 book.html（業務自助預約頁，不用登入）用：用 token 查任務內容。這支 API
+    本身沒有登入驗證——「知道連結」就是通行碼，所以 token 一定要夠長夠隨機
+    （secrets.token_urlsafe(16)，產生時就決定了，這裡不用再額外加密碼）。"""
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
+    return jsonify({"task": _task_to_dict(r)})
+
+
+@app.route("/api/vendor-slots/public-task/<token>/book", methods=["POST"])
+def book_vendor_slot_task(token):
+    """業務在 book.html 選好日期/時間、按下「完成預約」時呼叫。
+    body: {date, start_time, end_time, registrant, note}
+    date 必須是這個任務候選日期之一；案號/別名/廠商/項目類型都從任務本身帶，
+    業務不用也不能重新輸入（避免手滑打錯案號）。成功後把任務狀態改成「已完成」，
+    這個連結之後只能看、不能再預約一次（但可以讓 PM 自己刪掉任務重開一個）。"""
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個任務已經完成預約了，如果要改時間請聯絡窗口處理"}), 409
+
+    body = request.get_json(force=True)
+    date = (body.get("date") or "").strip()
+    if date not in task["candidate_dates"]:
+        return jsonify({"error": "日期不在候選範圍內，請從提供的候選日期裡選一個"}), 400
+
+    record, err = _book_vendor_slot(
+        task["vendor"], date, body.get("start_time"), body.get("end_time"),
+        task["case"], task["alias"], task["type"], body.get("registrant"), body.get("note"),
+    )
+    if err:
+        err_body, status = err
+        return jsonify(err_body), status
+
+    try:
+        requests.patch(
+            f"{TASK_API_URL}/{r['id']}", headers=airtable_headers(),
+            json={"fields": {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"]}},
+            timeout=20,
+        )
+    except Exception as e:
+        # 預約本身已經成功寫入了，這裡只是回頭標記任務完成，失敗也不該讓使用者
+        # 以為預約失敗——只印 log，前端照樣顯示預約成功。PM 之後重新整理主控台
+        # 時如果發現任務狀態沒更新，手動刪掉任務即可，不影響已經卡好的時段。
+        print(f"[book_vendor_slot_task] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+
+    return jsonify({"ok": True, "record": record})
 
 
 @app.route("/api/site-survey-cancelled-sync", methods=["POST"])
