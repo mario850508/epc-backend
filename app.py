@@ -221,6 +221,8 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from google.oauth2 import service_account
+import google.auth.transport.requests
 
 app = Flask(__name__)
 CORS(app)
@@ -322,6 +324,53 @@ SURVEY_FIELD_ACTUAL_DATE = "fldvgJUT55WLX4EiW"  # 實際場勘日
 # 的勾選欄位。
 SURVEY_FIELD_EXCEPTION = "fldPzjPSpLdpUMJCg"  # 場勘異常
 SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID}"
+
+# 2026-10-01 新增：「場勘安排」清單還要排除業務自治區 Google 試算表裡已經標記
+# 「取消」的案件（使用者反饋：有些等了幾百天的紅字案件，其實早就撤案了，只是
+# 工務組那個 base 沒有同步更新）。
+# 這份試算表含賠償金額等內部資訊，不適合整張公開，改用 Google 服務帳戶讀取——
+# 使用者需要：1) 建立一個 GCP 服務帳戶、啟用 Sheets API、產生 JSON 金鑰；
+# 2) 把這份試算表以「檢視者」身分分享給那組服務帳戶的 email；3) 把金鑰 JSON
+# 內容整個貼進 Render 環境變數 GOOGLE_SERVICE_ACCOUNT_JSON（不是檔案路徑，
+# 是 JSON 字串本身）。三個步驟沒做完，fetch_cancelled_case_numbers() 會失敗，
+# 但只會印 log、不會讓「場勘安排」整支 API 掛掉（取消排除就先不生效）。
+BIZ_SHEET_ID = "17gH7IiF0T0zZKv6YAEbzkyPQvdhaYJiSt0DhPnOT7aU"  # 業務自治區
+BIZ_SHEET_CANCEL_TABS = ["取消案件", "A01資訊"]  # 這兩個頁籤的 A 欄都可能標記「取消」
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+
+def _google_sheets_access_token():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise Exception("缺少環境變數 GOOGLE_SERVICE_ACCOUNT_JSON（Google 服務帳戶金鑰 JSON）")
+    info = json.loads(raw)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
+    creds.refresh(google.auth.transport.requests.Request())
+    return creds.token
+
+
+def fetch_cancelled_case_numbers():
+    """讀業務自治區試算表「取消案件」「A01資訊」這兩個頁籤，把 A 欄是「取消」的
+    那幾列的案號（D 欄）抓出來，回傳一個 set。任何失敗（金鑰沒設定、試算表
+    沒分享給服務帳戶…）都只印 log、拋出例外讓呼叫端自己決定要不要忽略，
+    不應該讓這支函式吞掉錯誤變成「查起來沒問題但其實資料是空的」。"""
+    token = _google_sheets_access_token()
+    case_nos = set()
+    for sheet_name in BIZ_SHEET_CANCEL_TABS:
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{BIZ_SHEET_ID}/values/"
+            f"{requests.utils.quote(sheet_name, safe='')}!A:D"
+        )
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        if resp.status_code >= 400:
+            raise Exception(f"讀取「{sheet_name}」頁籤失敗：{resp.text}")
+        rows = resp.json().get("values", [])
+        for row in rows[1:]:  # 第一列是標題列
+            status = (row[0] if len(row) > 0 else "").strip()
+            case_no = (row[3] if len(row) > 3 else "").strip()
+            if status == "取消" and case_no:
+                case_nos.add(case_no)
+    return case_nos
 
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
 # 這張表是 2026-08-25 新增的，用來存放「已完工」「掛表安排」「異常案件」「變流器出貨日期」
@@ -2301,7 +2350,14 @@ def _compute_survey_cases():
     Fail／完成／送件進行中等等跟場勘無關的狀態）。使用者確認的排除規則：
       3. 這個案號在陽光管理主控台原本的 base（appj1wnO3WnRtIEvg）「進度管理」
          表裡，「併聯審查」這個里程碑如果已經有送件日期或取得日期，代表案件
-         早就過了場勘階段，要排除（不管這邊的實際場勘日有沒有填）。"""
+         早就過了場勘階段，要排除（不管這邊的實際場勘日有沒有填）。
+      4. 這個案號在業務自治區 Google 試算表「取消案件」或「A01資訊」頁籤裡，
+         如果 A 欄已經標記「取消」，代表案件已經撤案，要排除——這是因為
+         有些撤案案件工務組沒有回頭在 Table 1 更新狀態，只單用前三個條件
+         會把這些早就撤案、但案件提供日停在很久以前的案件也列進來（使用者
+         截圖回報：「等幾百天」的紅字案件其實都已經撤案）。
+         Google 試算表讀取失敗（通常是服務帳戶金鑰還沒設定好）不能讓整支
+         「場勘安排」查詢掛掉，只印 log、當作「這次沒有任何案件需要排除」。"""
     survey_fields = [
         SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
         SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
@@ -2327,11 +2383,19 @@ def _compute_survey_cases():
         if r["fields"].get(FIELD_MS_PROJECT_NAME)
     }
 
+    try:
+        cancelled_case_nos = fetch_cancelled_case_numbers()
+    except Exception as e:
+        cancelled_case_nos = set()
+        print(f"[_compute_survey_cases] 讀取業務自治區撤案清單失敗（本輪不排除任何撤案案件）：{e}", flush=True)
+
     cases = []
     for r in candidates:
         f = r["fields"]
         case_no = f.get(SURVEY_FIELD_CASE_NO, "")
         if case_no and case_no in excluded_case_nos:
+            continue
+        if case_no and case_no in cancelled_case_nos:
             continue
         cases.append({
             "record_id": r["id"],
