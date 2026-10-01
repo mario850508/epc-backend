@@ -291,6 +291,32 @@ CASE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CASE_TABLE_ID}"
 MILESTONE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MILESTONE_TABLE_ID}"
 INVERTER_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INVERTER_TABLE_ID}"
 
+# 2026-10-01 新增：「進度管理」表裡每筆里程碑記錄回連到「專案細節」的連結欄位
+# （FIELD_MS_CASE_LINK）在公式裡直接引用時，Airtable 會用連結表的主欄位（也就是
+# 專案細節表的「案號」，因為 CASE_TABLE_ID 的 primaryFieldId 正好是「案號」）當
+# 顯示值。「專案名稱」這個公式欄位的內容就是 {FIELD_MS_CASE_LINK}，等於直接查到
+# 這筆里程碑記錄屬於哪個案號，不用另外再查一次「專案細節」表比對 record id。
+FIELD_MS_PROJECT_NAME = "fldn4GXmErzbm3FhU"
+FIELD_MS_SUBMIT_DATE = "fldY0PpJgNXOEqwL8"  # 送件時間（跟 FIELD_MS_ACTUAL_DATE「完成日期」分開的欄位）
+
+# ---- 場勘安排（2026-10-01 新增，資料來自另一個 Airtable base「工務組」）----
+# 這是獨立於 appj1wnO3WnRtIEvg（[電廠] 案場管理）之外的另一個 base，工務組用來
+# 追蹤案場從「拿到案件」到「完工」的各個現場階段（場勘／平配圖／設計討論／丈量…），
+# 跟 EPC 出貨排程這邊原本接的 base 沒有關聯，只能用「案號」文字比對。
+# 必須確認 AIRTABLE_TOKEN 這組 PAT 有把這個 base 加進授權範圍，不然查詢會收到
+# 403 NOT_AUTHORIZED（跟本來那個 base 是各自獨立的權限設定）。
+SURVEY_BASE_ID = "appijmWI4f4lukYF7"  # 工務組（跟陽光管理主控台原本的 base 不同）
+SURVEY_TABLE_ID = "tbl9NIA83ZXUoozlT"  # Table 1
+SURVEY_FIELD_ALIAS = "fldp2lLjWhBd0OVPz"  # 案場別名
+SURVEY_FIELD_CASE_NO = "flda1hW5uEDeEsWTL"  # 案號
+SURVEY_FIELD_ADDRESS = "fldClOEBKjeRGebbR"  # 地址
+SURVEY_FIELD_VENDOR = "fldEiuYPdqOjlIG36"  # 責任EPC
+SURVEY_FIELD_SALES = "fldAKCKzWyhrXDMY2"  # 責任業務1
+SURVEY_FIELD_PROVIDED_DATE = "fldmhn7FUE8eoxKiW"  # 案件提供日（確定由哪間 EPC 承接的日期）
+SURVEY_FIELD_PLANNED_DATE = "fldmmvw9v099ebhSv"  # 預計場勘日
+SURVEY_FIELD_ACTUAL_DATE = "fldvgJUT55WLX4EiW"  # 實際場勘日
+SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID}"
+
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
 # 這張表是 2026-08-25 新增的，用來存放「已完工」「掛表安排」「異常案件」「變流器出貨日期」
 # 「註記清單」這幾個原本只存在瀏覽器本機的狀態，改成寫回 Airtable，讓不同電腦、不同同事
@@ -2241,6 +2267,82 @@ def milestone_status():
         return jsonify({"completed": bool(actual_date), "actual_date": actual_date, "found_milestone": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/site-survey-pending")
+def site_survey_pending():
+    """「EPC 出貨／進場排程 → 場勘安排」頁用：列出需要安排場勘的案件。
+    資料來自另一個 Airtable base（SURVEY_BASE_ID，工務組用來追蹤案場現場階段的
+    base，跟陽光管理主控台原本接的 base 不同，只能用案號文字比對）。
+    條件：
+      1. 案件提供日有值（代表已經確定由哪間 EPC 承接這個案子）
+      2. 實際場勘日空白（代表 EPC 還沒去場勘）
+    這兩個條件單獨用，會混進一批很久以前、根本沒在用這個流程節點的舊案件
+    （已經撤案/完工/走到後面階段，只是「實際場勘日」欄位本來就沒人回頭填過——
+    2026-10-01 實測：單用這兩個條件有 69 筆，但有 22 筆「進度」其實已經是
+    Fail／完成／送件進行中等等跟場勘無關的狀態）。使用者確認的排除規則：
+      3. 這個案號在陽光管理主控台原本的 base（appj1wnO3WnRtIEvg）「進度管理」
+         表裡，「併聯審查」這個里程碑如果已經有送件日期或取得日期，代表案件
+         早就過了場勘階段，要排除（不管這邊的實際場勘日有沒有填）。
+    這支 API 不會被每 6 秒一次的背景自動同步呼叫，只有切到「場勘安排」頁籤或
+    按手動重新整理才查，避免兩個 base 一起查太頻繁撞到 Airtable 每秒 5 次請求
+    的限制。"""
+    try:
+        survey_fields = [
+            SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
+            SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
+            SURVEY_FIELD_PLANNED_DATE,
+        ]
+        candidate_formula = (
+            f"AND(NOT({{{SURVEY_FIELD_PROVIDED_DATE}}}=BLANK()),"
+            f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK())"
+        )
+        candidates = airtable_get_all(SURVEY_API_URL, candidate_formula, survey_fields)
+    except Exception as e:
+        return jsonify({
+            "error": "查詢場勘資料失敗，請確認 AIRTABLE_TOKEN 這組 Personal Access Token"
+                      "有把「工務組」這個 base（appijmWI4f4lukYF7）加進授權範圍",
+            "detail": str(e),
+        }), 502
+
+    if not candidates:
+        return jsonify({"cases": []})
+
+    try:
+        # 併聯審查「送件時間」或「完成日期」只要有一個有值，就代表已經過了場勘階段
+        rejoin_formula = (
+            f"AND({{{FIELD_MS_TYPE}}}='併聯審查',"
+            f"OR(NOT({{{FIELD_MS_SUBMIT_DATE}}}=BLANK()),NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK())))"
+        )
+        rejoin_records = airtable_get_all(MILESTONE_API_URL, rejoin_formula, [FIELD_MS_PROJECT_NAME])
+        excluded_case_nos = {
+            r["fields"].get(FIELD_MS_PROJECT_NAME)
+            for r in rejoin_records
+            if r["fields"].get(FIELD_MS_PROJECT_NAME)
+        }
+    except Exception as e:
+        return jsonify({"error": "查詢併聯審查進度失敗", "detail": str(e)}), 502
+
+    cases = []
+    for r in candidates:
+        f = r["fields"]
+        case_no = f.get(SURVEY_FIELD_CASE_NO, "")
+        if case_no and case_no in excluded_case_nos:
+            continue
+        cases.append({
+            "record_id": r["id"],
+            "alias": f.get(SURVEY_FIELD_ALIAS, ""),
+            "case": case_no,
+            "address": f.get(SURVEY_FIELD_ADDRESS, ""),
+            # singleSelect 欄位透過 REST API（不是 MCP 工具）查詢時，值直接就是
+            # 選項文字本身，不是物件，不用再額外 .get("name")。
+            "vendor": f.get(SURVEY_FIELD_VENDOR),
+            "sales_person": f.get(SURVEY_FIELD_SALES),
+            "provided_date": f.get(SURVEY_FIELD_PROVIDED_DATE),
+            "planned_date": f.get(SURVEY_FIELD_PLANNED_DATE),
+        })
+    cases.sort(key=lambda c: c.get("provided_date") or "")
+    return jsonify({"cases": cases, "excluded_count": len(candidates) - len(cases)})
 
 
 # ===================================================================
