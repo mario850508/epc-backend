@@ -221,8 +221,6 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from google.oauth2 import service_account
-import google.auth.transport.requests
 
 app = Flask(__name__)
 CORS(app)
@@ -328,49 +326,38 @@ SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID
 # 2026-10-01 新增：「場勘安排」清單還要排除業務自治區 Google 試算表裡已經標記
 # 「取消」的案件（使用者反饋：有些等了幾百天的紅字案件，其實早就撤案了，只是
 # 工務組那個 base 沒有同步更新）。
-# 這份試算表含賠償金額等內部資訊，不適合整張公開，改用 Google 服務帳戶讀取——
-# 使用者需要：1) 建立一個 GCP 服務帳戶、啟用 Sheets API、產生 JSON 金鑰；
-# 2) 把這份試算表以「檢視者」身分分享給那組服務帳戶的 email；3) 把金鑰 JSON
-# 內容整個貼進 Render 環境變數 GOOGLE_SERVICE_ACCOUNT_JSON（不是檔案路徑，
-# 是 JSON 字串本身）。三個步驟沒做完，fetch_cancelled_case_numbers() 會失敗，
-# 但只會印 log、不會讓「場勘安排」整支 API 掛掉（取消排除就先不生效）。
-BIZ_SHEET_ID = "17gH7IiF0T0zZKv6YAEbzkyPQvdhaYJiSt0DhPnOT7aU"  # 業務自治區
-BIZ_SHEET_CANCEL_TABS = ["取消案件", "A01資訊"]  # 這兩個頁籤的 A 欄都可能標記「取消」
-GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+#
+# 原本想用 Google 服務帳戶讓後端主動去拉這份試算表，但公司 Workspace 網域政策
+# 把「外部帳號存取」整個鎖死了——服務帳戶被共用雲端硬碟的網域限制擋下來，
+# 改走 Apps Script 網頁應用程式也一樣，「誰可以存取」被組織政策鎖死只能選
+# 「網域內使用者」，這支後端沒有 sunnyfounder.com 的 Google 身分，打不進去。
+#
+# 改成反過來：試算表那邊用 Apps Script 的「時間觸發器」，定期主動把資料
+# UrlFetchApp.fetch() 推來這支 API，不是後端去拉。這個方向完全不受「誰可以
+# 存取網頁應用程式」那個網域限制影響（那個設定只管「誰可以打進 Apps Script」，
+# 不管「Apps Script 自己要打去哪裡」）。拿一組雙方說好的 SECRET（Render 環境
+# 變數 BIZ_SHEET_SYNC_KEY）當簡單驗證，避免這支公開端點被亂打。
+CANCELLED_CASE_CACHE = {"case_nos": set(), "updated_at": None}
+BIZ_SHEET_SYNC_KEY = os.environ.get("BIZ_SHEET_SYNC_KEY")
 
 
-def _google_sheets_access_token():
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw:
-        raise Exception("缺少環境變數 GOOGLE_SERVICE_ACCOUNT_JSON（Google 服務帳戶金鑰 JSON）")
-    info = json.loads(raw)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=GOOGLE_SHEETS_SCOPES)
-    creds.refresh(google.auth.transport.requests.Request())
-    return creds.token
+@app.route("/api/site-survey-cancelled-sync", methods=["POST"])
+def site_survey_cancelled_sync():
+    """業務自治區 Google 試算表的 Apps Script 時間觸發器呼叫這支，把「取消案件」
+    「A01資訊」兩個頁籤裡 A 欄＝「取消」的案號（D 欄）整批推過來，存進
+    CANCELLED_CASE_CACHE，_compute_survey_cases() 算「場勘安排」清單時直接讀
+    這份快取（不會每次都重新驗證 SECRET 以外的事，單純信任推進來的內容，呼叫
+    頻率跟內容正確性由試算表那邊的腳本負責）。
+    body: {key, cancelled_case_numbers: [案號, ...]}"""
+    body = request.get_json(force=True)
+    if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    case_nos = body.get("cancelled_case_numbers") or []
+    CANCELLED_CASE_CACHE["case_nos"] = {c for c in case_nos if c}
+    CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
+    print(f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號", flush=True)
+    return jsonify({"ok": True, "count": len(CANCELLED_CASE_CACHE["case_nos"])})
 
-
-def fetch_cancelled_case_numbers():
-    """讀業務自治區試算表「取消案件」「A01資訊」這兩個頁籤，把 A 欄是「取消」的
-    那幾列的案號（D 欄）抓出來，回傳一個 set。任何失敗（金鑰沒設定、試算表
-    沒分享給服務帳戶…）都只印 log、拋出例外讓呼叫端自己決定要不要忽略，
-    不應該讓這支函式吞掉錯誤變成「查起來沒問題但其實資料是空的」。"""
-    token = _google_sheets_access_token()
-    case_nos = set()
-    for sheet_name in BIZ_SHEET_CANCEL_TABS:
-        url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{BIZ_SHEET_ID}/values/"
-            f"{requests.utils.quote(sheet_name, safe='')}!A:D"
-        )
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
-        if resp.status_code >= 400:
-            raise Exception(f"讀取「{sheet_name}」頁籤失敗：{resp.text}")
-        rows = resp.json().get("values", [])
-        for row in rows[1:]:  # 第一列是標題列
-            status = (row[0] if len(row) > 0 else "").strip()
-            case_no = (row[3] if len(row) > 3 else "").strip()
-            if status == "取消" and case_no:
-                case_nos.add(case_no)
-    return case_nos
 
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
 # 這張表是 2026-08-25 新增的，用來存放「已完工」「掛表安排」「異常案件」「變流器出貨日期」
@@ -2355,9 +2342,9 @@ def _compute_survey_cases():
          如果 A 欄已經標記「取消」，代表案件已經撤案，要排除——這是因為
          有些撤案案件工務組沒有回頭在 Table 1 更新狀態，只單用前三個條件
          會把這些早就撤案、但案件提供日停在很久以前的案件也列進來（使用者
-         截圖回報：「等幾百天」的紅字案件其實都已經撤案）。
-         Google 試算表讀取失敗（通常是服務帳戶金鑰還沒設定好）不能讓整支
-         「場勘安排」查詢掛掉，只印 log、當作「這次沒有任何案件需要排除」。"""
+         截圖回報：「等幾百天」的紅字案件其實都已經撤案）。這份清單是試算表
+         那邊 Apps Script 定期主動推過來的（見 CANCELLED_CASE_CACHE／
+         /api/site-survey-cancelled-sync），這裡直接讀快取，不是現查。"""
     survey_fields = [
         SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
         SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
@@ -2383,11 +2370,9 @@ def _compute_survey_cases():
         if r["fields"].get(FIELD_MS_PROJECT_NAME)
     }
 
-    try:
-        cancelled_case_nos = fetch_cancelled_case_numbers()
-    except Exception as e:
-        cancelled_case_nos = set()
-        print(f"[_compute_survey_cases] 讀取業務自治區撤案清單失敗（本輪不排除任何撤案案件）：{e}", flush=True)
+    # 不用現查，直接讀 Apps Script 推過來的快取（還沒收到過推送時就是空集合，
+    # 等同「這輪不排除任何撤案案件」，不會讓這支函式整個失敗）。
+    cancelled_case_nos = CANCELLED_CASE_CACHE["case_nos"]
 
     cases = []
     for r in candidates:
