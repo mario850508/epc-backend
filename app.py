@@ -342,6 +342,14 @@ SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID
 CANCELLED_CASE_CACHE = {"case_nos": set(), "updated_at": None}
 BIZ_SHEET_SYNC_KEY = os.environ.get("BIZ_SHEET_SYNC_KEY")
 
+# 2026-10-01 新增：同一份 Apps Script 推送，順便帶「A01資訊」分頁裡 A 欄
+# ＝「已公證」的案件（案號＋施作廠商）。這些案件已經公證、PM 會需要先排
+# 掛表/植筋/放樣/場勘時段，但業務流程上通常要再晚一點才會建進 Airtable
+# 的「專案細節」表——不能等建檔才能排時段。只給「廠商時段協調」的案號
+# 模糊搜尋用（/api/case-search），不影響其他地方的案件查詢；沒有
+# record_id（因為根本沒有 Airtable 記錄），別名/業務欄位自然留空。
+CERTIFIED_CASE_CACHE = {"cases": [], "updated_at": None}
+
 # ---- 廠商時段協調（2026-10-01 新增）----
 # 廠商會開放幾個日期讓我們安排現場作業（掛表／植筋／放樣／場勘），業務各自去
 # 幫自己的案子卡時段，同一個廠商同一天不能有兩筆預約時間重疊（同一組工班）。
@@ -767,15 +775,33 @@ def site_survey_cancelled_sync():
     CANCELLED_CASE_CACHE，_compute_survey_cases() 算「場勘安排」清單時直接讀
     這份快取（不會每次都重新驗證 SECRET 以外的事，單純信任推進來的內容，呼叫
     頻率跟內容正確性由試算表那邊的腳本負責）。
-    body: {key, cancelled_case_numbers: [案號, ...]}"""
+    2026-10-01 同一支端點擴充：body 可以再帶一組 certified_cases（A01資訊
+    分頁裡 A 欄＝「已公證」的案號＋施作廠商），存進 CERTIFIED_CASE_CACHE，
+    給 /api/case-search 用——這些案件已經公證但通常還沒建進 Airtable 的
+    「專案細節」表，PM 卻已經要開始排時段了。
+    body: {key, cancelled_case_numbers: [案號, ...], certified_cases: [{case, vendor}, ...]}"""
     body = request.get_json(force=True)
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
     case_nos = body.get("cancelled_case_numbers") or []
     CANCELLED_CASE_CACHE["case_nos"] = {c for c in case_nos if c}
     CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
-    print(f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號", flush=True)
-    return jsonify({"ok": True, "count": len(CANCELLED_CASE_CACHE["case_nos"])})
+    certified = body.get("certified_cases") or []
+    CERTIFIED_CASE_CACHE["cases"] = [
+        {"case": (c.get("case") or "").strip(), "vendor": (c.get("vendor") or "").strip()}
+        for c in certified if isinstance(c, dict) and (c.get("case") or "").strip()
+    ]
+    CERTIFIED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
+    print(
+        f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號、"
+        f"{len(CERTIFIED_CASE_CACHE['cases'])} 筆已公證案件",
+        flush=True,
+    )
+    return jsonify({
+        "ok": True,
+        "count": len(CANCELLED_CASE_CACHE["case_nos"]),
+        "certified_count": len(CERTIFIED_CASE_CACHE["cases"]),
+    })
 
 
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
@@ -2568,8 +2594,17 @@ def case_search():
     廠商／地址）給清單顯示用，選定之後前端再呼叫 /api/case-lookup（帶
     case_record_id）查詢完整規格跟函文進度，這樣使用者一個字一個字打的時候，
     每次查詢都很輕量、不會卡頓。
-    query params: q（至少 1 個字，會同時比對案號／別名／地址，比對不分大小寫）"""
+    query params:
+      - q（至少 1 個字，會同時比對案號／別名／地址，比對不分大小寫）
+      - include_certified（選填，隨便給個值即可）：2026-10-01 新增，只有
+        「廠商時段協調」的案號搜尋會帶這個參數——額外把業務自治區 A01資訊
+        分頁裡 A 欄＝「已公證」、但還沒建進 Airtable 的案件也混進結果（見
+        CERTIFIED_CASE_CACHE）。其他呼叫端（電話紀錄筆記本、案件進場安排
+        手動新增）故意不帶這個參數，維持原本只查 Airtable 的行為，不要
+        把還沒建檔的案件混進那些場景（record_id 是空的，那些地方的後續
+        流程都假設一定有 record_id）。"""
     q = (request.args.get("q") or "").strip()
+    include_certified = bool(request.args.get("include_certified"))
     if not q:
         return jsonify({"results": []})
     try:
@@ -2604,6 +2639,23 @@ def case_search():
                 "vendor": f.get(FIELD_VENDOR, ""),
                 "address": f.get(FIELD_ADDRESS, ""),
             })
+        if include_certified:
+            seen_cases = {r["case"] for r in results}
+            q_lower = q.lower()
+            for c in CERTIFIED_CASE_CACHE.get("cases", []):
+                case_no = c.get("case", "")
+                if not case_no or case_no in seen_cases:
+                    continue
+                if q_lower in case_no.lower() or q_lower in (c.get("vendor") or "").lower():
+                    results.append({
+                        "record_id": "",
+                        "case": case_no,
+                        "alias": "",
+                        "vendor": c.get("vendor", ""),
+                        "address": "",
+                        "not_in_airtable": True,
+                    })
+            results = results[:8]
         return jsonify({"results": results})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
