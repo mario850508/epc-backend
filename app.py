@@ -350,6 +350,15 @@ BIZ_SHEET_SYNC_KEY = os.environ.get("BIZ_SHEET_SYNC_KEY")
 # record_id（因為根本沒有 Airtable 記錄），別名/業務欄位自然留空。
 CERTIFIED_CASE_CACHE = {"cases": [], "updated_at": None}
 
+# 2026-10-01 新增：屋主聯絡資訊（姓名/電話），來源是 A01資訊 K 欄連結指到的
+# Drive 案場資料夾裡「契約」子資料夾裡的租賃合約書文件最後一頁「甲方」區塊。
+# Apps Script 那邊先把解析結果快取寫回 A01資訊 表格的兩個新欄位（避免每次
+# 推送都要重新打開文件解析，案件一多會太慢/超過 Apps Script 單次執行時間
+# 限制），pushCancelledCases() 之後只是單純讀那兩欄、跟其他欄位一起推送
+# 過來。涵蓋「所有」案件（不限於已公證／不限於還沒建進 Airtable），所以
+# 用案號當 key 的獨立快取，不是 CERTIFIED_CASE_CACHE 的一部分。
+OWNER_CONTACT_CACHE = {}  # {案號: {"name": ..., "phone": ...}}
+
 # ---- 廠商時段協調（2026-10-01 新增）----
 # 廠商會開放幾個日期讓我們安排現場作業（掛表／植筋／放樣／場勘），業務各自去
 # 幫自己的案子卡時段，同一個廠商同一天不能有兩筆預約時間重疊（同一組工班）。
@@ -373,6 +382,8 @@ FIELD_SLOT_TYPE = "fldxwQTU9dB1aDPqX"        # 項目類型(多選)：掛表／�
 # 轉成 multipleSelects，只能建新欄位），舊欄位保留不刪，只是沒人寫/讀了。
 FIELD_SLOT_REGISTRANT = "fldgzpUmVlN51Abf6"  # 登記人
 FIELD_SLOT_NOTE = "fld0l1iExfCns0iNa"        # 備註
+FIELD_SLOT_OWNER_NAME = "fld3ljzB0bpzQzaXL"  # 屋主姓名，2026-10-01 新增
+FIELD_SLOT_OWNER_PHONE = "fldT1YrJY2Rp8L33S"  # 屋主電話，2026-10-01 新增
 SLOT_KIND_WINDOW = "開放時段"
 SLOT_KIND_BOOKING = "已預約"
 SLOT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{SLOT_TABLE_ID}"
@@ -396,6 +407,8 @@ FIELD_TASK_BOOKING_ID = "fldjI1Lofz85R0qlA"
 FIELD_TASK_CREATOR = "fldhlpfrSacYaGFsH"
 FIELD_TASK_NOTE = "fldgyScZS4sEU85L3"
 FIELD_TASK_DURATION_MIN = "fldzMaYBiILXmbHCd"  # 預估時長(分鐘)，2026-10-01 新增
+FIELD_TASK_OWNER_NAME = "fldva2m9OpEuNfmf9"  # 屋主姓名(預設)，2026-10-01 新增
+FIELD_TASK_OWNER_PHONE = "fldNqj1zYCkDjFIFf"  # 屋主電話(預設)，2026-10-01 新增
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -489,7 +502,8 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
-def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note):
+def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
+                       owner_name=None, owner_phone=None):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -559,6 +573,10 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
             FIELD_SLOT_REGISTRANT: registrant,
             FIELD_SLOT_NOTE: (note or "").strip(),
         }
+        if owner_name:
+            fields[FIELD_SLOT_OWNER_NAME] = owner_name.strip()
+        if owner_phone:
+            fields[FIELD_SLOT_OWNER_PHONE] = owner_phone.strip()
         resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return None, ({"error": "Airtable 寫入失敗", "detail": resp.text}, 502)
@@ -601,7 +619,7 @@ def _task_fields():
         FIELD_TASK_VENDOR, FIELD_TASK_CASE_NO, FIELD_TASK_ALIAS, FIELD_TASK_TYPE,
         FIELD_TASK_CANDIDATE_DATES, FIELD_TASK_ASSIGNEE, FIELD_TASK_STATUS,
         FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
-        FIELD_TASK_DURATION_MIN,
+        FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
     ]
 
 
@@ -622,6 +640,8 @@ def _task_to_dict(r):
         "creator": f.get(FIELD_TASK_CREATOR, ""),
         "note": f.get(FIELD_TASK_NOTE, ""),
         "duration_min": f.get(FIELD_TASK_DURATION_MIN),
+        "owner_name": f.get(FIELD_TASK_OWNER_NAME, ""),
+        "owner_phone": f.get(FIELD_TASK_OWNER_PHONE, ""),
     }
 
 
@@ -678,6 +698,12 @@ def create_vendor_slot_task():
         }
         if duration_min is not None:
             fields[FIELD_TASK_DURATION_MIN] = duration_min
+        owner_name = (body.get("owner_name") or "").strip()
+        owner_phone = (body.get("owner_phone") or "").strip()
+        if owner_name:
+            fields[FIELD_TASK_OWNER_NAME] = owner_name
+        if owner_phone:
+            fields[FIELD_TASK_OWNER_PHONE] = owner_phone
         resp = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
@@ -743,10 +769,13 @@ def get_vendor_slot_task_by_token(token):
 @app.route("/api/vendor-slots/public-task/<token>/book", methods=["POST"])
 def book_vendor_slot_task(token):
     """業務在 book.html 選好日期/時間、按下「完成預約」時呼叫。
-    body: {date, start_time, end_time, registrant, note}
+    body: {date, start_time, end_time, registrant, note, owner_name, owner_phone}
     date 必須是這個任務候選日期之一；案號/別名/廠商/項目類型都從任務本身帶，
-    業務不用也不能重新輸入（避免手滑打錯案號）。成功後把任務狀態改成「已完成」，
-    這個連結之後只能看、不能再預約一次（但可以讓 PM 自己刪掉任務重開一個）。"""
+    業務不用也不能重新輸入（避免手滑打錯案號）。owner_name/owner_phone 是
+    book.html「屋主聯絡資訊」區塊的值（業務可能勾「同公證書資訊」直接帶
+    任務上的預設值，也可能手動改過，以業務實際送出的為準）。成功後把任務
+    狀態改成「已完成」，這個連結之後只能看、不能再預約一次（但可以讓 PM
+    自己刪掉任務重開一個）。"""
     try:
         r = _find_task_by_token(token)
     except Exception as e:
@@ -765,6 +794,7 @@ def book_vendor_slot_task(token):
     record, err = _book_vendor_slot(
         task["vendor"], date, body.get("start_time"), body.get("end_time"),
         task["case"], task["alias"], task["type"], body.get("registrant"), body.get("note"),
+        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"),
     )
     if err:
         err_body, status = err
@@ -796,8 +826,14 @@ def site_survey_cancelled_sync():
     分頁裡 A 欄＝「已公證」的案號＋別名＋施作廠商＋業務），存進
     CERTIFIED_CASE_CACHE，給 /api/case-search 用——這些案件已經公證但通常
     還沒建進 Airtable 的「專案細節」表，PM 卻已經要開始排時段了。
+    2026-10-01 同日再擴充：body 可以再帶一組 owner_contacts（A01資訊表格
+    裡快取好的屋主姓名/電話，來源是 K 欄連結的 Drive 合約文件，解析過程
+    在 Apps Script 那邊做，這裡單純接收結果），存進 OWNER_CONTACT_CACHE，
+    涵蓋所有案件（不限於已公證／不限於還沒建進 Airtable），PM 建立「指派
+    給業務」任務時查到就會預先帶入屋主姓名/電話。
     body: {key, cancelled_case_numbers: [案號, ...],
-           certified_cases: [{case, alias, vendor, sales_person}, ...]}"""
+           certified_cases: [{case, alias, vendor, sales_person}, ...],
+           owner_contacts: [{case, name, phone}, ...]}"""
     body = request.get_json(force=True)
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
@@ -815,16 +851,42 @@ def site_survey_cancelled_sync():
         for c in certified if isinstance(c, dict) and (c.get("case") or "").strip()
     ]
     CERTIFIED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
+    owner_contacts = body.get("owner_contacts") or []
+    new_owner_cache = {}
+    for c in owner_contacts:
+        if not isinstance(c, dict):
+            continue
+        case_no = (c.get("case") or "").strip()
+        name = (c.get("name") or "").strip()
+        phone = (c.get("phone") or "").strip()
+        if case_no and (name or phone):
+            new_owner_cache[case_no] = {"name": name, "phone": phone}
+    OWNER_CONTACT_CACHE.clear()
+    OWNER_CONTACT_CACHE.update(new_owner_cache)
     print(
         f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號、"
-        f"{len(CERTIFIED_CASE_CACHE['cases'])} 筆已公證案件",
+        f"{len(CERTIFIED_CASE_CACHE['cases'])} 筆已公證案件、{len(OWNER_CONTACT_CACHE)} 筆屋主聯絡資訊",
         flush=True,
     )
     return jsonify({
         "ok": True,
         "count": len(CANCELLED_CASE_CACHE["case_nos"]),
         "certified_count": len(CERTIFIED_CASE_CACHE["cases"]),
+        "owner_contact_count": len(OWNER_CONTACT_CACHE),
     })
+
+
+@app.route("/api/owner-contact")
+def get_owner_contact():
+    """給前端選定案號後查屋主姓名/電話用（見 OWNER_CONTACT_CACHE 說明）。
+    query params: case（完整案號，需完全相符）"""
+    case_no = (request.args.get("case") or "").strip()
+    if not case_no:
+        return jsonify({"found": False})
+    info = OWNER_CONTACT_CACHE.get(case_no)
+    if not info:
+        return jsonify({"found": False})
+    return jsonify({"found": True, "name": info.get("name", ""), "phone": info.get("phone", "")})
 
 
 # ---- APP資料（前端狀態同步用，跨裝置/跨使用者共用；取代原本的 localStorage）----
