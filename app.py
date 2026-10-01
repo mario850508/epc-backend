@@ -358,7 +358,11 @@ FIELD_SLOT_START = "fldpHOWg6uebcs8Xe"       # 開始時間（"HH:MM" 字串，�
 FIELD_SLOT_END = "fldu0ZxMUnMtxy09d"         # 結束時間（同上）
 FIELD_SLOT_CASE_NO = "fldbeFm5WoQG5J6Xn"     # 案號（只有已預約會填）
 FIELD_SLOT_ALIAS = "fldqBDfAcb0r7pAPB"       # 案場別名（只有已預約會填）
-FIELD_SLOT_TYPE = "fldXYG2HPHWYI1NVk"        # 項目類型：掛表／植筋／放樣／場勘
+FIELD_SLOT_TYPE = "fldxwQTU9dB1aDPqX"        # 項目類型(多選)：掛表／植筋／放樣／場勘，可複選
+# 2026-10-01：原本 fldXYG2HPHWYI1NVk 是 singleSelect，使用者反饋常常要
+# 「放樣跟植筋一起」用同一個時段，改成 multipleSelects 新欄位
+# （fldxwQTU9dB1aDPqX，Airtable API 不能直接把既有欄位從 singleSelect
+# 轉成 multipleSelects，只能建新欄位），舊欄位保留不刪，只是沒人寫/讀了。
 FIELD_SLOT_REGISTRANT = "fldgzpUmVlN51Abf6"  # 登記人
 FIELD_SLOT_NOTE = "fld0l1iExfCns0iNa"        # 備註
 SLOT_KIND_WINDOW = "開放時段"
@@ -375,7 +379,7 @@ FIELD_TASK_TITLE = "fldU4lK1ioIwC37El"
 FIELD_TASK_VENDOR = "fldUuLlcmoPYH6D2v"
 FIELD_TASK_CASE_NO = "fldBWRBOQAnLrOAQx"
 FIELD_TASK_ALIAS = "fld415LlbNJEXLSXd"
-FIELD_TASK_TYPE = "fldskbG78tge7sZ4d"
+FIELD_TASK_TYPE = "fldD0ZRPJ30k3efgy"        # 項目類型(多選)，同上改成 multipleSelects
 FIELD_TASK_CANDIDATE_DATES = "fldtlJv4YEt2tH6nD"  # 逗號分隔 YYYY-MM-DD 字串
 FIELD_TASK_ASSIGNEE = "fldsNoYvammA9I5E3"
 FIELD_TASK_STATUS = "fldX4K5SBqwNtw6wm"
@@ -397,6 +401,15 @@ def _slots_overlap(start_a, end_a, start_b, end_b):
     """時間區間是否重疊（半開區間，10:00-11:00 跟 11:00-12:00 算不重疊，
     銜接得剛剛好）。輸入格式驗證（HH:MM、開始早於結束）由呼叫端先做好。"""
     return _parse_hhmm(start_a) < _parse_hhmm(end_b) and _parse_hhmm(start_b) < _parse_hhmm(end_a)
+
+
+def _normalize_type_list(raw):
+    """項目類型 2026-10-01 改成可複選（掛表/植筋/放樣/場勘可以同時選，例如
+    「放樣+植筋」一起跑一趟），前端一律送陣列，但這裡也接受舊格式的單一
+    字串（容錯，不然舊快取的前端頁面送過來會整個壞掉）。"""
+    if isinstance(raw, str):
+        raw = [raw] if raw.strip() else []
+    return [t.strip() for t in (raw or []) if isinstance(t, str) and t.strip()]
 
 
 @app.route("/api/vendor-slots")
@@ -426,7 +439,7 @@ def list_vendor_slots():
                 "end_time": f.get(FIELD_SLOT_END),
                 "case": f.get(FIELD_SLOT_CASE_NO, ""),
                 "alias": f.get(FIELD_SLOT_ALIAS, ""),
-                "type": f.get(FIELD_SLOT_TYPE),
+                "type": f.get(FIELD_SLOT_TYPE) or [],
                 "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
                 "note": f.get(FIELD_SLOT_NOTE, ""),
             })
@@ -480,9 +493,9 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     start_time = (start_time or "").strip()
     end_time = (end_time or "").strip()
     case_no = (case_no or "").strip()
-    slot_type = (slot_type or "").strip()
+    slot_type = _normalize_type_list(slot_type)
     registrant = (registrant or "").strip()
-    if not all([vendor, date, start_time, end_time, case_no, slot_type, registrant]):
+    if not all([vendor, date, start_time, end_time, case_no, registrant]) or not slot_type:
         return None, ({"error": "缺少必填欄位（廠商/日期/開始時間/結束時間/案號/項目類型/登記人）"}, 400)
     try:
         _parse_hhmm(start_time)
@@ -514,7 +527,7 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
                     "conflict": {
                         "case": ef.get(FIELD_SLOT_CASE_NO, ""),
                         "alias": ef.get(FIELD_SLOT_ALIAS, ""),
-                        "type": ef.get(FIELD_SLOT_TYPE),
+                        "type": ef.get(FIELD_SLOT_TYPE) or [],
                         "start_time": es,
                         "end_time": ee,
                         "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
@@ -525,7 +538,7 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
 
     try:
         fields = {
-            FIELD_SLOT_TITLE: f"{vendor} {date} {start_time}-{end_time} {slot_type}",
+            FIELD_SLOT_TITLE: f"{vendor} {date} {start_time}-{end_time} {'/'.join(slot_type)}",
             FIELD_SLOT_KIND: SLOT_KIND_BOOKING,
             FIELD_SLOT_VENDOR: vendor,
             FIELD_SLOT_DATE: date,
@@ -590,7 +603,7 @@ def _task_to_dict(r):
         "vendor": f.get(FIELD_TASK_VENDOR),
         "case": f.get(FIELD_TASK_CASE_NO, ""),
         "alias": f.get(FIELD_TASK_ALIAS, ""),
-        "type": f.get(FIELD_TASK_TYPE),
+        "type": f.get(FIELD_TASK_TYPE) or [],
         "candidate_dates": [d.strip() for d in dates_raw.split(",") if d.strip()],
         "assignee": f.get(FIELD_TASK_ASSIGNEE, ""),
         "status": f.get(FIELD_TASK_STATUS, TASK_STATUS_PENDING),
@@ -621,14 +634,14 @@ def create_vendor_slot_task():
     body = request.get_json(force=True)
     vendor = (body.get("vendor") or "").strip()
     case_no = (body.get("case") or "").strip()
-    slot_type = (body.get("type") or "").strip()
+    slot_type = _normalize_type_list(body.get("type"))
     candidate_dates = [d.strip() for d in (body.get("candidate_dates") or []) if d.strip()]
     if not vendor or not case_no or not slot_type or not candidate_dates:
         return jsonify({"error": "缺少必填欄位（廠商/案號/項目類型/候選日期至少一天）"}), 400
     token = secrets.token_urlsafe(16)
     try:
         fields = {
-            FIELD_TASK_TITLE: f"{vendor} {case_no} {slot_type} 待業務安排",
+            FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(slot_type)} 待業務安排",
             FIELD_TASK_VENDOR: vendor,
             FIELD_TASK_CASE_NO: case_no,
             FIELD_TASK_ALIAS: (body.get("alias") or "").strip(),
