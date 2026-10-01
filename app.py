@@ -321,6 +321,7 @@ SURVEY_FIELD_ACTUAL_DATE = "fldvgJUT55WLX4EiW"  # 實際場勘日
 # 日期自然就不會被處理到），只有「有異常但先不改日期」這種情況才需要這個獨立
 # 的勾選欄位。
 SURVEY_FIELD_EXCEPTION = "fldPzjPSpLdpUMJCg"  # 場勘異常
+SURVEY_FIELD_PROGRESS = "fldmJt64Oy2ama2zS"  # 進度（singleSelect，Fail 代表已經撤案/結束，要排除）
 SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID}"
 
 # 2026-10-01 新增：「場勘安排」清單還要排除業務自治區 Google 試算表裡已經標記
@@ -2344,7 +2345,13 @@ def _compute_survey_cases():
          會把這些早就撤案、但案件提供日停在很久以前的案件也列進來（使用者
          截圖回報：「等幾百天」的紅字案件其實都已經撤案）。這份清單是試算表
          那邊 Apps Script 定期主動推過來的（見 CANCELLED_CASE_CACHE／
-         /api/site-survey-cancelled-sync），這裡直接讀快取，不是現查。"""
+         /api/site-survey-cancelled-sync），這裡直接讀快取，不是現查。
+      5. Table 1 自己的「進度」欄位＝Fail 的也要排除（2026-10-01 使用者
+         截圖回報：用上面 1~4 的規則後，畫面上還是有一些「進度」已經是
+         Fail 的案件沒被擋到——這些是從頭到尾都沒進到併聯審查、也不在
+         業務自治區撤案清單裡的案件，只能直接看 Table 1 自己的進度欄位）。
+         直接寫進 Airtable filterByFormula，由 Airtable 端篩選掉，不用
+         另外查。"""
     survey_fields = [
         SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
         SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
@@ -2352,7 +2359,8 @@ def _compute_survey_cases():
     ]
     candidate_formula = (
         f"AND(NOT({{{SURVEY_FIELD_PROVIDED_DATE}}}=BLANK()),"
-        f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK())"
+        f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK(),"
+        f"{{{SURVEY_FIELD_PROGRESS}}}!='Fail')"
     )
     candidates = airtable_get_all(SURVEY_API_URL, candidate_formula, survey_fields)
     if not candidates:
