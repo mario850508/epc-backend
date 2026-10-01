@@ -776,10 +776,11 @@ def site_survey_cancelled_sync():
     這份快取（不會每次都重新驗證 SECRET 以外的事，單純信任推進來的內容，呼叫
     頻率跟內容正確性由試算表那邊的腳本負責）。
     2026-10-01 同一支端點擴充：body 可以再帶一組 certified_cases（A01資訊
-    分頁裡 A 欄＝「已公證」的案號＋施作廠商），存進 CERTIFIED_CASE_CACHE，
-    給 /api/case-search 用——這些案件已經公證但通常還沒建進 Airtable 的
-    「專案細節」表，PM 卻已經要開始排時段了。
-    body: {key, cancelled_case_numbers: [案號, ...], certified_cases: [{case, vendor}, ...]}"""
+    分頁裡 A 欄＝「已公證」的案號＋別名＋施作廠商＋業務），存進
+    CERTIFIED_CASE_CACHE，給 /api/case-search 用——這些案件已經公證但通常
+    還沒建進 Airtable 的「專案細節」表，PM 卻已經要開始排時段了。
+    body: {key, cancelled_case_numbers: [案號, ...],
+           certified_cases: [{case, alias, vendor, sales_person}, ...]}"""
     body = request.get_json(force=True)
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
@@ -788,7 +789,12 @@ def site_survey_cancelled_sync():
     CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
     certified = body.get("certified_cases") or []
     CERTIFIED_CASE_CACHE["cases"] = [
-        {"case": (c.get("case") or "").strip(), "vendor": (c.get("vendor") or "").strip()}
+        {
+            "case": (c.get("case") or "").strip(),
+            "alias": (c.get("alias") or "").strip(),
+            "vendor": (c.get("vendor") or "").strip(),
+            "sales_person": (c.get("sales_person") or "").strip(),
+        }
         for c in certified if isinstance(c, dict) and (c.get("case") or "").strip()
     ]
     CERTIFIED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
@@ -2646,13 +2652,16 @@ def case_search():
                 case_no = c.get("case", "")
                 if not case_no or case_no in seen_cases:
                     continue
-                if q_lower in case_no.lower() or q_lower in (c.get("vendor") or "").lower():
+                alias = c.get("alias") or ""
+                vendor = c.get("vendor") or ""
+                if q_lower in case_no.lower() or q_lower in vendor.lower() or q_lower in alias.lower():
                     results.append({
                         "record_id": "",
                         "case": case_no,
-                        "alias": "",
-                        "vendor": c.get("vendor", ""),
+                        "alias": alias,
+                        "vendor": vendor,
                         "address": "",
+                        "sales_person": c.get("sales_person") or "",
                         "not_in_airtable": True,
                     })
             results = results[:8]
