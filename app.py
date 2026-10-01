@@ -1643,6 +1643,7 @@ def _startup_refresh_all():
     直接 `python app.py` 執行時），確保一定是在真正服務請求的 process 裡執行。"""
     refresh_cache()
     refresh_model_options_cache()
+    refresh_survey_cache()
 
 
 @app.after_request
@@ -2275,11 +2276,22 @@ def milestone_status():
         return jsonify({"error": str(e)}), 502
 
 
-@app.route("/api/site-survey-pending")
-def site_survey_pending():
-    """「EPC 出貨／進場排程 → 場勘安排」頁用：列出需要安排場勘的案件。
-    資料來自另一個 Airtable base（SURVEY_BASE_ID，工務組用來追蹤案場現場階段的
-    base，跟陽光管理主控台原本接的 base 不同，只能用案號文字比對）。
+SURVEY_CACHE = {
+    "cases": [],
+    "excluded_count": 0,
+    "updated_at": None,
+    "refreshing": False,
+    "refreshing_started_at": None,
+    "refreshing_run_id": None,
+    "last_error": None,
+}
+_survey_cache_lock = threading.Lock()
+
+
+def _compute_survey_cases():
+    """實際去兩個 Airtable base 查詢、算出「場勘安排」清單，是 refresh_survey_cache()
+    真正做事的部分。拆成獨立函式方便測試，也讓 refresh_survey_cache() 專心處理
+    快取狀態（跟 compute_pending_and_entry() / refresh_cache() 的分工方式一樣）。
     條件：
       1. 案件提供日有值（代表已經確定由哪間 EPC 承接這個案子）
       2. 實際場勘日空白（代表 EPC 還沒去場勘）
@@ -2289,45 +2301,31 @@ def site_survey_pending():
     Fail／完成／送件進行中等等跟場勘無關的狀態）。使用者確認的排除規則：
       3. 這個案號在陽光管理主控台原本的 base（appj1wnO3WnRtIEvg）「進度管理」
          表裡，「併聯審查」這個里程碑如果已經有送件日期或取得日期，代表案件
-         早就過了場勘階段，要排除（不管這邊的實際場勘日有沒有填）。
-    這支 API 不會被每 6 秒一次的背景自動同步呼叫，只有切到「場勘安排」頁籤或
-    按手動重新整理才查，避免兩個 base 一起查太頻繁撞到 Airtable 每秒 5 次請求
-    的限制。"""
-    try:
-        survey_fields = [
-            SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
-            SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
-            SURVEY_FIELD_PLANNED_DATE, SURVEY_FIELD_EXCEPTION,
-        ]
-        candidate_formula = (
-            f"AND(NOT({{{SURVEY_FIELD_PROVIDED_DATE}}}=BLANK()),"
-            f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK())"
-        )
-        candidates = airtable_get_all(SURVEY_API_URL, candidate_formula, survey_fields)
-    except Exception as e:
-        return jsonify({
-            "error": "查詢場勘資料失敗，請確認 AIRTABLE_TOKEN 這組 Personal Access Token"
-                      "有把「工務組」這個 base（appijmWI4f4lukYF7）加進授權範圍",
-            "detail": str(e),
-        }), 502
-
+         早就過了場勘階段，要排除（不管這邊的實際場勘日有沒有填）。"""
+    survey_fields = [
+        SURVEY_FIELD_ALIAS, SURVEY_FIELD_CASE_NO, SURVEY_FIELD_ADDRESS,
+        SURVEY_FIELD_VENDOR, SURVEY_FIELD_SALES, SURVEY_FIELD_PROVIDED_DATE,
+        SURVEY_FIELD_PLANNED_DATE, SURVEY_FIELD_EXCEPTION,
+    ]
+    candidate_formula = (
+        f"AND(NOT({{{SURVEY_FIELD_PROVIDED_DATE}}}=BLANK()),"
+        f"{{{SURVEY_FIELD_ACTUAL_DATE}}}=BLANK())"
+    )
+    candidates = airtable_get_all(SURVEY_API_URL, candidate_formula, survey_fields)
     if not candidates:
-        return jsonify({"cases": []})
+        return [], 0
 
-    try:
-        # 併聯審查「送件時間」或「完成日期」只要有一個有值，就代表已經過了場勘階段
-        rejoin_formula = (
-            f"AND({{{FIELD_MS_TYPE}}}='併聯審查',"
-            f"OR(NOT({{{FIELD_MS_SUBMIT_DATE}}}=BLANK()),NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK())))"
-        )
-        rejoin_records = airtable_get_all(MILESTONE_API_URL, rejoin_formula, [FIELD_MS_PROJECT_NAME])
-        excluded_case_nos = {
-            r["fields"].get(FIELD_MS_PROJECT_NAME)
-            for r in rejoin_records
-            if r["fields"].get(FIELD_MS_PROJECT_NAME)
-        }
-    except Exception as e:
-        return jsonify({"error": "查詢併聯審查進度失敗", "detail": str(e)}), 502
+    # 併聯審查「送件時間」或「完成日期」只要有一個有值，就代表已經過了場勘階段
+    rejoin_formula = (
+        f"AND({{{FIELD_MS_TYPE}}}='併聯審查',"
+        f"OR(NOT({{{FIELD_MS_SUBMIT_DATE}}}=BLANK()),NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK())))"
+    )
+    rejoin_records = airtable_get_all(MILESTONE_API_URL, rejoin_formula, [FIELD_MS_PROJECT_NAME])
+    excluded_case_nos = {
+        r["fields"].get(FIELD_MS_PROJECT_NAME)
+        for r in rejoin_records
+        if r["fields"].get(FIELD_MS_PROJECT_NAME)
+    }
 
     cases = []
     for r in candidates:
@@ -2349,7 +2347,77 @@ def site_survey_pending():
             "exception": bool(f.get(SURVEY_FIELD_EXCEPTION)),
         })
     cases.sort(key=lambda c: c.get("provided_date") or "")
-    return jsonify({"cases": cases, "excluded_count": len(candidates) - len(cases)})
+    return cases, len(candidates) - len(cases)
+
+
+def refresh_survey_cache():
+    """2026-10-01 新增：原本 /api/site-survey-pending 是每次有人打開頁面就「現場」
+    查兩個 Airtable base（一次候選案件查詢 + 一次要掃好幾百筆的併聯審查排除查詢），
+    使用者反饋每次進頁面都要等～10 秒。改成跟 refresh_cache()（出貨/進場/已完工
+    那份快取）一樣的「背景排程 + 記憶體快取」模式：這支函式才會真的去查 Airtable，
+    API 本身只讀記憶體、瞬間回應。"""
+    run_id = uuid.uuid4().hex[:8]
+    now = datetime.now()
+    tag = f"[refresh_survey_cache #{run_id}]"
+
+    with _survey_cache_lock:
+        if SURVEY_CACHE["refreshing"]:
+            started = SURVEY_CACHE.get("refreshing_started_at")
+            age = (now - started).total_seconds() if started else None
+            if age is not None and age < STALE_REFRESH_SECONDS:
+                print(f"{tag} 已有其他更新在進行中，略過本次觸發", flush=True)
+                return
+            print(f"{tag} 偵測到上一輪疑似卡死，強制重新開始", flush=True)
+        SURVEY_CACHE["refreshing"] = True
+        SURVEY_CACHE["refreshing_started_at"] = now
+        SURVEY_CACHE["refreshing_run_id"] = run_id
+
+    print(f"{tag} 開始…", flush=True)
+    try:
+        cases, excluded_count = _compute_survey_cases()
+        SURVEY_CACHE["cases"] = cases
+        SURVEY_CACHE["excluded_count"] = excluded_count
+        SURVEY_CACHE["updated_at"] = datetime.now().isoformat()
+        SURVEY_CACHE["last_error"] = None
+        elapsed = (datetime.now() - now).total_seconds()
+        print(f"{tag} 完成，cases={len(cases)} excluded={excluded_count}，耗時 {elapsed:.1f} 秒", flush=True)
+    except Exception as e:
+        SURVEY_CACHE["last_error"] = str(e)
+        print(f"{tag} 失敗：{e}", flush=True)
+    finally:
+        with _survey_cache_lock:
+            if SURVEY_CACHE.get("refreshing_run_id") == run_id:
+                SURVEY_CACHE["refreshing"] = False
+                SURVEY_CACHE["refreshing_started_at"] = None
+                SURVEY_CACHE["refreshing_run_id"] = None
+
+
+@app.route("/api/site-survey-pending")
+def site_survey_pending():
+    """「EPC 出貨／進場排程 → 場勘安排」頁用：列出需要安排場勘的案件。只讀記憶體
+    快取（SURVEY_CACHE），瞬間回應——真正查 Airtable 的邏輯在 refresh_survey_cache()，
+    由排程（每 20 分鐘，見 scheduler.add_job）跟手動重新整理（POST 這支 API 的
+    /refresh）觸發，不會卡在這支 API 裡。"""
+    if SURVEY_CACHE["updated_at"] is None and not SURVEY_CACHE["refreshing"] and not SURVEY_CACHE["last_error"]:
+        # 伺服器剛啟動、_startup_refresh_all() 還沒跑到這份快取時，順手在背景觸發一次，
+        # 不然要等到下一個 20 分鐘整點才有資料。
+        threading.Thread(target=refresh_survey_cache, daemon=True).start()
+    return jsonify({
+        "cases": SURVEY_CACHE["cases"],
+        "excluded_count": SURVEY_CACHE["excluded_count"],
+        "updated_at": SURVEY_CACHE["updated_at"],
+        "refreshing": SURVEY_CACHE["refreshing"],
+        "last_error": SURVEY_CACHE["last_error"],
+    })
+
+
+@app.route("/api/site-survey-pending/refresh", methods=["POST"])
+def refresh_site_survey_pending():
+    """手動觸發「場勘安排」資料重新整理，背景執行、立刻回應（跟 /api/refresh 的
+    手動更新按鈕是同一種模式），前端按「🔄 重新整理」時呼叫這支，再輪詢
+    /api/site-survey-pending 的 updated_at 有沒有變化。"""
+    threading.Thread(target=refresh_survey_cache, daemon=True).start()
+    return jsonify({"ok": True, "message": "已在背景開始重新整理"})
 
 
 @app.route("/api/site-survey-pending/<record_id>", methods=["POST"])
@@ -2360,7 +2428,8 @@ def update_site_survey_case(record_id):
     這份資料本來就不是陽光管理主控台原本那個 base 的案件，沒有案件 RecordID
     可以對應，record_id 這裡指的就是 SURVEY_BASE_ID 這個 base 裡的記錄 id。
     body: {planned_date: "YYYY-MM-DD" 或 null（選填）, exception: true/false（選填）}
-    兩個都是選填，只會更新有帶的欄位。"""
+    兩個都是選填，只會更新有帶的欄位。寫入成功後順手同步更新 SURVEY_CACHE 裡
+    對應那一筆，這樣不用等下一輪排程，其他人下一次打開頁面就能看到最新值。"""
     body = request.get_json(force=True)
     fields = {}
     if "planned_date" in body:
@@ -2376,6 +2445,13 @@ def update_site_survey_case(record_id):
         )
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+        for c in SURVEY_CACHE["cases"]:
+            if c["record_id"] == record_id:
+                if "planned_date" in body:
+                    c["planned_date"] = body.get("planned_date") or None
+                if "exception" in body:
+                    c["exception"] = bool(body.get("exception"))
+                break
         return jsonify({"ok": True, "record": resp.json()})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -2431,6 +2507,10 @@ def auto_fill_survey_actual_dates():
 # 排程本身何時真正執行（實際啟動是 gunicorn.conf.py 的 post_fork 裡呼叫
 # scheduler.start()，那時候這裡一定已經執行完畢、job 已經登記好了）。
 scheduler.add_job(auto_fill_survey_actual_dates, CronTrigger(hour=7, minute=30))
+# 「場勘安排」快取每 20 分鐘重新整理一次（0,20,40 分），比出貨/進場那份快取
+# （每 6 小時）頻繁，因為這份資料使用者會常態性打開查看、填寫預計場勘日；
+# 但也不像出貨/進場那份有 6 秒一次的前端背景同步，避免兩個 base 一起查太頻繁。
+scheduler.add_job(refresh_survey_cache, CronTrigger(minute="0,20,40"))
 
 
 # ===================================================================
