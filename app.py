@@ -395,6 +395,7 @@ FIELD_TASK_TOKEN = "fldF8tofB4Ohsmmzj"
 FIELD_TASK_BOOKING_ID = "fldjI1Lofz85R0qlA"
 FIELD_TASK_CREATOR = "fldhlpfrSacYaGFsH"
 FIELD_TASK_NOTE = "fldgyScZS4sEU85L3"
+FIELD_TASK_DURATION_MIN = "fldzMaYBiILXmbHCd"  # 預估時長(分鐘)，2026-10-01 新增
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -600,6 +601,7 @@ def _task_fields():
         FIELD_TASK_VENDOR, FIELD_TASK_CASE_NO, FIELD_TASK_ALIAS, FIELD_TASK_TYPE,
         FIELD_TASK_CANDIDATE_DATES, FIELD_TASK_ASSIGNEE, FIELD_TASK_STATUS,
         FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
+        FIELD_TASK_DURATION_MIN,
     ]
 
 
@@ -619,6 +621,7 @@ def _task_to_dict(r):
         "booking_id": f.get(FIELD_TASK_BOOKING_ID, ""),
         "creator": f.get(FIELD_TASK_CREATOR, ""),
         "note": f.get(FIELD_TASK_NOTE, ""),
+        "duration_min": f.get(FIELD_TASK_DURATION_MIN),
     }
 
 
@@ -637,8 +640,13 @@ def list_vendor_slot_tasks():
 @app.route("/api/vendor-slots/tasks", methods=["POST"])
 def create_vendor_slot_task():
     """PM 建立一個待業務安排的任務。body: {vendor, case, alias, type, candidate_dates: [...],
-    assignee, creator, note}。產生一組隨機 token，回傳連結路徑 /book.html?token=xxx
-    讓前端組出完整網址、產生要貼給業務的訊息文字。"""
+    assignee, creator, note, duration_min}。產生一組隨機 token，回傳連結路徑
+    /book.html?token=xxx 讓前端組出完整網址、產生要貼給業務的訊息文字。
+    duration_min（選填，正整數）：PM 給的預估作業時長（分鐘），不管是直接
+    勾「交由業務安排」填的時長，還是從完整預估時間 start/end 換算出來的，
+    統一存成這一個欄位——book.html 自助預約頁看到這個值，就能讓業務只選
+    開始時間、結束時間自動帶（仍可手動改），沒有這個值就維持原本兩個時間
+    都要自己選的舊版行為（相容舊任務）。"""
     body = request.get_json(force=True)
     vendor = (body.get("vendor") or "").strip()
     case_no = (body.get("case") or "").strip()
@@ -646,6 +654,13 @@ def create_vendor_slot_task():
     candidate_dates = [d.strip() for d in (body.get("candidate_dates") or []) if d.strip()]
     if not vendor or not case_no or not slot_type or not candidate_dates:
         return jsonify({"error": "缺少必填欄位（廠商/案號/項目類型/候選日期至少一天）"}), 400
+    duration_min = body.get("duration_min")
+    try:
+        duration_min = int(duration_min) if duration_min else None
+        if duration_min is not None and duration_min <= 0:
+            duration_min = None
+    except (TypeError, ValueError):
+        duration_min = None
     token = secrets.token_urlsafe(16)
     try:
         fields = {
@@ -661,6 +676,8 @@ def create_vendor_slot_task():
             FIELD_TASK_CREATOR: (body.get("creator") or "").strip(),
             FIELD_TASK_NOTE: (body.get("note") or "").strip(),
         }
+        if duration_min is not None:
+            fields[FIELD_TASK_DURATION_MIN] = duration_min
         resp = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
