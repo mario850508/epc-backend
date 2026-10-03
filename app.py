@@ -763,6 +763,35 @@ def get_vendor_slot_task_by_token(token):
                 }
         except Exception:
             pass
+    elif task["status"] != TASK_STATUS_DONE and task["vendor"] and task["candidate_dates"]:
+        # 2026-10-03：book.html 要在選時間的下拉裡直接把「這個廠商那天已經被
+        # 預約」的時段灰掉不能選，不要等送出才報衝突。這裡只回日期＋起訖時間
+        # （不帶案號/登記人，這支 API 沒有登入、知道連結就能看，不要順便把別人
+        # 的案子資訊也公開出去）。撈失敗不影響頁面，busy_slots 就是空陣列，
+        # 照舊靠送出時後端的衝突檢查擋。
+        task["busy_slots"] = []
+        try:
+            escaped_vendor = task["vendor"].replace("'", "\\'")
+            date_checks = ",".join(
+                f"IS_SAME({{{FIELD_SLOT_DATE}}},'{d}','day')" for d in task["candidate_dates"]
+            )
+            formula = (
+                f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',"
+                f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',OR({date_checks}))"
+            )
+            busy_records = airtable_get_all(
+                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END],
+            )
+            for br in busy_records:
+                bf = br["fields"]
+                if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
+                    task["busy_slots"].append({
+                        "date": bf[FIELD_SLOT_DATE],
+                        "start_time": bf[FIELD_SLOT_START],
+                        "end_time": bf[FIELD_SLOT_END],
+                    })
+        except Exception as e:
+            print(f"[get_vendor_slot_task_by_token] 撈已預約時段失敗（不影響頁面）：{e}", flush=True)
     return jsonify({"task": task})
 
 
