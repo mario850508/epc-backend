@@ -409,6 +409,16 @@ FIELD_TASK_NOTE = "fldgyScZS4sEU85L3"
 FIELD_TASK_DURATION_MIN = "fldzMaYBiILXmbHCd"  # 預估時長(分鐘)，2026-10-01 新增
 FIELD_TASK_OWNER_NAME = "fldva2m9OpEuNfmf9"  # 屋主姓名(預設)，2026-10-01 新增
 FIELD_TASK_OWNER_PHONE = "fldNqj1zYCkDjFIFf"  # 屋主電話(預設)，2026-10-01 新增
+# 2026-10-04：「原預約時間屋主不行，業務提供其他時間 → 窗口跟廠商確認後選一個
+# → 回傳業務確認」的協調流程。狀態欄位（待業務安排/已完成）是 singleSelect、
+# Airtable API 沒辦法加選項，所以另開「協調階段」欄位：空白＝一般流程，
+# 待窗口確認＝業務已回傳備選時段，待業務確認＝窗口已選定、等業務按確認。
+FIELD_TASK_STAGE = "fldfh9eWwvx5Tii1s"
+FIELD_TASK_ALT_SLOTS = "fldS0AR77PexwZJZa"      # 備選時段 JSON：[{date,start_time,end_time},...]
+FIELD_TASK_CHOSEN_SLOT = "fldlqEl82wwwiq9tM"    # 窗口選定時段 JSON：{date,start_time,end_time}
+FIELD_TASK_REP_NOTE = "fldAy7F6ibcZpbwTY"       # 業務回覆備註
+TASK_STAGE_WAIT_PM = "待窗口確認"
+TASK_STAGE_WAIT_REP = "待業務確認"
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -502,6 +512,36 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
+def _find_slot_conflict(vendor, date, start_time, end_time):
+    """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
+    資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
+    escaped_vendor = vendor.replace("'", "\\'")
+    formula = (
+        f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',"
+        f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',"
+        f"IS_SAME({{{FIELD_SLOT_DATE}}},'{date}','day'))"
+    )
+    existing = airtable_get_all(
+        SLOT_API_URL, formula,
+        [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
+    )
+    for r in existing:
+        ef = r["fields"]
+        es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
+        if not es or not ee:
+            continue
+        if _slots_overlap(start_time, end_time, es, ee):
+            return {
+                "case": ef.get(FIELD_SLOT_CASE_NO, ""),
+                "alias": ef.get(FIELD_SLOT_ALIAS, ""),
+                "type": ef.get(FIELD_SLOT_TYPE) or [],
+                "start_time": es,
+                "end_time": ee,
+                "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
+            }
+    return None
+
+
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
                        owner_name=None, owner_phone=None):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
@@ -529,35 +569,11 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
         return None, ({"error": "開始時間要早於結束時間"}, 400)
 
     try:
-        escaped_vendor = vendor.replace("'", "\\'")
-        formula = (
-            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',"
-            f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',"
-            f"IS_SAME({{{FIELD_SLOT_DATE}}},'{date}','day'))"
-        )
-        existing = airtable_get_all(
-            SLOT_API_URL, formula,
-            [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
-        )
-        for r in existing:
-            ef = r["fields"]
-            es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
-            if not es or not ee:
-                continue
-            if _slots_overlap(start_time, end_time, es, ee):
-                return None, ({
-                    "error": "這個時段已經被佔用了",
-                    "conflict": {
-                        "case": ef.get(FIELD_SLOT_CASE_NO, ""),
-                        "alias": ef.get(FIELD_SLOT_ALIAS, ""),
-                        "type": ef.get(FIELD_SLOT_TYPE) or [],
-                        "start_time": es,
-                        "end_time": ee,
-                        "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
-                    },
-                }, 409)
+        conflict = _find_slot_conflict(vendor, date, start_time, end_time)
     except Exception as e:
         return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
+    if conflict:
+        return None, ({"error": "這個時段已經被佔用了", "conflict": conflict}, 409)
 
     try:
         fields = {
@@ -620,7 +636,16 @@ def _task_fields():
         FIELD_TASK_CANDIDATE_DATES, FIELD_TASK_ASSIGNEE, FIELD_TASK_STATUS,
         FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
         FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
+        FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
     ]
+
+
+def _json_or_default(raw, default):
+    try:
+        v = json.loads(raw) if raw else default
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
 
 
 def _task_to_dict(r):
@@ -642,6 +667,10 @@ def _task_to_dict(r):
         "duration_min": f.get(FIELD_TASK_DURATION_MIN),
         "owner_name": f.get(FIELD_TASK_OWNER_NAME, ""),
         "owner_phone": f.get(FIELD_TASK_OWNER_PHONE, ""),
+        "stage": f.get(FIELD_TASK_STAGE) or "",
+        "alt_slots": _json_or_default(f.get(FIELD_TASK_ALT_SLOTS), []),
+        "chosen_slot": _json_or_default(f.get(FIELD_TASK_CHOSEN_SLOT), {}) or None,
+        "rep_note": f.get(FIELD_TASK_REP_NOTE, ""),
     }
 
 
@@ -772,12 +801,12 @@ def get_vendor_slot_task_by_token(token):
         task["busy_slots"] = []
         try:
             escaped_vendor = task["vendor"].replace("'", "\\'")
-            date_checks = ",".join(
-                f"IS_SAME({{{FIELD_SLOT_DATE}}},'{d}','day')" for d in task["candidate_dates"]
-            )
+            # 2026-10-04：業務「提供其他時間」可以選候選日期以外的任何一天，所以不再只
+            # 撈候選日期，改撈這個廠商昨天以後的所有預約（量小）。
             formula = (
                 f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',"
-                f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',OR({date_checks}))"
+                f"{{{FIELD_SLOT_VENDOR}}}='{escaped_vendor}',"
+                f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))"
             )
             busy_records = airtable_get_all(
                 SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END],
@@ -832,7 +861,8 @@ def book_vendor_slot_task(token):
     try:
         requests.patch(
             f"{TASK_API_URL}/{r['id']}", headers=airtable_headers(),
-            json={"fields": {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"]}},
+            json={"fields": {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"],
+                             FIELD_TASK_STAGE: None}},
             timeout=20,
         )
     except Exception as e:
@@ -841,6 +871,160 @@ def book_vendor_slot_task(token):
         # 時如果發現任務狀態沒更新，手動刪掉任務即可，不影響已經卡好的時段。
         print(f"[book_vendor_slot_task] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
 
+    return jsonify({"ok": True, "record": record})
+
+
+# ---- 2026-10-04：「原時間屋主不行，業務提供其他時間」協調流程 ----
+# 業務在 book.html 勾「原預約時間屋主無法配合」→ 填幾組其他日期＋時間（propose）
+# → 窗口（PM）在主控台跟廠商確認後，從裡面選一個（choose）→ 業務打開同一條連結看到
+# 選定的時間、按確認（confirm）才真的建立預約（這時才做衝突檢查＋鎖時段）。
+# 窗口如果全部都被廠商打槍，可以退回（reset）請業務重新提供。
+def _normalize_slot(s):
+    """把前端送來的一組 {date,start_time,end_time} 驗證＋正規化；格式不對回 None。"""
+    try:
+        date = str(s.get("date") or "").strip()
+        datetime.strptime(date, "%Y-%m-%d")
+        st = _parse_hhmm(str(s.get("start_time") or ""))
+        et = _parse_hhmm(str(s.get("end_time") or ""))
+    except Exception:
+        return None
+    if st >= et:
+        return None
+    return {"date": date, "start_time": f"{st // 60:02d}:{st % 60:02d}", "end_time": f"{et // 60:02d}:{et % 60:02d}"}
+
+
+def _patch_task(record_id, fields):
+    resp = requests.patch(f"{TASK_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if resp.status_code >= 400:
+        raise RuntimeError(resp.text)
+    return resp.json()
+
+
+def _get_task_by_record_id(record_id):
+    resp = requests.get(
+        f"{TASK_API_URL}/{record_id}", headers=airtable_headers(),
+        params={"returnFieldsByFieldId": "true"}, timeout=15,
+    )
+    if resp.status_code >= 400:
+        return None
+    return resp.json()
+
+
+@app.route("/api/vendor-slots/public-task/<token>/propose", methods=["POST"])
+def propose_vendor_slot_alternatives(token):
+    """業務回傳「屋主可以配合的其他時間」。body: {slots: [{date,start_time,end_time}, ...],
+    note, owner_name, owner_phone}。可重複呼叫（窗口退回後業務重新提供，或業務想修改）。"""
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個任務已經完成預約了"}), 409
+    body = request.get_json(force=True)
+    slots, seen = [], set()
+    for s in (body.get("slots") or []):
+        ns = _normalize_slot(s if isinstance(s, dict) else {})
+        if not ns:
+            return jsonify({"error": "備選時段格式不對（每一組都要有日期、開始時間、結束時間，且開始要早於結束）"}), 400
+        key = (ns["date"], ns["start_time"], ns["end_time"])
+        if key not in seen:
+            seen.add(key)
+            slots.append(ns)
+    if not slots:
+        return jsonify({"error": "請至少填一組屋主可以配合的日期與時間"}), 400
+    if len(slots) > 10:
+        return jsonify({"error": "備選時段最多 10 組"}), 400
+    fields = {
+        FIELD_TASK_STAGE: TASK_STAGE_WAIT_PM,
+        FIELD_TASK_ALT_SLOTS: json.dumps(slots, ensure_ascii=False),
+        FIELD_TASK_CHOSEN_SLOT: "",
+        FIELD_TASK_REP_NOTE: (body.get("note") or "").strip(),
+    }
+    if (body.get("owner_name") or "").strip():
+        fields[FIELD_TASK_OWNER_NAME] = body["owner_name"].strip()
+    if (body.get("owner_phone") or "").strip():
+        fields[FIELD_TASK_OWNER_PHONE] = body["owner_phone"].strip()
+    try:
+        _patch_task(r["id"], fields)
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "slots": slots})
+
+
+@app.route("/api/vendor-slots/tasks/<record_id>/choose", methods=["POST"])
+def choose_vendor_slot_alternative(record_id):
+    """窗口（PM）從業務回傳的備選時段裡選定一個。body: {index}。選的當下先檢查一次
+    衝突（廠商那天那段已經被別案占用就直接告訴 PM），真正鎖時段是業務按確認那一刻。"""
+    rec = _get_task_by_record_id(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    if task["status"] == TASK_STATUS_DONE or task["stage"] not in (TASK_STAGE_WAIT_PM, TASK_STAGE_WAIT_REP):
+        return jsonify({"error": "這個任務目前沒有待選擇的備選時段"}), 409
+    body = request.get_json(force=True)
+    try:
+        slot = task["alt_slots"][int(body.get("index"))]
+    except Exception:
+        return jsonify({"error": "選的備選時段不存在"}), 400
+    try:
+        conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"])
+    except Exception as e:
+        return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+    if conflict:
+        return jsonify({"error": "這個時段已經被佔用了", "conflict": conflict}), 409
+    try:
+        _patch_task(record_id, {
+            FIELD_TASK_CHOSEN_SLOT: json.dumps(slot, ensure_ascii=False),
+            FIELD_TASK_STAGE: TASK_STAGE_WAIT_REP,
+        })
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "chosen_slot": slot})
+
+
+@app.route("/api/vendor-slots/tasks/<record_id>/reset", methods=["POST"])
+def reset_vendor_slot_alternatives(record_id):
+    """窗口退回：備選時段廠商都不行，清掉備選/選定，回到一般「待業務安排」，請業務重新提供。"""
+    try:
+        _patch_task(record_id, {FIELD_TASK_STAGE: None, FIELD_TASK_ALT_SLOTS: "", FIELD_TASK_CHOSEN_SLOT: ""})
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/vendor-slots/public-task/<token>/confirm", methods=["POST"])
+def confirm_vendor_slot_chosen(token):
+    """業務確認窗口選定的那個時間沒問題。body: {registrant, note, owner_name, owner_phone}。
+    這時才真的建立預約（跟一般預約共用 _book_vendor_slot 的衝突檢查）、任務標成已完成。"""
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個任務已經完成預約了"}), 409
+    chosen = task["chosen_slot"]
+    if task["stage"] != TASK_STAGE_WAIT_REP or not chosen:
+        return jsonify({"error": "窗口還沒有選定時間，目前不能確認"}), 409
+    body = request.get_json(force=True)
+    record, err = _book_vendor_slot(
+        task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"],
+        task["case"], task["alias"], task["type"],
+        (body.get("registrant") or task["assignee"] or "").strip(), body.get("note"),
+        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"),
+    )
+    if err:
+        err_body, status = err
+        return jsonify(err_body), status
+    try:
+        _patch_task(r["id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
+    except Exception as e:
+        print(f"[confirm_vendor_slot_chosen] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
     return jsonify({"ok": True, "record": record})
 
 
