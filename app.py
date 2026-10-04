@@ -417,6 +417,7 @@ FIELD_TASK_STAGE = "fldfh9eWwvx5Tii1s"
 FIELD_TASK_ALT_SLOTS = "fldS0AR77PexwZJZa"      # 備選時段 JSON：[{date,start_time,end_time},...]
 FIELD_TASK_CHOSEN_SLOT = "fldlqEl82wwwiq9tM"    # 窗口選定時段 JSON：{date,start_time,end_time}
 FIELD_TASK_REP_NOTE = "fldAy7F6ibcZpbwTY"       # 業務回覆備註
+FIELD_TASK_DEADLINE = "fldcNCOuBjyy4lT0E"       # 回覆期限（dateTime，台北時間），2026-10-04 新增
 TASK_STAGE_WAIT_PM = "待窗口確認"
 TASK_STAGE_WAIT_REP = "待業務確認"
 TASK_STATUS_PENDING = "待業務安排"
@@ -637,7 +638,21 @@ def _task_fields():
         FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
         FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
+        FIELD_TASK_DEADLINE,
     ]
+
+
+def _normalize_deadline(raw):
+    """前端送來的回覆期限（ISO 8601，例如 2026-10-04T18:00:00+08:00）驗證後原樣回傳；
+    空值/格式不對回 None（＝不設期限）。"""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    try:
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return s
 
 
 def _json_or_default(raw, default):
@@ -671,6 +686,7 @@ def _task_to_dict(r):
         "alt_slots": _json_or_default(f.get(FIELD_TASK_ALT_SLOTS), []),
         "chosen_slot": _json_or_default(f.get(FIELD_TASK_CHOSEN_SLOT), {}) or None,
         "rep_note": f.get(FIELD_TASK_REP_NOTE, ""),
+        "deadline": f.get(FIELD_TASK_DEADLINE) or "",
     }
 
 
@@ -727,6 +743,9 @@ def create_vendor_slot_task():
         }
         if duration_min is not None:
             fields[FIELD_TASK_DURATION_MIN] = duration_min
+        deadline = _normalize_deadline(body.get("deadline"))
+        if deadline:
+            fields[FIELD_TASK_DEADLINE] = deadline
         owner_name = (body.get("owner_name") or "").strip()
         owner_phone = (body.get("owner_phone") or "").strip()
         if owner_name:
@@ -983,6 +1002,21 @@ def choose_vendor_slot_alternative(record_id):
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
     return jsonify({"ok": True, "chosen_slot": slot})
+
+
+@app.route("/api/vendor-slots/tasks/<record_id>/deadline", methods=["POST"])
+def set_vendor_slot_task_deadline(record_id):
+    """調整（或取消）回覆期限。body: {deadline: ISO 字串 | null}。"""
+    body = request.get_json(force=True)
+    raw = body.get("deadline")
+    deadline = _normalize_deadline(raw)
+    if raw and not deadline:
+        return jsonify({"error": "期限格式不對"}), 400
+    try:
+        _patch_task(record_id, {FIELD_TASK_DEADLINE: deadline})
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True, "deadline": deadline or ""})
 
 
 @app.route("/api/vendor-slots/tasks/<record_id>/reset", methods=["POST"])
