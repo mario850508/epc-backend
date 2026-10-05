@@ -865,7 +865,8 @@ def get_vendor_slot_task_by_token(token):
             line_bound = bool(_get_line_binding(task["assignee"]))
         except Exception:
             pass
-    return jsonify({"task": task, "liff_id": liff_id, "line_bound": line_bound})
+    return jsonify({"task": task, "liff_id": liff_id, "line_bound": line_bound,
+                    "add_friend_url": os.environ.get("LINE_ADD_FRIEND_URL", "").strip()})
 
 
 @app.route("/api/vendor-slots/public-task/<token>/bind-line", methods=["POST"])
@@ -3545,6 +3546,10 @@ def send_deadline_reminders():
                 continue
             lines.insert(0, f"（{who} 尚未綁定 LINE，轉給你代為提醒）")
         ok, err = _line_push_text("\n".join(lines), to=rep_uid)
+        if not ok and rep_uid and target:
+            # 業務還沒加陽光機器人好友（或封鎖了）會推不出去，改轉給 PM，不要讓提醒默默消失
+            lines.insert(0, f"（{who} 的 LINE 推播失敗，可能還沒加陽光機器人好友，轉給你代為提醒）")
+            ok, err = _line_push_text("\n".join(lines))
         if not ok:
             print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
             continue
