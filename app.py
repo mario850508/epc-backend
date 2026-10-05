@@ -420,6 +420,13 @@ FIELD_TASK_REP_NOTE = "fldAy7F6ibcZpbwTY"       # 業務回覆備註
 FIELD_TASK_DEADLINE = "fldcNCOuBjyy4lT0E"       # 回覆期限（dateTime，台北時間），2026-10-04 新增
 TASK_STAGE_WAIT_PM = "待窗口確認"
 TASK_STAGE_WAIT_REP = "待業務確認"
+# 2026-10-05：業務 LINE 綁定表（姓名 → LINE userId），供回覆期限提醒個別推播
+LINE_BIND_TABLE_ID = "tblkTLFeRSvqsVpBi"
+FIELD_BIND_NAME = "fldqJBVB9IYxnyWDR"
+FIELD_BIND_UID = "fld21MqIEDGkcJtl8"
+FIELD_BIND_DISPLAY = "fld5ebY8BPab9BotD"
+LINE_BIND_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{LINE_BIND_TABLE_ID}"
+FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"  # 已提醒（checkbox）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -772,6 +779,17 @@ def delete_vendor_slot_task(record_id):
         return jsonify({"error": str(e)}), 502
 
 
+def _find_line_binding_record(name):
+    escaped = (name or "").strip().replace("\\", "\\\\").replace("'", "\\'")
+    recs = airtable_get_all(LINE_BIND_API_URL, f"{{{FIELD_BIND_NAME}}}='{escaped}'", [FIELD_BIND_NAME, FIELD_BIND_UID])
+    return recs[0] if recs else None
+
+
+def _get_line_binding(name):
+    rec = _find_line_binding_record(name)
+    return (rec["fields"].get(FIELD_BIND_UID) if rec else None) or None
+
+
 def _find_task_by_token(token):
     escaped = (token or "").replace("'", "\\'")
     formula = f"{{{FIELD_TASK_TOKEN}}}='{escaped}'"
@@ -840,7 +858,59 @@ def get_vendor_slot_task_by_token(token):
                     })
         except Exception as e:
             print(f"[get_vendor_slot_task_by_token] 撈已預約時段失敗（不影響頁面）：{e}", flush=True)
-    return jsonify({"task": task})
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    line_bound = False
+    if liff_id and task["assignee"]:
+        try:
+            line_bound = bool(_get_line_binding(task["assignee"]))
+        except Exception:
+            pass
+    return jsonify({"task": task, "liff_id": liff_id, "line_bound": line_bound})
+
+
+@app.route("/api/vendor-slots/public-task/<token>/bind-line", methods=["POST"])
+def bind_line_for_task(token):
+    """業務在 book.html 按「綁定 LINE 提醒」後呼叫。前端用 LIFF 取得的 access token 傳來，
+    這裡自己拿去問 LINE（/v2/profile）取得真正的 userId，不信任前端直接傳的 userId，
+    避免有人亂填別人的 userId。userId 存進「業務LINE綁定」表（以任務的「指派給」名字為鍵），
+    之後同一位業務的任務都直接推給他，不用再綁。"""
+    body = request.get_json(force=True) or {}
+    access_token = (body.get("access_token") or "").strip()
+    if not access_token:
+        return jsonify({"error": "缺少 LINE 登入資訊"}), 400
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務"}), 404
+    name = (r["fields"].get(FIELD_TASK_ASSIGNEE) or "").strip()
+    if not name:
+        return jsonify({"error": "這個任務沒有指派業務姓名，無法綁定，請聯絡窗口"}), 400
+    try:
+        prof = requests.get(
+            "https://api.line.me/v2/profile",
+            headers={"Authorization": f"Bearer {access_token}"}, timeout=15,
+        )
+        if prof.status_code >= 400:
+            return jsonify({"error": "LINE 驗證失敗，請重新開啟連結再試一次"}), 400
+        pj = prof.json()
+        user_id, display = pj.get("userId", ""), pj.get("displayName", "")
+        if not user_id:
+            return jsonify({"error": "LINE 驗證失敗"}), 400
+        existing = _find_line_binding_record(name)
+        fields = {FIELD_BIND_NAME: name, FIELD_BIND_UID: user_id, FIELD_BIND_DISPLAY: display}
+        if existing:
+            resp = requests.patch(f"{LINE_BIND_API_URL}/{existing['id']}", headers=airtable_headers(),
+                                  json={"fields": fields}, timeout=20)
+        else:
+            resp = requests.post(LINE_BIND_API_URL, headers=airtable_headers(),
+                                 json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "display_name": display})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/vendor-slots/public-task/<token>/book", methods=["POST"])
@@ -1013,7 +1083,8 @@ def set_vendor_slot_task_deadline(record_id):
     if raw and not deadline:
         return jsonify({"error": "期限格式不對"}), 400
     try:
-        _patch_task(record_id, {FIELD_TASK_DEADLINE: deadline})
+        # 期限改了就重新武裝提醒（已提醒打勾清掉）
+        _patch_task(record_id, {FIELD_TASK_DEADLINE: deadline, FIELD_TASK_REMINDED: False})
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
     return jsonify({"ok": True, "deadline": deadline or ""})
@@ -3385,7 +3456,6 @@ scheduler.add_job(refresh_survey_cache, CronTrigger(minute="0,20,40"))
 # 兩個必要變數沒設就整個功能休眠、不影響其他功能。
 # 「已提醒」checkbox 欄位避免重複提醒（重新部署也不會重發）。
 # ===================================================================
-FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
@@ -3396,8 +3466,9 @@ def _line_config():
     )
 
 
-def _line_push_text(text):
-    token, target = _line_config()
+def _line_push_text(text, to=None):
+    token, default_target = _line_config()
+    target = to or default_target
     if not token or not target:
         return False, "LINE 環境變數未設定"
     resp = requests.post(
@@ -3413,7 +3484,7 @@ def _line_push_text(text):
 
 def send_deadline_reminders():
     token, target = _line_config()
-    if not token or not target:
+    if not token:
         return
     try:
         lead_min = int(os.environ.get("LINE_REMINDER_LEAD_MIN", "60"))
@@ -3463,7 +3534,17 @@ def send_deadline_reminders():
             lines.append("窗口已選好時段，請進表單按「確認」。")
         if base_url and f.get(FIELD_TASK_TOKEN):
             lines.append(f"{base_url}/book.html?token={f[FIELD_TASK_TOKEN]}")
-        ok, err = _line_push_text("\n".join(lines))
+        rep_uid = None
+        if f.get(FIELD_TASK_ASSIGNEE):
+            try:
+                rep_uid = _get_line_binding(f[FIELD_TASK_ASSIGNEE])
+            except Exception as e:
+                print(f"[send_deadline_reminders] 查綁定失敗：{e}", flush=True)
+        if not rep_uid:
+            if not target:
+                continue
+            lines.insert(0, f"（{who} 尚未綁定 LINE，轉給你代為提醒）")
+        ok, err = _line_push_text("\n".join(lines), to=rep_uid)
         if not ok:
             print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
             continue
