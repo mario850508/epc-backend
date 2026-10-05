@@ -3842,6 +3842,23 @@ def _send_day_before_reminders_impl():
 scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*/10"))
 
 
+@app.route("/api/line/run-job", methods=["POST"])
+def line_run_job():
+    """管理用：手動跑一次 LINE 排程工作（排查用，需要同步密鑰）。body: {key, job}，
+    job＝deadline（回覆期限提醒）或 day_before（前日提醒）。同步執行並回傳執行狀態。"""
+    body = request.get_json(force=True) or {}
+    if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+    job = body.get("job")
+    if job == "day_before":
+        send_day_before_reminders()
+        return jsonify({"ok": True, "state": DAY_BEFORE_STATE})
+    if job == "deadline":
+        send_deadline_reminders()
+        return jsonify({"ok": True})
+    return jsonify({"error": "job 必須是 deadline 或 day_before"}), 400
+
+
 @app.route("/api/line/liff-config")
 def line_liff_config():
     return jsonify({
