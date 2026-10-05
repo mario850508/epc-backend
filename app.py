@@ -3749,7 +3749,19 @@ def _push_to_name(name, text):
     return ok
 
 
+DAY_BEFORE_STATE = {}  # 最近一次前日提醒排程的執行狀態（給 /api/line/status 看，方便排查）
+
+
 def send_day_before_reminders():
+    DAY_BEFORE_STATE.update({"at": datetime.now().isoformat(), "error": None, "found": None, "sent": 0})
+    try:
+        _send_day_before_reminders_impl()
+    except Exception as e:
+        DAY_BEFORE_STATE["error"] = repr(e)
+        print(f"[send_day_before_reminders] 例外：{e!r}", flush=True)
+
+
+def _send_day_before_reminders_impl():
     """2026-10-05：行程前一天中午 12:00（排程每 10 分鐘檢查 12:00–17:50，用「已前日提醒」
     勾選避免重複），LINE 提醒負責的業務跟安排人員：請業務跟屋主提醒明天的行程。
     「負責的業務」＝任務的指派對象（沒有任務、PM 直接預約的，用登記人）；
@@ -3770,7 +3782,9 @@ def send_day_before_reminders():
         )
     except Exception as e:
         print(f"[send_day_before_reminders] 讀取預約失敗：{e}", flush=True)
+        DAY_BEFORE_STATE["error"] = f"讀取預約失敗：{e}"
         return
+    DAY_BEFORE_STATE["found"] = len(records)
     for r in records:
         f = r["fields"]
         if f.get(FIELD_SLOT_DAY_REMINDED):
@@ -3816,8 +3830,11 @@ def send_day_before_reminders():
                 print(f"[send_day_before_reminders] {case_no} 推播失敗：{err}", flush=True)
                 continue
         try:
-            requests.patch(f"{SLOT_API_URL}/{r['id']}", headers=airtable_headers(),
-                           json={"fields": {FIELD_SLOT_DAY_REMINDED: True}}, timeout=20)
+            resp = requests.patch(f"{SLOT_API_URL}/{r['id']}", headers=airtable_headers(),
+                                  json={"fields": {FIELD_SLOT_DAY_REMINDED: True}}, timeout=20)
+            if resp.status_code >= 400:
+                raise Exception(resp.text)
+            DAY_BEFORE_STATE["sent"] = DAY_BEFORE_STATE.get("sent", 0) + 1
         except Exception as e:
             print(f"[send_day_before_reminders] {case_no} 標記已前日提醒失敗：{e}", flush=True)
 
@@ -3885,6 +3902,7 @@ def line_status():
         "token_set": bool(token),
         "target_set": bool(target),
         "target_kind": {"C": "group", "R": "room", "U": "user"}.get(target[:1], "unknown") if target else None,
+        "day_before_last_run": DAY_BEFORE_STATE,
     })
 
 
