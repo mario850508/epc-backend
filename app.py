@@ -217,7 +217,7 @@ import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前�
               # 的 get_netrc_auth() 在多執行緒同時第一次 import 這個模組時卡死（曾造成
               # gunicorn worker 因 WORKER TIMEOUT 被砍掉，且完全沒有任何錯誤 log）。
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -3373,6 +3373,118 @@ scheduler.add_job(auto_fill_survey_actual_dates, CronTrigger(hour=7, minute=30))
 # （每 6 小時）頻繁，因為這份資料使用者會常態性打開查看、填寫預計場勘日；
 # 但也不像出貨/進場那份有 6 秒一次的前端背景同步，避免兩個 base 一起查太頻繁。
 scheduler.add_job(refresh_survey_cache, CronTrigger(minute="0,20,40"))
+
+
+# ===================================================================
+# LINE 回覆期限提醒（2026-10-05）
+# 業務在「回覆期限」前 LINE_REMINDER_LEAD_MIN 分鐘（預設 60）還沒完成安排，
+# 就用 LINE 官方帳號（Messaging API）推播到指定群組/個人。需在 Render 設定環境變數：
+#   LINE_CHANNEL_ACCESS_TOKEN  官方帳號的 Channel access token（長期）
+#   LINE_REMINDER_TARGET_ID    要推播的 groupId（C 開頭）或 userId（U 開頭）
+#   DASHBOARD_BASE_URL         （選填）前端網址，例如 https://xxx.github.io/epc-dashboard，用來附業務填單連結
+# 兩個必要變數沒設就整個功能休眠、不影響其他功能。
+# 「已提醒」checkbox 欄位避免重複提醒（重新部署也不會重發）。
+# ===================================================================
+FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
+
+
+def _line_config():
+    return (
+        os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip(),
+        os.environ.get("LINE_REMINDER_TARGET_ID", "").strip(),
+    )
+
+
+def _line_push_text(text):
+    token, target = _line_config()
+    if not token or not target:
+        return False, "LINE 環境變數未設定"
+    resp = requests.post(
+        LINE_PUSH_URL,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"to": target, "messages": [{"type": "text", "text": text}]},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        return False, f"{resp.status_code} {resp.text}"
+    return True, ""
+
+
+def send_deadline_reminders():
+    token, target = _line_config()
+    if not token or not target:
+        return
+    try:
+        lead_min = int(os.environ.get("LINE_REMINDER_LEAD_MIN", "60"))
+    except ValueError:
+        lead_min = 60
+    try:
+        records = airtable_get_all(
+            TASK_API_URL, "TRUE()", _task_fields() + [FIELD_TASK_REMINDED]
+        )
+    except Exception as e:
+        print(f"[send_deadline_reminders] 讀取任務失敗：{e}", flush=True)
+        return
+    now = datetime.now(timezone.utc)
+    base_url = os.environ.get("DASHBOARD_BASE_URL", "").strip().rstrip("/")
+    for r in records:
+        f = r["fields"]
+        if f.get(FIELD_TASK_REMINDED):
+            continue
+        if f.get(FIELD_TASK_STATUS, TASK_STATUS_PENDING) != TASK_STATUS_PENDING:
+            continue
+        # 待窗口確認＝業務已經回傳備選時段，球在窗口手上，不用催業務
+        if f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_PM:
+            continue
+        raw = f.get(FIELD_TASK_DEADLINE)
+        if not raw:
+            continue
+        try:
+            dl = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dl.tzinfo is None:
+                dl = dl.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        remain_min = (dl - now).total_seconds() / 60
+        # 只提醒「剩餘時間已進入提醒區間、且還沒過期」的任務
+        if remain_min > lead_min or remain_min < 0:
+            continue
+        local = dl.astimezone(timezone(timedelta(hours=8)))
+        who = f.get(FIELD_TASK_ASSIGNEE) or "業務"
+        case_no = f.get(FIELD_TASK_CASE_NO, "")
+        alias = f.get(FIELD_TASK_ALIAS, "")
+        types = "、".join(f.get(FIELD_TASK_TYPE) or [])
+        lines = [
+            f"⏰ {who} 您好，{case_no} {alias}".rstrip(),
+            f"{types}時段還沒確認，回覆期限 {local.strftime('%H:%M')}，剩約 {max(1, round(remain_min))} 分鐘。",
+        ]
+        if f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_REP:
+            lines.append("窗口已選好時段，請進表單按「確認」。")
+        if base_url and f.get(FIELD_TASK_TOKEN):
+            lines.append(f"{base_url}/book.html?token={f[FIELD_TASK_TOKEN]}")
+        ok, err = _line_push_text("\n".join(lines))
+        if not ok:
+            print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
+            continue
+        try:
+            _patch_task(r["id"], {FIELD_TASK_REMINDED: True})
+        except Exception as e:
+            print(f"[send_deadline_reminders] {case_no} 標記已提醒失敗：{e}", flush=True)
+
+
+scheduler.add_job(send_deadline_reminders, CronTrigger(minute="*/5"))
+
+
+@app.route("/api/line/status")
+def line_status():
+    """只回報 LINE 提醒設定是否到位（不回傳 token / ID 內容）。"""
+    token, target = _line_config()
+    return jsonify({
+        "token_set": bool(token),
+        "target_set": bool(target),
+        "target_kind": {"C": "group", "R": "room", "U": "user"}.get(target[:1], "unknown") if target else None,
+    })
 
 
 # ===================================================================
