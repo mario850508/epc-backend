@@ -3898,6 +3898,114 @@ scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*
                   replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
+# ---- 2026-10-05：隔天行程總覽（給 PM 本人，不限業務填單的案件）----
+# 每天 12:05 起（每 10 分鐘檢查到 17:55，成功發過就不重發），把「明天」所有行程整理成一則
+# LINE 訊息傳給預設對象（LINE_REMINDER_TARGET_ID＝PM 本人）：時段預約（場勘/放樣/掛表/植筋/進場…）、
+# 模組/逆變器出貨、進場、預計掛表日、植筋日、變流器出貨日、預計場勘日。
+# 只列指定廠商（預設 三創/尚展/曙光，可用環境變數 LINE_DIGEST_VENDORS 改，逗號分隔）。
+DIGEST_VENDORS = [v.strip() for v in os.environ.get("LINE_DIGEST_VENDORS", "三創,尚展,曙光").split(",") if v.strip()]
+DIGEST_STATE = {}
+
+
+def _collect_tomorrow_events(tmr):
+    events, seen = [], set()   # seen：(案號, 項目) 避免「時段預約」跟「預計日期欄位」重複列
+    # 1. 廠商時段預約（含 PM 自己直接預約的）
+    recs = airtable_get_all(
+        SLOT_API_URL,
+        f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',IS_SAME({{{FIELD_SLOT_DATE}}},'{tmr}','day'))",
+        [FIELD_SLOT_VENDOR, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS,
+         FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
+    )
+    for r in recs:
+        f = r["fields"]
+        types = f.get(FIELD_SLOT_TYPE) or []
+        case_no = f.get(FIELD_SLOT_CASE_NO, "")
+        for t in types:
+            seen.add((case_no, t))
+        events.append({
+            "vendor": f.get(FIELD_SLOT_VENDOR) or "", "kind": "/".join(types),
+            "time": f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}",
+            "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""),
+            "extra": f"業務：{f.get(FIELD_SLOT_REGISTRANT)}" if f.get(FIELD_SLOT_REGISTRANT) else "",
+        })
+    # 2. 出貨／進場（來自出貨進場排程快取）
+    case_vendor = {}
+    for lst in (DATA_CACHE.get("pending") or [], DATA_CACHE.get("entry") or [], DATA_CACHE.get("completed") or []):
+        for c in lst:
+            case_vendor[c.get("case")] = c.get("vendor") or ""
+    for c in (DATA_CACHE.get("entry") or []) + (DATA_CACHE.get("completed") or []):
+        if c.get("ship_date") == tmr and (c["case"], "出貨") not in seen:
+            seen.add((c["case"], "出貨"))
+            extra = "；".join(x for x in [f"模組 {c.get('module')}" if c.get("module") else "",
+                                          f"變流器 {c.get('inverter')}" if c.get("inverter") else ""] if x)
+            events.append({"vendor": c.get("vendor") or "", "kind": "出貨", "time": "", "case": c["case"],
+                           "alias": c.get("alias", ""), "extra": extra})
+    for c in DATA_CACHE.get("completed") or []:
+        if c.get("entry_date") == tmr and (c["case"], "進場") not in seen:
+            seen.add((c["case"], "進場"))
+            events.append({"vendor": c.get("vendor") or "", "kind": "進場", "time": "", "case": c["case"],
+                           "alias": c.get("alias", ""), "extra": ""})
+    # 3. APP資料「案件狀態」裡手動填的日期
+    for row in app_data_get_all("{類型}='案件狀態'"):
+        f = row["fields"]
+        case_no = f.get("案號", "")
+        for field_name, kind in (("預計掛表日期", "掛表"), ("植筋日期", "植筋"), ("變流器出貨日期", "變流器出貨")):
+            if f.get(field_name) == tmr and (case_no, kind) not in seen:
+                seen.add((case_no, kind))
+                events.append({"vendor": case_vendor.get(case_no, ""), "kind": kind, "time": "", "case": case_no,
+                               "alias": "", "extra": ""})
+    # 4. 預計場勘日（場勘 base）
+    for c in SURVEY_CACHE.get("cases") or []:
+        if c.get("planned_date") == tmr and (c.get("case"), "場勘") not in seen:
+            seen.add((c.get("case"), "場勘"))
+            events.append({"vendor": c.get("vendor") or "", "kind": "場勘", "time": "", "case": c.get("case", ""),
+                           "alias": c.get("alias", ""), "extra": f"業務：{c['sales_person']}" if c.get("sales_person") else ""})
+    return [e for e in events if (not e["vendor"]) or e["vendor"] in DIGEST_VENDORS]
+
+
+def send_tomorrow_digest(force=False):
+    token, target = _line_config()
+    if not token or not target:
+        return
+    tw = timezone(timedelta(hours=8))
+    tomorrow = datetime.now(tw) + timedelta(days=1)
+    tmr = tomorrow.strftime("%Y-%m-%d")
+    if not force and DIGEST_STATE.get("sent_for") == tmr:
+        return
+    DIGEST_STATE.update({"at": datetime.now().isoformat(), "for": tmr, "count": None, "error": None})
+    try:
+        events = _collect_tomorrow_events(tmr)
+    except Exception as e:
+        DIGEST_STATE["error"] = repr(e)
+        print(f"[send_tomorrow_digest] 收集行程失敗：{e!r}", flush=True)
+        return
+    DIGEST_STATE["count"] = len(events)
+    if not events:
+        return
+    by_vendor = {}
+    for e in events:
+        by_vendor.setdefault(e["vendor"] or "（廠商未知）", []).append(e)
+    lines = [f"📅 明天 {tmr[5:].replace('-', '/')}（週{WEEKDAY_ZH[tomorrow.weekday()]}）行程總覽，共 {len(events)} 筆"]
+    for vendor in sorted(by_vendor):
+        lines.append(f"\n【{vendor}】")
+        for e in sorted(by_vendor[vendor], key=lambda x: (x["time"] or "99", x["kind"])):
+            head = f"• {e['kind']}" + (f" {e['time']}" if e["time"] else "")
+            lines.append(f"{head}｜{e['case']} {e['alias']}".rstrip() + (f"（{e['extra']}）" if e["extra"] else ""))
+    text = "\n".join(lines)
+    if len(text) > 4800:
+        text = text[:4800] + "\n…（太長，後面略）"
+    ok, err = _line_push_text(text)
+    if ok:
+        DIGEST_STATE["sent_for"] = tmr
+    else:
+        DIGEST_STATE["error"] = err
+        print(f"[send_tomorrow_digest] 推播失敗：{err}", flush=True)
+
+
+scheduler.add_job(send_tomorrow_digest, CronTrigger(hour="12-17", minute="5,15,25,35,45,55", timezone="Asia/Taipei"),
+                  id="line_digest", replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
+
+
 @app.route("/api/line/run-job", methods=["POST"])
 def line_run_job():
     """管理用：手動跑一次 LINE 排程工作（排查用，需要同步密鑰）。body: {key, job}，
@@ -3912,6 +4020,9 @@ def line_run_job():
     if job == "deadline":
         send_deadline_reminders()
         return jsonify({"ok": True})
+    if job == "digest":
+        send_tomorrow_digest(force=bool(body.get("force")))
+        return jsonify({"ok": True, "state": DIGEST_STATE})
     return jsonify({"error": "job 必須是 deadline 或 day_before"}), 400
 
 
@@ -3976,6 +4087,7 @@ def line_status():
         "target_set": bool(target),
         "target_kind": {"C": "group", "R": "room", "U": "user"}.get(target[:1], "unknown") if target else None,
         "day_before_last_run": DAY_BEFORE_STATE,
+        "digest_last_run": DIGEST_STATE,
     })
 
 
