@@ -3960,6 +3960,20 @@ def _collect_tomorrow_events(tmr):
             seen.add((c.get("case"), "場勘"))
             events.append({"vendor": c.get("vendor") or "", "kind": "場勘", "time": "", "case": c.get("case", ""),
                            "alias": c.get("alias", ""), "extra": f"業務：{c['sales_person']}" if c.get("sales_person") else ""})
+    # 廠商還不知道的（例如案件已不在出貨進場排程裡），直接去案件表用案號查
+    missing = sorted({e["case"] for e in events if not e["vendor"] and e["case"]})
+    for i in range(0, len(missing), 20):
+        chunk = missing[i:i + 20]
+        formula = "OR(" + ",".join("{" + FIELD_CASE_NO + "}='" + c.replace("'", chr(92) + "'") + "'" for c in chunk) + ")"
+        try:
+            vm = {r["fields"].get(FIELD_CASE_NO): (r["fields"].get(FIELD_VENDOR) or "")
+                  for r in airtable_get_all(CASE_API_URL, formula, [FIELD_CASE_NO, FIELD_VENDOR])}
+        except Exception as e:
+            print(f"[_collect_tomorrow_events] 查廠商失敗：{e}", flush=True)
+            continue
+        for ev in events:
+            if not ev["vendor"] and ev["case"] in vm:
+                ev["vendor"] = vm[ev["case"]]
     return [e for e in events if (not e["vendor"]) or e["vendor"] in DIGEST_VENDORS]
 
 
