@@ -461,7 +461,7 @@ def list_vendor_slots():
         fields = [
             FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START,
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
-            FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE,
+            FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
@@ -483,6 +483,8 @@ def list_vendor_slots():
                 "type": f.get(FIELD_SLOT_TYPE) or [],
                 "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
                 "note": f.get(FIELD_SLOT_NOTE, ""),
+                "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
+                "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""),
             })
             bookings.append(item)
         else:
@@ -1027,7 +1029,8 @@ def book_vendor_slot_task(token):
     _notify_scheduler_async(
         task["creator"],
         f"✅ {task['assignee'] or body.get('registrant') or '業務'} 已完成安排\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{date} {body.get('start_time')}-{body.get('end_time')}",
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{date} {body.get('start_time')}-{body.get('end_time')}"
+        + _owner_note_lines(body.get("owner_name"), body.get("owner_phone"), body.get("note")),
     )
     return jsonify({"ok": True, "record": record})
 
@@ -1208,7 +1211,8 @@ def confirm_vendor_slot_chosen(token):
     _notify_scheduler_async(
         task["creator"],
         f"✅ {task['assignee'] or '業務'} 已確認時間，安排完成\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{chosen['date']} {chosen['start_time']}-{chosen['end_time']}",
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{chosen['date']} {chosen['start_time']}-{chosen['end_time']}"
+        + _owner_note_lines(body.get("owner_name"), body.get("owner_phone"), body.get("note")),
     )
     return jsonify({"ok": True, "record": record})
 
@@ -3710,6 +3714,115 @@ def _notify_scheduler(creator, headline):
 def _notify_scheduler_async(creator, headline):
     """在背景執行，不拖慢業務按「完成預約」的回應。"""
     threading.Thread(target=_notify_scheduler, args=(creator, headline), daemon=True).start()
+
+
+def _owner_note_lines(owner_name, owner_phone, note):
+    """通知訊息裡附上業務填的屋主資訊與備註（有填才顯示）。"""
+    out = ""
+    owner = " ".join(x for x in [(owner_name or "").strip(), (owner_phone or "").strip()] if x)
+    if owner:
+        out += f"\n屋主：{owner}"
+    if (note or "").strip():
+        out += f"\n備註：{note.strip()}"
+    return out
+
+
+FIELD_SLOT_DAY_REMINDED = "fldsDdEwnmxc68MR6"  # 已前日提醒（checkbox）
+WEEKDAY_ZH = ["一", "二", "三", "四", "五", "六", "日"]
+
+
+def _push_to_name(name, text):
+    """用名字查「業務LINE綁定」表推播；沒綁定或失敗回 False。"""
+    name = (name or "").strip()
+    if not name:
+        return False
+    try:
+        uid = _get_line_binding(name)
+    except Exception as e:
+        print(f"[_push_to_name] 查綁定失敗：{e}", flush=True)
+        return False
+    if not uid:
+        return False
+    ok, err = _line_push_text(text, to=uid)
+    if not ok:
+        print(f"[_push_to_name] 推播給 {name} 失敗：{err}", flush=True)
+    return ok
+
+
+def send_day_before_reminders():
+    """2026-10-05：行程前一天中午 12:00（排程每 10 分鐘檢查 12:00–17:50，用「已前日提醒」
+    勾選避免重複），LINE 提醒負責的業務跟安排人員：請業務跟屋主提醒明天的行程。
+    「負責的業務」＝任務的指派對象（沒有任務、PM 直接預約的，用登記人）；
+    「安排人員」＝任務的建立人。都沒綁定就轉給預設對象，不讓提醒默默消失。"""
+    token, default_target = _line_config()
+    if not token:
+        return
+    tw = timezone(timedelta(hours=8))
+    tomorrow = datetime.now(tw) + timedelta(days=1)
+    tmr = tomorrow.strftime("%Y-%m-%d")
+    try:
+        records = airtable_get_all(
+            SLOT_API_URL,
+            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',IS_SAME({{{FIELD_SLOT_DATE}}},'{tmr}','day'))",
+            [FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO,
+             FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE,
+             FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE, FIELD_SLOT_DAY_REMINDED],
+        )
+    except Exception as e:
+        print(f"[send_day_before_reminders] 讀取預約失敗：{e}", flush=True)
+        return
+    for r in records:
+        f = r["fields"]
+        if f.get(FIELD_SLOT_DAY_REMINDED):
+            continue
+        rep_name = (f.get(FIELD_SLOT_REGISTRANT) or "").strip()
+        creator = ""
+        try:
+            trs = airtable_get_all(TASK_API_URL, f"{{{FIELD_TASK_BOOKING_ID}}}='{r['id']}'",
+                                   [FIELD_TASK_ASSIGNEE, FIELD_TASK_CREATOR])
+            if trs:
+                rep_name = (trs[0]["fields"].get(FIELD_TASK_ASSIGNEE) or rep_name).strip()
+                creator = (trs[0]["fields"].get(FIELD_TASK_CREATOR) or "").strip()
+        except Exception as e:
+            print(f"[send_day_before_reminders] 查任務失敗：{e}", flush=True)
+        case_no = f.get(FIELD_SLOT_CASE_NO, "")
+        alias = f.get(FIELD_SLOT_ALIAS, "")
+        types = "、".join(f.get(FIELD_SLOT_TYPE) or [])
+        wd = WEEKDAY_ZH[tomorrow.weekday()]
+        detail = (
+            f"{case_no} {alias}".rstrip()
+            + f"\n{types}｜明天 {tmr[5:].replace('-', '/')}（週{wd}）{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"
+            + f"\n廠商：{f.get(FIELD_SLOT_VENDOR, '')}"
+            + _owner_note_lines(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE), f.get(FIELD_SLOT_NOTE))
+        )
+        rep_ok = _push_to_name(
+            rep_name,
+            "📅 明天有行程，請記得跟屋主提醒！\n" + detail + "\n\n請今天聯絡屋主，提醒明天的行程 🙏",
+        )
+        sched_ok = False
+        if creator and creator != rep_name:
+            sched_ok = _push_to_name(
+                creator,
+                "📅 明天的行程提醒" + ("（已通知業務 " + rep_name + "）" if rep_ok else "（業務 " + (rep_name or "?") + " 沒綁定 LINE，請你確認有提醒屋主）") + "\n" + detail,
+            )
+        ok = rep_ok or sched_ok
+        if not ok:
+            if not default_target:
+                continue
+            ok, err = _line_push_text(
+                "📅 明天的行程提醒（業務／安排人員都沒綁定 LINE，轉給你代為通知）\n" + detail
+            )
+            if not ok:
+                print(f"[send_day_before_reminders] {case_no} 推播失敗：{err}", flush=True)
+                continue
+        try:
+            requests.patch(f"{SLOT_API_URL}/{r['id']}", headers=airtable_headers(),
+                           json={"fields": {FIELD_SLOT_DAY_REMINDED: True}}, timeout=20)
+        except Exception as e:
+            print(f"[send_day_before_reminders] {case_no} 標記已前日提醒失敗：{e}", flush=True)
+
+
+scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*/10"))
 
 
 @app.route("/api/line/liff-config")
