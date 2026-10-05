@@ -621,26 +621,35 @@ def _sync_booking_to_case_dates(case_no, slot_type, date):
       掛表 → 預計掛表日期（APP資料「案件狀態」列）
       植筋 → 植筋日期（同上）
       場勘 → 預計場勘日（場勘 base）
-    放樣/進場等項目目前沒有對應欄位，不處理。同一筆預約有多個項目就各自寫。
-    日期直接覆蓋原有的預計日期（預約＝PM 確認過的安排）。"""
+      進場 → 「進場屋主預約」里程碑的實際日期（跟「案件進場安排」排定進場日期同一個地方）
+    放樣目前沒有對應欄位（常跟場勘/植筋同一趟，勾多選就會跟著那個項目寫），不處理。
+    同一筆預約有多個項目就各自寫。日期直接覆蓋原有的預計日期（預約＝PM 確認過的安排）。"""
     types = set(slot_type or [])
     patch = {}
     if "掛表" in types:
         patch["預計掛表日期"] = date
     if "植筋" in types:
         patch["植筋日期"] = date
-    if patch:
+    if patch or "進場" in types:
         escaped = case_no.replace("\\", "\\\\").replace("'", "\\'")
         recs = airtable_get_all(CASE_API_URL, f"{{{FIELD_CASE_NO}}}='{escaped}'", [FIELD_CASE_NO])
         if not recs:
             print(f"[_sync_booking_to_case_dates] 找不到案號 {case_no}，略過掛表/植筋日期同步", flush=True)
         else:
             case_record_id = recs[0]["id"]
-            existing = app_data_find_case_row(case_record_id)
-            if existing:
-                app_data_update(existing["id"], patch)
-            else:
-                app_data_create({"類型": "案件狀態", "案件RecordID": case_record_id, "案號": case_no, **patch})
+            if "進場" in types:
+                ms_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_ENTRY)
+                resp = requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
+                                      json={"fields": {FIELD_MS_ACTUAL_DATE: date}}, timeout=20)
+                if resp.status_code >= 400:
+                    raise Exception(resp.text)
+                threading.Thread(target=refresh_cache, daemon=True).start()
+            if patch:
+                existing = app_data_find_case_row(case_record_id)
+                if existing:
+                    app_data_update(existing["id"], patch)
+                else:
+                    app_data_create({"類型": "案件狀態", "案件RecordID": case_record_id, "案號": case_no, **patch})
             if "預計掛表日期" in patch:
                 threading.Thread(
                     target=sync_ops_case_on_meter_planned,
