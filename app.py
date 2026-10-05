@@ -3658,7 +3658,8 @@ def send_deadline_reminders():
             print(f"[send_deadline_reminders] {case_no} 標記已提醒失敗：{e}", flush=True)
 
 
-scheduler.add_job(send_deadline_reminders, CronTrigger(minute="*/5"))
+scheduler.add_job(send_deadline_reminders, CronTrigger(minute="*/5"), id="line_deadline", replace_existing=True,
+                  misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
 def _list_scheduler_names():
@@ -3839,7 +3840,8 @@ def _send_day_before_reminders_impl():
             print(f"[send_day_before_reminders] {case_no} 標記已前日提醒失敗：{e}", flush=True)
 
 
-scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*/10"))
+scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*/10"), id="line_day_before",
+                  replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
 @app.route("/api/line/run-job", methods=["POST"])
