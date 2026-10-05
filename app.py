@@ -428,6 +428,7 @@ FIELD_BIND_DISPLAY = "fld5ebY8BPab9BotD"
 FIELD_BIND_SCHEDULER = "fldP46k7RInwCYXQV"  # 安排人員（checkbox）
 LINE_BIND_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{LINE_BIND_TABLE_ID}"
 FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"  # 已提醒（checkbox）
+FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指派時填，填單頁當預設開始時間）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -756,7 +757,7 @@ def _task_fields():
         FIELD_TASK_TOKEN, FIELD_TASK_BOOKING_ID, FIELD_TASK_CREATOR, FIELD_TASK_NOTE,
         FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
-        FIELD_TASK_DEADLINE,
+        FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
     ]
 
 
@@ -805,6 +806,7 @@ def _task_to_dict(r):
         "chosen_slot": _json_or_default(f.get(FIELD_TASK_CHOSEN_SLOT), {}) or None,
         "rep_note": f.get(FIELD_TASK_REP_NOTE, ""),
         "deadline": f.get(FIELD_TASK_DEADLINE) or "",
+        "est_start": f.get(FIELD_TASK_EST_START) or "",
     }
 
 
@@ -864,6 +866,12 @@ def create_vendor_slot_task():
         deadline = _normalize_deadline(body.get("deadline"))
         if deadline:
             fields[FIELD_TASK_DEADLINE] = deadline
+        est_start = (body.get("est_start") or "").strip()
+        try:
+            _parse_hhmm(est_start)
+            fields[FIELD_TASK_EST_START] = est_start
+        except Exception:
+            pass
         owner_name = (body.get("owner_name") or "").strip()
         owner_phone = (body.get("owner_phone") or "").strip()
         if owner_name:
