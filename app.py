@@ -425,6 +425,7 @@ LINE_BIND_TABLE_ID = "tblkTLFeRSvqsVpBi"
 FIELD_BIND_NAME = "fldqJBVB9IYxnyWDR"
 FIELD_BIND_UID = "fld21MqIEDGkcJtl8"
 FIELD_BIND_DISPLAY = "fld5ebY8BPab9BotD"
+FIELD_BIND_SCHEDULER = "fldP46k7RInwCYXQV"  # 安排人員（checkbox）
 LINE_BIND_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{LINE_BIND_TABLE_ID}"
 FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"  # 已提醒（checkbox）
 TASK_STATUS_PENDING = "待業務安排"
@@ -1023,6 +1024,11 @@ def book_vendor_slot_task(token):
         # 時如果發現任務狀態沒更新，手動刪掉任務即可，不影響已經卡好的時段。
         print(f"[book_vendor_slot_task] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
 
+    _notify_scheduler_async(
+        task["creator"],
+        f"✅ {task['assignee'] or body.get('registrant') or '業務'} 已完成安排\n"
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{date} {body.get('start_time')}-{body.get('end_time')}",
+    )
     return jsonify({"ok": True, "record": record})
 
 
@@ -1103,6 +1109,12 @@ def propose_vendor_slot_alternatives(token):
         _patch_task(r["id"], fields)
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    _notify_scheduler_async(
+        task["creator"],
+        f"📝 {task['assignee'] or '業務'} 回傳了屋主可配合的其他時間（{len(slots)} 組）\n"
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}\n"
+        "請到主控台「廠商時段協調」跟廠商確認後，選一個時間。",
+    )
     return jsonify({"ok": True, "slots": slots})
 
 
@@ -1193,6 +1205,11 @@ def confirm_vendor_slot_chosen(token):
         _patch_task(r["id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
     except Exception as e:
         print(f"[confirm_vendor_slot_chosen] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+    _notify_scheduler_async(
+        task["creator"],
+        f"✅ {task['assignee'] or '業務'} 已確認時間，安排完成\n"
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{chosen['date']} {chosen['start_time']}-{chosen['end_time']}",
+    )
     return jsonify({"ok": True, "record": record})
 
 
@@ -3603,18 +3620,34 @@ def send_deadline_reminders():
                 rep_uid = _get_line_binding(f[FIELD_TASK_ASSIGNEE])
             except Exception as e:
                 print(f"[send_deadline_reminders] 查綁定失敗：{e}", flush=True)
-        if not rep_uid:
+        rep_ok = False
+        if rep_uid:
+            rep_ok, err = _line_push_text("\n".join(lines), to=rep_uid)
+            if not rep_ok:
+                print(f"[send_deadline_reminders] {case_no} 推播給業務失敗：{err}", flush=True)
+        # 同時通知「安排人員」（建立任務的人）：期限快到、還沒安排完成＋目前狀態
+        stage = f.get(FIELD_TASK_STAGE) or ""
+        stage_text = {
+            TASK_STAGE_WAIT_REP: "已選好時間，等業務按確認",
+        }.get(stage, "業務還沒安排")
+        creator = (f.get(FIELD_TASK_CREATOR) or "").strip()
+        sched_ok = False
+        if creator:
+            sched_ok = _notify_scheduler(
+                creator,
+                f"⏰ 回覆期限 {local.strftime('%H:%M')} 快到了（剩約 {max(1, round(remain_min))} 分鐘）\n"
+                f"{case_no} {alias}\n{types}｜指派：{who}\n目前狀態：{stage_text}",
+            )
+        ok = rep_ok or sched_ok
+        if not ok:
+            # 業務、安排人員都沒綁定（或推播失敗）→ 轉給預設對象，不要讓提醒默默消失
             if not target:
                 continue
-            lines.insert(0, f"（{who} 尚未綁定 LINE，轉給你代為提醒）")
-        ok, err = _line_push_text("\n".join(lines), to=rep_uid)
-        if not ok and rep_uid and target:
-            # 業務還沒加陽光機器人好友（或封鎖了）會推不出去，改轉給 PM，不要讓提醒默默消失
-            lines.insert(0, f"（{who} 的 LINE 推播失敗，可能還沒加陽光機器人好友，轉給你代為提醒）")
+            lines.insert(0, f"（{who} 尚未綁定 LINE 或推播失敗，轉給你代為提醒）")
             ok, err = _line_push_text("\n".join(lines))
-        if not ok:
-            print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
-            continue
+            if not ok:
+                print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
+                continue
         try:
             _patch_task(r["id"], {FIELD_TASK_REMINDED: True})
         except Exception as e:
@@ -3622,6 +3655,113 @@ def send_deadline_reminders():
 
 
 scheduler.add_job(send_deadline_reminders, CronTrigger(minute="*/5"))
+
+
+def _list_scheduler_names():
+    recs = airtable_get_all(LINE_BIND_API_URL, f"{{{FIELD_BIND_SCHEDULER}}}=TRUE()", [FIELD_BIND_NAME])
+    return sorted({(r["fields"].get(FIELD_BIND_NAME) or "").strip() for r in recs} - {""})
+
+
+def _scheduler_summary(creator):
+    """這位安排人員名下任務的目前狀況，附在每則通知後面。"""
+    esc = creator.replace("\\", "\\\\").replace("'", "\\'")
+    recs = airtable_get_all(TASK_API_URL, f"{{{FIELD_TASK_CREATOR}}}='{esc}'", [FIELD_TASK_STATUS, FIELD_TASK_STAGE])
+    wait_rep = wait_pm = wait_confirm = done = 0
+    for r in recs:
+        f = r["fields"]
+        if f.get(FIELD_TASK_STATUS) == TASK_STATUS_DONE:
+            done += 1
+        elif f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_PM:
+            wait_pm += 1
+        elif f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_REP:
+            wait_confirm += 1
+        else:
+            wait_rep += 1
+    return (
+        f"📊 你名下的任務：待業務安排 {wait_rep}、待你選時間 {wait_pm}、"
+        f"待業務確認 {wait_confirm}、已完成 {done}"
+    )
+
+
+def _notify_scheduler(creator, headline):
+    """推播給安排人員（用名字對應「業務LINE綁定」表）。沒綁定回 False。"""
+    creator = (creator or "").strip()
+    token, _ = _line_config()
+    if not token or not creator:
+        return False
+    try:
+        uid = _get_line_binding(creator)
+        if not uid:
+            return False
+        text = headline
+        try:
+            text += "\n\n" + _scheduler_summary(creator)
+        except Exception as e:
+            print(f"[_notify_scheduler] 組狀態摘要失敗：{e}", flush=True)
+        ok, err = _line_push_text(text, to=uid)
+        if not ok:
+            print(f"[_notify_scheduler] 推播給 {creator} 失敗：{err}", flush=True)
+        return ok
+    except Exception as e:
+        print(f"[_notify_scheduler] 例外：{e}", flush=True)
+        return False
+
+
+def _notify_scheduler_async(creator, headline):
+    """在背景執行，不拖慢業務按「完成預約」的回應。"""
+    threading.Thread(target=_notify_scheduler, args=(creator, headline), daemon=True).start()
+
+
+@app.route("/api/line/liff-config")
+def line_liff_config():
+    return jsonify({
+        "liff_id": os.environ.get("LIFF_ID", "").strip(),
+        "add_friend_url": os.environ.get("LINE_ADD_FRIEND_URL", "").strip(),
+    })
+
+
+@app.route("/api/line/schedulers")
+def line_schedulers():
+    """已綁定 LINE 的安排人員名單（只回名字），給「指派給業務」視窗的安排人員下拉用。"""
+    try:
+        return jsonify({"names": _list_scheduler_names()})
+    except Exception as e:
+        return jsonify({"error": str(e), "names": []}), 502
+
+
+@app.route("/api/line/bind-scheduler", methods=["POST"])
+def line_bind_scheduler():
+    """安排人員在 book.html?bind=scheduler 輸入自己的名字、用 LINE 登入後呼叫。
+    跟業務綁定一樣用 access token 向 LINE 驗證 userId，寫進「業務LINE綁定」表並勾「安排人員」。
+    body: {access_token, name}"""
+    body = request.get_json(force=True) or {}
+    access_token = (body.get("access_token") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not access_token or not name:
+        return jsonify({"error": "缺少名字或 LINE 登入資訊"}), 400
+    try:
+        prof = requests.get("https://api.line.me/v2/profile",
+                            headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        if prof.status_code >= 400:
+            return jsonify({"error": "LINE 驗證失敗，請重新開啟連結再試一次"}), 400
+        pj = prof.json()
+        user_id, display = pj.get("userId", ""), pj.get("displayName", "")
+        if not user_id:
+            return jsonify({"error": "LINE 驗證失敗"}), 400
+        fields = {FIELD_BIND_NAME: name, FIELD_BIND_UID: user_id, FIELD_BIND_DISPLAY: display,
+                  FIELD_BIND_SCHEDULER: True}
+        existing = _find_line_binding_record(name)
+        if existing:
+            resp = requests.patch(f"{LINE_BIND_API_URL}/{existing['id']}", headers=airtable_headers(),
+                                  json={"fields": fields}, timeout=20)
+        else:
+            resp = requests.post(LINE_BIND_API_URL, headers=airtable_headers(),
+                                 json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "display_name": display, "name": name})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/line/status")
