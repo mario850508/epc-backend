@@ -604,9 +604,62 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
         resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return None, ({"error": "Airtable 寫入失敗", "detail": resp.text}, 502)
-        return resp.json(), None
+        record = resp.json()
     except Exception as e:
         return None, ({"error": str(e)}, 502)
+    # 預約成功後，把日期同步寫進對應的「預計日期」欄位（失敗不影響預約本身）
+    try:
+        _sync_booking_to_case_dates(case_no, slot_type, date)
+    except Exception as e:
+        print(f"[_book_vendor_slot] 同步預計日期失敗（不影響預約）：{e}", flush=True)
+    return record, None
+
+
+def _sync_booking_to_case_dates(case_no, slot_type, date):
+    """2026-10-05：時段預約完成後，自動把預約日期寫進主控台原本的「預計日期」欄位，
+    PM 不用再手動多一步：
+      掛表 → 預計掛表日期（APP資料「案件狀態」列）
+      植筋 → 植筋日期（同上）
+      場勘 → 預計場勘日（場勘 base）
+    放樣/進場等項目目前沒有對應欄位，不處理。同一筆預約有多個項目就各自寫。
+    日期直接覆蓋原有的預計日期（預約＝PM 確認過的安排）。"""
+    types = set(slot_type or [])
+    patch = {}
+    if "掛表" in types:
+        patch["預計掛表日期"] = date
+    if "植筋" in types:
+        patch["植筋日期"] = date
+    if patch:
+        escaped = case_no.replace("\\", "\\\\").replace("'", "\\'")
+        recs = airtable_get_all(CASE_API_URL, f"{{{FIELD_CASE_NO}}}='{escaped}'", [FIELD_CASE_NO])
+        if not recs:
+            print(f"[_sync_booking_to_case_dates] 找不到案號 {case_no}，略過掛表/植筋日期同步", flush=True)
+        else:
+            case_record_id = recs[0]["id"]
+            existing = app_data_find_case_row(case_record_id)
+            if existing:
+                app_data_update(existing["id"], patch)
+            else:
+                app_data_create({"類型": "案件狀態", "案件RecordID": case_record_id, "案號": case_no, **patch})
+            if "預計掛表日期" in patch:
+                threading.Thread(
+                    target=sync_ops_case_on_meter_planned,
+                    args=(case_record_id, case_no, date),
+                    daemon=True,
+                ).start()
+    if "場勘" in types:
+        escaped = case_no.replace("\\", "\\\\").replace("'", "\\'")
+        recs = airtable_get_all(SURVEY_API_URL, f"{{{SURVEY_FIELD_CASE_NO}}}='{escaped}'", [SURVEY_FIELD_CASE_NO])
+        if recs:
+            rid = recs[0]["id"]
+            resp = requests.patch(f"{SURVEY_API_URL}/{rid}", headers=airtable_headers(),
+                                  json={"fields": {SURVEY_FIELD_PLANNED_DATE: date}}, timeout=20)
+            if resp.status_code >= 400:
+                raise Exception(resp.text)
+            for c in SURVEY_CACHE["cases"]:
+                if c["record_id"] == rid:
+                    c["planned_date"] = date
+                    break
 
 
 @app.route("/api/vendor-slots/bookings", methods=["POST"])
