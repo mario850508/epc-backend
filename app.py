@@ -674,6 +674,52 @@ def _sync_booking_to_case_dates(case_no, slot_type, date):
                     break
 
 
+@app.route("/api/vendor-slots/<record_id>/detail")
+def vendor_slot_booking_detail(record_id):
+    """2026-10-05：主控台「查看填單」用——回傳業務當時送出的預約內容（時間、屋主資訊、備註、
+    登記人、填單時間），並且如果這筆預約是從「指派給業務」任務來的，一併帶出任務資訊
+    （指派對象、安排人員、回覆期限、屋主預設資料＝公證書資訊、業務曾經回傳的其他時間）。"""
+    try:
+        resp = requests.get(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(),
+                            params={"returnFieldsByFieldId": "true"}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "找不到這筆預約"}), 404
+        rec = resp.json()
+        f = rec.get("fields", {})
+        out = {
+            "booking": {
+                "record_id": rec["id"],
+                "created_at": rec.get("createdTime"),
+                "vendor": f.get(FIELD_SLOT_VENDOR),
+                "date": f.get(FIELD_SLOT_DATE),
+                "start_time": f.get(FIELD_SLOT_START),
+                "end_time": f.get(FIELD_SLOT_END),
+                "case": f.get(FIELD_SLOT_CASE_NO, ""),
+                "alias": f.get(FIELD_SLOT_ALIAS, ""),
+                "type": f.get(FIELD_SLOT_TYPE) or [],
+                "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
+                "note": f.get(FIELD_SLOT_NOTE, ""),
+                "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
+                "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""),
+            },
+            "task": None,
+        }
+        escaped = rec["id"].replace("'", "\\'")
+        trs = airtable_get_all(TASK_API_URL, f"{{{FIELD_TASK_BOOKING_ID}}}='{escaped}'", _task_fields())
+        if trs:
+            t = _task_to_dict(trs[0])
+            out["task"] = {
+                "assignee": t["assignee"], "creator": t["creator"], "deadline": t["deadline"],
+                "candidate_dates": t["candidate_dates"], "duration_min": t["duration_min"],
+                "owner_name": t["owner_name"], "owner_phone": t["owner_phone"],
+                "alt_slots": t["alt_slots"], "rep_note": t["rep_note"], "note": t["note"],
+                "created_at": trs[0].get("createdTime"),
+            }
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/api/vendor-slots/bookings", methods=["POST"])
 def create_vendor_slot_booking():
     """預約時段：寫入前先查同廠商、同日期的既有「已預約」記錄，時間重疊就擋下來
