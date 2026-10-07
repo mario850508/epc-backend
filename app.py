@@ -429,6 +429,10 @@ FIELD_BIND_SCHEDULER = "fldP46k7RInwCYXQV"  # 安排人員（checkbox）
 LINE_BIND_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{LINE_BIND_TABLE_ID}"
 FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"  # 已提醒（checkbox）
 FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指派時填，填單頁當預設開始時間）
+# 2026-10-07：屋主版預約連結（測試版）。跟業務版 token 分開，屋主版只回去識別化的資料。
+FIELD_TASK_OWNER_TOKEN = "fldEAVpfdwAot2wmx"      # 屋主Token
+FIELD_TASK_OWNER_WIN_START = "fldcshgkAyg8iA1mV"  # 屋主可選時段開始 HH:MM（預設 09:00）
+FIELD_TASK_OWNER_WIN_END = "fldZM3kKE3GWpyvvK"    # 屋主可選時段結束 HH:MM（預設 17:00，作業要在這之前結束）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -758,6 +762,7 @@ def _task_fields():
         FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
+        FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END,
     ]
 
 
@@ -807,6 +812,9 @@ def _task_to_dict(r):
         "rep_note": f.get(FIELD_TASK_REP_NOTE, ""),
         "deadline": f.get(FIELD_TASK_DEADLINE) or "",
         "est_start": f.get(FIELD_TASK_EST_START) or "",
+        "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
+        "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
+        "owner_win_end": f.get(FIELD_TASK_OWNER_WIN_END) or "",
     }
 
 
@@ -847,6 +855,7 @@ def create_vendor_slot_task():
     except (TypeError, ValueError):
         duration_min = None
     token = secrets.token_urlsafe(16)
+    owner_token = secrets.token_urlsafe(16)
     try:
         fields = {
             FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(slot_type)} 待業務安排",
@@ -860,6 +869,9 @@ def create_vendor_slot_task():
             FIELD_TASK_TOKEN: token,
             FIELD_TASK_CREATOR: (body.get("creator") or "").strip(),
             FIELD_TASK_NOTE: (body.get("note") or "").strip(),
+            FIELD_TASK_OWNER_TOKEN: owner_token,
+            FIELD_TASK_OWNER_WIN_START: _valid_hhmm(body.get("owner_win_start"), "09:00"),
+            FIELD_TASK_OWNER_WIN_END: _valid_hhmm(body.get("owner_win_end"), "17:00"),
         }
         if duration_min is not None:
             fields[FIELD_TASK_DURATION_MIN] = duration_min
@@ -881,7 +893,8 @@ def create_vendor_slot_task():
         resp = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
-        return jsonify({"ok": True, "token": token, "path": f"/book.html?token={token}"})
+        return jsonify({"ok": True, "token": token, "path": f"/book.html?token={token}",
+                        "record_id": resp.json().get("id"), "owner_path": f"/owner.html?t={owner_token}"})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -1283,6 +1296,309 @@ def confirm_vendor_slot_chosen(token):
               button=("開啟主控台", _dash_url() + "/")),
     )
     return jsonify({"ok": True, "record": record})
+
+
+# ===================================================================
+# 2026-10-07：屋主版預約（測試版）。業務把屋主版連結（owner.html?t=屋主Token）轉給屋主，
+# 屋主自己選時間。跟業務版的差別：
+#   - 只回去識別化資料：不給案號、別名、廠商名稱、地址、屋主預設姓名電話、回覆期限。
+#   - 施工項目用白話（現場勘查／施工團隊進場安裝…）。
+#   - 只能在 PM 設定的「屋主可選時段」內、每 30 分鐘選開始時間；結束時間由後端依作業時長算，屋主不能改。
+#   - 屋主送出（預約／提供其他時間／確認）後，用 LINE 卡片同時通知業務跟安排人員。
+# 業務版連結照常可用，誰先完成預約就算數。
+# ===================================================================
+OWNER_TYPE_LABELS = {
+    "場勘": "現場勘查", "放樣": "施工前現場放樣（定位）", "植筋": "植筋（支架基座施工）",
+    "進場": "施工團隊進場安裝", "掛表": "台電人員裝設電表（掛表）",
+}
+OWNER_TYPE_DEFAULT_MIN = {"掛表": 180, "植筋": 180, "放樣": 60, "場勘": 60, "進場": 240}
+
+
+def _valid_hhmm(raw, default):
+    v = (raw or "").strip() if isinstance(raw, str) else ""
+    try:
+        m = _parse_hhmm(v)
+        return f"{m // 60:02d}:{m % 60:02d}"
+    except Exception:
+        return default
+
+
+def _owner_find_task(otoken):
+    otoken = (otoken or "").strip()
+    if len(otoken) < 10:
+        return None
+    esc = otoken.replace("'", chr(92) + "'")
+    recs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_OWNER_TOKEN + "}='" + esc + "'", _task_fields())
+    return recs[0] if recs else None
+
+
+def _owner_duration(task):
+    return task.get("duration_min") or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in task.get("type") or []) or 60
+
+
+def _owner_window(task):
+    return _valid_hhmm(task.get("owner_win_start"), "09:00"), _valid_hhmm(task.get("owner_win_end"), "17:00")
+
+
+def _vendor_busy_slots(vendor):
+    if not vendor:
+        return []
+    esc = vendor.replace("'", chr(92) + "'")
+    formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',"
+               f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
+    out = []
+    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END]):
+        bf = br["fields"]
+        if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
+            out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END]})
+    return out
+
+
+def _owner_slot_from_start(task, date, start):
+    """依屋主選的日期＋開始時間算出完整時段，並檢查是否落在可選時段內。回 (slot, 錯誤訊息)。"""
+    try:
+        datetime.strptime(date or "", "%Y-%m-%d")
+        st = _parse_hhmm(start or "")
+    except Exception:
+        return None, "日期或時間格式不正確"
+    ws, we = _owner_window(task)
+    et = st + _owner_duration(task)
+    if st < _parse_hhmm(ws) or et > _parse_hhmm(we):
+        return None, f"請選 {ws}–{we} 之間的時間"
+    return {"date": date, "start_time": f"{st // 60:02d}:{st % 60:02d}", "end_time": f"{et // 60:02d}:{et % 60:02d}"}, None
+
+
+def _owner_contact(body):
+    name = (body.get("owner_name") or "").strip()[:30]
+    phone = (body.get("owner_phone") or "").strip()[:30]
+    if not name or sum(c.isdigit() for c in phone) < 8:
+        return None, None, "請填寫您的姓名和聯絡電話"
+    return name, phone, None
+
+
+def _notify_owner_action(task, tag_scheduler, tag_rep, color, rows, note_rep=""):
+    """屋主有動作時，通知安排人員（附任務狀態）和業務。"""
+    title = f"{task['case']} {task['alias']}".strip()
+    _notify_scheduler_async(task["creator"], _card(tag_scheduler, color, title, rows=rows,
+                                                   button=("開啟主控台", _dash_url() + "/")))
+    if task.get("assignee") and task["assignee"] != task.get("creator"):
+        threading.Thread(target=_push_to_name, daemon=True, args=(
+            task["assignee"], _card(tag_rep, color, title, rows=rows, note=note_rep))).start()
+
+
+@app.route("/api/owner-booking/<otoken>")
+def owner_booking_get(otoken):
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，可能已經失效，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    ws, we = _owner_window(task)
+    stage = task["stage"]
+    if task["status"] == TASK_STATUS_DONE:
+        status = "done"
+    elif stage == TASK_STAGE_WAIT_PM:
+        status = "wait_pm"
+    elif stage == TASK_STAGE_WAIT_REP and task["chosen_slot"]:
+        status = "wait_confirm"
+    else:
+        status = "open"
+    out = {
+        "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
+        "candidate_dates": task["candidate_dates"],
+        "duration_min": _owner_duration(task),
+        "window_start": ws, "window_end": we,
+        "rep_name": task["assignee"],
+        "status": status,
+        "chosen_slot": task["chosen_slot"] if status == "wait_confirm" else None,
+        "proposed": task["alt_slots"] if status == "wait_pm" else [],
+        "busy_slots": [],
+        "booked": None,
+    }
+    if status == "done" and task["booking_id"]:
+        try:
+            resp = requests.get(f"{SLOT_API_URL}/{task['booking_id']}", headers=airtable_headers(),
+                                params={"returnFieldsByFieldId": "true"}, timeout=15)
+            if resp.status_code < 400:
+                bf = resp.json().get("fields", {})
+                out["booked"] = {"date": bf.get(FIELD_SLOT_DATE), "start_time": bf.get(FIELD_SLOT_START),
+                                 "end_time": bf.get(FIELD_SLOT_END)}
+        except Exception:
+            pass
+    elif status != "done":
+        try:
+            out["busy_slots"] = _vendor_busy_slots(task["vendor"])
+        except Exception as e:
+            print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
+    return jsonify(out)
+
+
+@app.route("/api/owner-booking/<otoken>/book", methods=["POST"])
+def owner_booking_book(otoken):
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
+    body = request.get_json(force=True) or {}
+    date = (body.get("date") or "").strip()
+    if date not in task["candidate_dates"]:
+        return jsonify({"error": "請從頁面上的日期裡選一天"}), 400
+    slot, err_msg = _owner_slot_from_start(task, date, body.get("start_time"))
+    if err_msg:
+        return jsonify({"error": err_msg}), 400
+    name, phone, err_msg = _owner_contact(body)
+    if err_msg:
+        return jsonify({"error": err_msg}), 400
+    note = (body.get("note") or "").strip()[:300]
+    record, err = _book_vendor_slot(
+        task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
+        f"屋主 {name}", note, owner_name=name, owner_phone=phone,
+    )
+    if err:
+        err_body, status = err
+        if status == 409:
+            return jsonify({"error": "這個時間剛好被別人預約了，請換一個時間"}), 409
+        return jsonify(err_body), status
+    try:
+        _patch_task(r["id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
+    except Exception as e:
+        print(f"[owner_booking_book] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+    _notify_owner_action(
+        task, "🏠 屋主已自行預約｜給安排人員", "🏠 屋主已自行預約｜給業務", "#16A34A",
+        [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+         ("時間", f"{_wd_label(date)} {slot['start_time']}-{slot['end_time']}"),
+         ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+        note_rep="屋主已經自己選好時間，前一天請記得再跟屋主確認",
+    )
+    return jsonify({"ok": True, "booked": slot})
+
+
+@app.route("/api/owner-booking/<otoken>/propose", methods=["POST"])
+def owner_booking_propose(otoken):
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
+    body = request.get_json(force=True) or {}
+    name, phone, err_msg = _owner_contact(body)
+    if err_msg:
+        return jsonify({"error": err_msg}), 400
+    slots, seen = [], set()
+    for sl in (body.get("slots") or [])[:10]:
+        if not isinstance(sl, dict):
+            continue
+        slot, err_msg = _owner_slot_from_start(task, (sl.get("date") or "").strip(), sl.get("start_time"))
+        if err_msg:
+            return jsonify({"error": err_msg}), 400
+        key = (slot["date"], slot["start_time"])
+        if key not in seen:
+            seen.add(key)
+            slots.append(slot)
+    if not slots:
+        return jsonify({"error": "請至少填一組您方便的日期和時間"}), 400
+    note = (body.get("note") or "").strip()[:300]
+    try:
+        _patch_task(r["id"], {
+            FIELD_TASK_STAGE: TASK_STAGE_WAIT_PM,
+            FIELD_TASK_ALT_SLOTS: json.dumps(slots, ensure_ascii=False),
+            FIELD_TASK_CHOSEN_SLOT: "",
+            FIELD_TASK_REP_NOTE: f"（屋主 {name} {phone}）{note}".strip(),
+        })
+    except Exception as e:
+        return jsonify({"error": "送出失敗，請稍後再試", "detail": str(e)}), 502
+    slot_lines = "\n".join(f"{i + 1}. {_wd_label(sl['date'])} {sl['start_time']}-{sl['end_time']}" for i, sl in enumerate(slots))
+    _notify_owner_action(
+        task, "🏠 屋主提供其他時間｜給安排人員", "🏠 屋主提供其他時間｜給業務", "#D97706",
+        [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+         (f"屋主方便的時間（{len(slots)} 組）", slot_lines), ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+        note_rep="窗口跟廠商確認後會選一個時間，屋主可以在同一個連結按確認",
+    )
+    return jsonify({"ok": True, "slots": slots})
+
+
+@app.route("/api/owner-booking/<otoken>/confirm", methods=["POST"])
+def owner_booking_confirm(otoken):
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個預約已經完成了"}), 409
+    chosen = task["chosen_slot"]
+    if task["stage"] != TASK_STAGE_WAIT_REP or not chosen:
+        return jsonify({"error": "目前還沒有需要確認的時間"}), 409
+    body = request.get_json(force=True) or {}
+    name, phone, err_msg = _owner_contact(body)
+    if err_msg:
+        return jsonify({"error": err_msg}), 400
+    note = (body.get("note") or "").strip()[:300]
+    record, err = _book_vendor_slot(
+        task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
+        task["type"], f"屋主 {name}", note, owner_name=name, owner_phone=phone,
+    )
+    if err:
+        err_body, status = err
+        if status == 409:
+            return jsonify({"error": "這個時間剛好被別人預約了，請聯絡您的業務重新安排"}), 409
+        return jsonify(err_body), status
+    try:
+        _patch_task(r["id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
+    except Exception as e:
+        print(f"[owner_booking_confirm] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+    _notify_owner_action(
+        task, "🏠 屋主已確認時間｜給安排人員", "🏠 屋主已確認時間｜給業務", "#16A34A",
+        [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+         ("時間", f"{_wd_label(chosen['date'])} {chosen['start_time']}-{chosen['end_time']}"),
+         ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+        note_rep="屋主已確認時間，前一天請記得再跟屋主確認",
+    )
+    return jsonify({"ok": True, "booked": chosen})
+
+
+@app.route("/api/vendor-slots/tasks/<record_id>/owner-link", methods=["POST"])
+def vendor_slot_task_owner_link(record_id):
+    """主控台「複製屋主版訊息」用：取得（沒有就產生）屋主版連結，回傳組訊息需要的資料。
+    舊任務沒有屋主 token／可選時段，第一次按的時候補上（預設 09:00–17:00）。"""
+    rec = _get_task_by_record_id(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    patch = {}
+    if not task["owner_token"]:
+        task["owner_token"] = secrets.token_urlsafe(16)
+        patch[FIELD_TASK_OWNER_TOKEN] = task["owner_token"]
+    if not task["owner_win_start"] or not task["owner_win_end"]:
+        ws, we = _owner_window(task)
+        patch[FIELD_TASK_OWNER_WIN_START] = ws
+        patch[FIELD_TASK_OWNER_WIN_END] = we
+        task["owner_win_start"], task["owner_win_end"] = ws, we
+    if patch:
+        try:
+            _patch_task(record_id, patch)
+        except Exception as e:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    ws, we = _owner_window(task)
+    return jsonify({
+        "ok": True, "owner_path": f"/owner.html?t={task['owner_token']}",
+        "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
+        "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
+        "window_start": ws, "window_end": we, "assignee": task["assignee"], "status": task["status"],
+    })
 
 
 @app.route("/api/site-survey-cancelled-sync", methods=["POST"])
