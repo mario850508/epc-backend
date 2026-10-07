@@ -4715,6 +4715,37 @@ def procurement_equipment_inventory():
     return jsonify({"cases": rows})
 
 
+# ---- 資料夾檔案預覽（2026-10-07）----
+# 懸浮視窗點檔名預覽：07 資料夾的檔案由使用者電腦的 folder_preview.py 同步到「採購-資料夾預覽」
+# （一個資料夾一筆、檔案放附件欄）。Airtable 附件網址約 2 小時過期，所以快取只放 60 秒。
+FOLDER_PREVIEW_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tblncHNB3oJZLXNR9"
+FP_FIELD_PATH = "fldrmeBh8FbnteKh7"
+FP_FIELD_FILES = "fld5yzzqe9nEgENME"
+FP_FIELD_SKIPPED = "fldUELTpnTeUxehP8"
+_FOLDER_PREVIEW_CACHE = {"at": 0, "by_path": {}}
+
+
+@app.route("/api/procurement/folder-files")
+def procurement_folder_files():
+    path = (request.args.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "缺少 path"}), 400
+    if time.time() - _FOLDER_PREVIEW_CACHE["at"] > 60:
+        try:
+            records = airtable_get_all(FOLDER_PREVIEW_API_URL, None, [FP_FIELD_PATH, FP_FIELD_FILES, FP_FIELD_SKIPPED])
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        _FOLDER_PREVIEW_CACHE["by_path"] = {r.get("fields", {}).get(FP_FIELD_PATH, ""): r.get("fields", {}) for r in records}
+        _FOLDER_PREVIEW_CACHE["at"] = time.time()
+    f = _FOLDER_PREVIEW_CACHE["by_path"].get(path)
+    if f is None:
+        return jsonify({"files": [], "skipped": [], "synced": False})
+    files = [{"name": a.get("filename", ""), "url": a.get("url", ""), "type": a.get("type", "")}
+             for a in f.get(FP_FIELD_FILES, [])]
+    skipped = [x for x in (f.get(FP_FIELD_SKIPPED) or "").split("\n") if x]
+    return jsonify({"files": files, "skipped": skipped, "synced": True})
+
+
 @app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
 def procurement_inverter_cert_rename(record_id):
     """送出改名請求（寫入「改名為」），本機 cert_agent.py 一分鐘內套用到 G 槽。"""
