@@ -3914,6 +3914,31 @@ scheduler.add_job(send_day_before_reminders, CronTrigger(hour="12-17", minute="*
 DIGEST_VENDORS = [v.strip() for v in os.environ.get("LINE_DIGEST_VENDORS", "三創,尚展,曙光").split(",") if v.strip()]
 DIGEST_STATE = {}
 
+# 「系統狀態」小型鍵值表：記錄隔天總覽最後一次發送的日期。不能只放在記憶體——Render 服務
+# 閒置重啟後記憶體就清空，會讓同一天的總覽每小時重發一次（2026-10-07 發生過）。
+STATE_TABLE_ID = "tblVreMXHonXqiLQ5"
+STATE_FIELD_KEY = "fldrHYI14wJILHojA"
+STATE_FIELD_VALUE = "fldFPRxqylDFdtWNg"
+STATE_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{STATE_TABLE_ID}"
+
+
+def _state_get(key):
+    esc = key.replace("'", chr(92) + "'")
+    recs = airtable_get_all(STATE_API_URL, "{" + STATE_FIELD_KEY + "}='" + esc + "'", [STATE_FIELD_KEY, STATE_FIELD_VALUE])
+    return (recs[0]["fields"].get(STATE_FIELD_VALUE) or "") if recs else ""
+
+
+def _state_set(key, value):
+    esc = key.replace("'", chr(92) + "'")
+    recs = airtable_get_all(STATE_API_URL, "{" + STATE_FIELD_KEY + "}='" + esc + "'", [STATE_FIELD_KEY])
+    fields = {STATE_FIELD_KEY: key, STATE_FIELD_VALUE: value}
+    if recs:
+        resp = requests.patch(f"{STATE_API_URL}/{recs[0]['id']}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    else:
+        resp = requests.post(STATE_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
+
 
 def _collect_tomorrow_events(tmr):
     events, seen = [], set()   # seen：(案號, 項目) 避免「時段預約」跟「預計日期欄位」重複列
@@ -3992,8 +4017,18 @@ def send_tomorrow_digest(force=False):
     tw = timezone(timedelta(hours=8))
     tomorrow = datetime.now(tw) + timedelta(days=1)
     tmr = tomorrow.strftime("%Y-%m-%d")
-    if not force and DIGEST_STATE.get("sent_for") == tmr:
-        return
+    if not force:
+        if DIGEST_STATE.get("sent_for") == tmr:
+            return
+        try:
+            if _state_get("digest_sent_for") == tmr:
+                DIGEST_STATE["sent_for"] = tmr
+                return
+        except Exception as e:
+            # 讀不到「發過沒」就寧可不發，避免重複轟炸；下一輪（10 分鐘後）會再試
+            DIGEST_STATE["error"] = f"讀取發送紀錄失敗：{e}"
+            print(f"[send_tomorrow_digest] 讀取發送紀錄失敗，本輪不發：{e}", flush=True)
+            return
     DIGEST_STATE.update({"at": datetime.now().isoformat(), "for": tmr, "count": None, "error": None})
     try:
         events = _collect_tomorrow_events(tmr)
@@ -4019,6 +4054,11 @@ def send_tomorrow_digest(force=False):
     ok, err = _line_push_text(text)
     if ok:
         DIGEST_STATE["sent_for"] = tmr
+        try:
+            _state_set("digest_sent_for", tmr)
+        except Exception as e:
+            print(f"[send_tomorrow_digest] 寫入發送紀錄失敗（可能造成重發）：{e}", flush=True)
+            DIGEST_STATE["error"] = f"寫入發送紀錄失敗：{e}"
     else:
         DIGEST_STATE["error"] = err
         print(f"[send_tomorrow_digest] 推播失敗：{err}", flush=True)
