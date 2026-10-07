@@ -4629,6 +4629,12 @@ CERT_FIELD_SHIP_DATE = "fldLuclXuC9N2YHf5"     # 出廠日期
 CERT_FIELD_FILED_AT = "fldg52kpcleAmN2VH"      # 歸檔時間
 CERT_FIELD_VENDOR = "flde14fVfgIONZ41p"        # 廠商（變流器廠，目前只有碩天）
 CERT_FIELD_ABBR_OK = "fldn3CSuGgMjfOyNl"       # 簡稱已確認
+# 以下 4 欄由本機 cert_agent.py（每分鐘）維護：主控台只寫「改名為」，實際改名在
+# 使用者電腦的 G 槽執行，成功後清空「改名為」、更新「歸檔檔名」並寫「改名結果」。
+CERT_FIELD_FILE = "fldqHpiW4nxDPOKOe"          # 檔案（PDF 附件，懸浮視窗預覽用）
+CERT_FIELD_LISTING = "fldPzyenX1YJnwyqN"       # 資料夾檔案（放置資料夾目前的檔案清單，一行一個）
+CERT_FIELD_RENAME_TO = "fldyc3EBmDTH0zWi8"     # 改名為（待處理的改名請求）
+CERT_FIELD_RENAME_RESULT = "fldchBvCfrWH9ieFO" # 改名結果
 
 
 @app.route("/api/procurement/inverter-certs")
@@ -4638,6 +4644,7 @@ def procurement_inverter_certs():
             CERT_FIELD_SRC_NAME, CERT_FIELD_CASE_NO, CERT_FIELD_FILED_NAME, CERT_FIELD_PATH,
             CERT_FIELD_STATUS, CERT_FIELD_ABBR_GUESSED, CERT_FIELD_SHIP_DATE,
             CERT_FIELD_FILED_AT, CERT_FIELD_VENDOR, CERT_FIELD_ABBR_OK,
+            CERT_FIELD_FILE, CERT_FIELD_LISTING, CERT_FIELD_RENAME_TO, CERT_FIELD_RENAME_RESULT,
         ])
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -4656,9 +4663,35 @@ def procurement_inverter_certs():
             "ship_date": f.get(CERT_FIELD_SHIP_DATE, ""),
             "filed_at": f.get(CERT_FIELD_FILED_AT, ""),
             "vendor": f.get(CERT_FIELD_VENDOR, ""),
+            "file_url": (f.get(CERT_FIELD_FILE) or [{}])[0].get("url", ""),
+            "folder_files": [x for x in (f.get(CERT_FIELD_LISTING) or "").split("\n") if x],
+            "rename_to": f.get(CERT_FIELD_RENAME_TO, ""),
+            "rename_result": f.get(CERT_FIELD_RENAME_RESULT, ""),
         })
     rows.sort(key=lambda x: x["filed_at"] or "", reverse=True)
     return jsonify({"certs": rows})
+
+
+@app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
+def procurement_inverter_cert_rename(record_id):
+    """送出改名請求（寫入「改名為」），本機 cert_agent.py 一分鐘內套用到 G 槽。"""
+    body = request.get_json(force=True) or {}
+    new_name = (body.get("new_name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "請輸入新檔名"}), 400
+    if any(c in new_name for c in '\\/:*?"<>|'):
+        return jsonify({"error": '檔名不能含 \\ / : * ? " < > |'}), 400
+    if not new_name.lower().endswith(".pdf"):
+        new_name += ".pdf"
+    resp = requests.patch(
+        f"{CERT_API_URL}/{record_id}",
+        headers=airtable_headers(),
+        json={"fields": {CERT_FIELD_RENAME_TO: new_name, CERT_FIELD_RENAME_RESULT: "⏳ 等待本機套用改名…"}},
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True, "new_name": new_name})
 
 
 @app.route("/api/procurement/inverter-certs/<record_id>/abbr-ok", methods=["POST"])
