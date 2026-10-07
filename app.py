@@ -4679,6 +4679,42 @@ def procurement_inverter_certs():
     return jsonify({"certs": rows})
 
 
+# ---- 設備資料盤點（2026-10-07）----
+# 已進場／已掛表但尚未取得設備登記的潤特／工程案件，07 資料夾是否備齊 5 項設備文件。
+# 由使用者電腦上的 cert_agent.py 每小時呼叫 equipment_inventory.sync() 覆寫（本後端看不到 G 槽）。
+INV_TABLE_ID = "tbl4Cw68D1gx8BJ9a"
+INV_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INV_TABLE_ID}"
+INV_FIELDS = {
+    "case_no": "fldX4rFo0Mb6eoojj", "alias": "fldq2K6GCBvtPyVZj", "vendor": "fldFXTdNJ93TNM4Bv",
+    "stage": "fld9z57gYbUIATIUp", "meter_date": "fldaAWEpbUrEUhcQB",
+    "module_cert": "fldbpPDC1TeYblecn", "module_serial": "fldVN11gCbdaFtM7U", "module_invoice": "fldFJTdnmctnYmNWI",
+    "inverter_cert": "fld09sMcyzVOp3Sb3", "inverter_invoice": "fldFf0omtjK60gRQr",
+    "missing": "fldnNG8uIsTXlXjAE", "path": "fldbBn2h0FMaBYbW9", "files": "fldoQigIFPHRmyNsf",
+    "updated_at": "fldawjwCFSu5vW8g3",
+}
+INV_CHECKS = ["module_cert", "module_serial", "module_invoice", "inverter_cert", "inverter_invoice"]
+
+
+@app.route("/api/procurement/equipment-inventory")
+def procurement_equipment_inventory():
+    try:
+        records = airtable_get_all(INV_API_URL, None, list(INV_FIELDS.values()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    rows = []
+    for r in records:
+        f = r.get("fields", {})
+        row = {k: f.get(fid) for k, fid in INV_FIELDS.items()}
+        for k in INV_CHECKS:
+            row[k] = bool(row[k])
+        row["missing"] = row["missing"] or 0
+        row["files"] = [x for x in (row["files"] or "").split("\n") if x]
+        row["id"] = r["id"]
+        rows.append(row)
+    rows.sort(key=lambda x: (-x["missing"], x["case_no"] or ""))
+    return jsonify({"cases": rows})
+
+
 @app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
 def procurement_inverter_cert_rename(record_id):
     """送出改名請求（寫入「改名為」），本機 cert_agent.py 一分鐘內套用到 G 槽。"""
