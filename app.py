@@ -4610,6 +4610,71 @@ def generate_ops_pdf(record_id):
     return jsonify({"ok": True, "pdf_url": pdf_url})
 
 
+# ===================================================================
+# 採購專區：變流器出廠證明歸檔紀錄（2026-10-07）
+# ===================================================================
+# 資料由使用者電腦上的 Claude 每日排程（cps-inverter-cert-sync）寫入：
+# 每天 09:00 從碩天 CPSDrive 下載新的出廠暨保固證明書，歸檔到 G 槽案件
+# 「07 設備保固及出廠證明」，再把結果寫進這張表。本後端只負責讀取，以及讓
+# 使用者在主控台勾選「簡稱已確認」（推定的簡稱，例如 桃81，需人工確認一次）。
+CERT_TABLE_ID = "tblNy1ls9aFLVMxHh"
+CERT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{CERT_TABLE_ID}"
+CERT_FIELD_SRC_NAME = "fldA1EYvZ95wAGH1e"      # 原檔名（primary field）
+CERT_FIELD_CASE_NO = "fld7suIlvN4YfwwE8"       # 案號（非案件為空）
+CERT_FIELD_FILED_NAME = "fldwmZUgwyjE7DhL6"    # 歸檔檔名
+CERT_FIELD_PATH = "fldHxASfgq18rbHyi"          # 放置路徑（G 槽資料夾）
+CERT_FIELD_STATUS = "fldormzJT0aa8BWJs"        # 狀態：已歸檔／未歸檔／已存在
+CERT_FIELD_ABBR_GUESSED = "fldzguJVqi14cBORj"  # 簡稱推定
+CERT_FIELD_SHIP_DATE = "fldLuclXuC9N2YHf5"     # 出廠日期
+CERT_FIELD_FILED_AT = "fldg52kpcleAmN2VH"      # 歸檔時間
+CERT_FIELD_VENDOR = "flde14fVfgIONZ41p"        # 廠商（變流器廠，目前只有碩天）
+CERT_FIELD_ABBR_OK = "fldn3CSuGgMjfOyNl"       # 簡稱已確認
+
+
+@app.route("/api/procurement/inverter-certs")
+def procurement_inverter_certs():
+    try:
+        records = airtable_get_all(CERT_API_URL, None, [
+            CERT_FIELD_SRC_NAME, CERT_FIELD_CASE_NO, CERT_FIELD_FILED_NAME, CERT_FIELD_PATH,
+            CERT_FIELD_STATUS, CERT_FIELD_ABBR_GUESSED, CERT_FIELD_SHIP_DATE,
+            CERT_FIELD_FILED_AT, CERT_FIELD_VENDOR, CERT_FIELD_ABBR_OK,
+        ])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    rows = []
+    for r in records:
+        f = r.get("fields", {})
+        rows.append({
+            "id": r["id"],
+            "src_name": f.get(CERT_FIELD_SRC_NAME, ""),
+            "case_no": f.get(CERT_FIELD_CASE_NO, ""),
+            "filed_name": f.get(CERT_FIELD_FILED_NAME, ""),
+            "path": f.get(CERT_FIELD_PATH, ""),
+            "status": f.get(CERT_FIELD_STATUS, ""),
+            "abbr_guessed": bool(f.get(CERT_FIELD_ABBR_GUESSED)),
+            "abbr_ok": bool(f.get(CERT_FIELD_ABBR_OK)),
+            "ship_date": f.get(CERT_FIELD_SHIP_DATE, ""),
+            "filed_at": f.get(CERT_FIELD_FILED_AT, ""),
+            "vendor": f.get(CERT_FIELD_VENDOR, ""),
+        })
+    rows.sort(key=lambda x: x["filed_at"] or "", reverse=True)
+    return jsonify({"certs": rows})
+
+
+@app.route("/api/procurement/inverter-certs/<record_id>/abbr-ok", methods=["POST"])
+def procurement_inverter_cert_abbr_ok(record_id):
+    body = request.get_json(force=True) or {}
+    resp = requests.patch(
+        f"{CERT_API_URL}/{record_id}",
+        headers=airtable_headers(),
+        json={"fields": {CERT_FIELD_ABBR_OK: bool(body.get("ok", True))}},
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True})
+
+
 @app.route("/")
 def health():
     return jsonify({
