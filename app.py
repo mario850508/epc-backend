@@ -1082,9 +1082,12 @@ def book_vendor_slot_task(token):
 
     _notify_scheduler_async(
         task["creator"],
-        f"✅ {task['assignee'] or body.get('registrant') or '業務'} 已完成安排\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{date} {body.get('start_time')}-{body.get('end_time')}"
-        + _owner_note_lines(body.get("owner_name"), body.get("owner_phone"), body.get("note")),
+        _card("✅ 業務已完成安排｜給安排人員", "#16A34A", f"{task['case']} {task['alias']}".strip(),
+              rows=[("業務", task["assignee"] or body.get("registrant") or ""), ("項目", "、".join(task["type"])),
+                    ("廠商", task["vendor"]), ("時間", f"{_wd_label(date)} {body.get('start_time')}-{body.get('end_time')}"),
+                    ("屋主", _owner_str(body.get("owner_name"), body.get("owner_phone"))),
+                    ("備註", (body.get("note") or "").strip())],
+              button=("開啟主控台", _dash_url() + "/")),
     )
     return jsonify({"ok": True, "record": record})
 
@@ -1174,11 +1177,11 @@ def propose_vendor_slot_alternatives(token):
     rep_note = (body.get("note") or "").strip()
     _notify_scheduler_async(
         task["creator"],
-        f"📝 {task['assignee'] or '業務'} 回傳了屋主可配合的其他時間（{len(slots)} 組）\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{task['vendor']}\n\n"
-        f"屋主可以的時間：\n{slot_lines}"
-        + (f"\n\n業務備註：{rep_note}" if rep_note else "")
-        + "\n\n請到主控台「廠商時段協調」跟廠商確認後，選一個時間。",
+        _card("📝 業務回傳其他時間｜給安排人員", "#D97706", f"{task['case']} {task['alias']}".strip(),
+              rows=[("業務", task["assignee"] or ""), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+                    (f"可選時間（{len(slots)} 組）", slot_lines), ("業務備註", rep_note)],
+              note="請跟廠商確認後，到主控台選一個時間",
+              button=("開啟主控台", _dash_url() + "/")),
     )
     return jsonify({"ok": True, "slots": slots})
 
@@ -1272,9 +1275,12 @@ def confirm_vendor_slot_chosen(token):
         print(f"[confirm_vendor_slot_chosen] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
     _notify_scheduler_async(
         task["creator"],
-        f"✅ {task['assignee'] or '業務'} 已確認時間，安排完成\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{chosen['date']} {chosen['start_time']}-{chosen['end_time']}"
-        + _owner_note_lines(body.get("owner_name"), body.get("owner_phone"), body.get("note")),
+        _card("✅ 業務已確認時間，安排完成｜給安排人員", "#16A34A", f"{task['case']} {task['alias']}".strip(),
+              rows=[("業務", task["assignee"] or ""), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+                    ("時間", f"{_wd_label(chosen['date'])} {chosen['start_time']}-{chosen['end_time']}"),
+                    ("屋主", _owner_str(body.get("owner_name"), body.get("owner_phone"))),
+                    ("備註", (body.get("note") or "").strip())],
+              button=("開啟主控台", _dash_url() + "/")),
     )
     return jsonify({"ok": True, "record": record})
 
@@ -3628,6 +3634,103 @@ def _line_push_text(text, to=None):
     return True, ""
 
 
+# ---- 2026-10-07：LINE 通知改用 Flex Message「卡片」（上方色塊標示「這則是給誰的／什麼事」）----
+# 色塊顏色：橘＝給業務的提醒、藍＝給安排人員、綠＝完成、琥珀＝需要處理、紫＝明天行程、青綠＝總覽。
+# Flex 推播失敗（例如格式有問題）會自動退回純文字，不讓通知消失。
+def _dash_url():
+    return os.environ.get("DASHBOARD_BASE_URL", "https://epc-dashboard-ee5f.onrender.com").strip().rstrip("/")
+
+
+def _wd_label(date_str):
+    """'2026-10-08' → '10/08（週四）'"""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        return f"{d.strftime('%m/%d')}（週{WEEKDAY_ZH[d.weekday()]}）"
+    except Exception:
+        return date_str or ""
+
+
+def _card(tag, color, title, subtitle="", rows=None, sections=None, note="", button=None, footer=""):
+    return {"tag": tag, "color": color, "title": title, "subtitle": subtitle, "rows": rows or [],
+            "sections": sections or [], "note": note, "button": button, "footer": footer}
+
+
+def _card_to_flex(card):
+    contents = [{"type": "text", "text": card["title"] or "（無標題）", "weight": "bold", "size": "lg", "wrap": True}]
+    if card.get("subtitle"):
+        contents.append({"type": "text", "text": card["subtitle"], "size": "sm", "color": "#6B7280", "wrap": True, "margin": "xs"})
+    rows = [(k, v) for k, v in (card.get("rows") or []) if v not in (None, "")]
+    if rows:
+        contents.append({"type": "separator", "margin": "md"})
+    for k, v in rows:
+        contents.append({"type": "box", "layout": "baseline", "margin": "sm", "spacing": "sm", "contents": [
+            {"type": "text", "text": str(k), "size": "sm", "color": "#6B7280", "flex": 2},
+            {"type": "text", "text": str(v), "size": "sm", "color": "#1B2333", "wrap": True, "flex": 5},
+        ]})
+    for heading, lines in card.get("sections") or []:
+        contents.append({"type": "text", "text": heading, "size": "sm", "weight": "bold", "color": card["color"], "margin": "lg"})
+        for ln in lines:
+            contents.append({"type": "text", "text": ln, "size": "sm", "wrap": True, "margin": "xs", "color": "#1B2333"})
+    if card.get("note"):
+        contents.append({"type": "text", "text": card["note"], "size": "sm", "wrap": True, "margin": "lg", "color": "#B45309", "weight": "bold"})
+    bubble = {
+        "type": "bubble", "size": "mega",
+        "header": {"type": "box", "layout": "vertical", "backgroundColor": card["color"], "paddingAll": "12px",
+                   "contents": [{"type": "text", "text": card["tag"], "color": "#FFFFFF", "weight": "bold", "size": "sm", "wrap": True}]},
+        "body": {"type": "box", "layout": "vertical", "paddingAll": "14px", "contents": contents},
+    }
+    footer = []
+    if card.get("button"):
+        label, uri = card["button"]
+        footer.append({"type": "button", "style": "primary", "color": card["color"], "height": "sm",
+                       "action": {"type": "uri", "label": label, "uri": uri}})
+    if card.get("footer"):
+        footer.append({"type": "text", "text": card["footer"], "size": "xs", "color": "#6B7280", "wrap": True, "margin": "md"})
+    if footer:
+        bubble["footer"] = {"type": "box", "layout": "vertical", "paddingAll": "12px", "contents": footer}
+    return bubble
+
+
+def _card_plain_text(card):
+    lines = [card["tag"], card["title"]]
+    if card.get("subtitle"):
+        lines.append(card["subtitle"])
+    lines += [f"{k}：{v}" for k, v in (card.get("rows") or []) if v not in (None, "")]
+    for heading, sec in card.get("sections") or []:
+        lines.append("\n" + heading)
+        lines += sec
+    if card.get("note"):
+        lines.append("\n" + card["note"])
+    if card.get("footer"):
+        lines.append("\n" + card["footer"])
+    return "\n".join(lines)
+
+
+def _line_push_card(card, to=None):
+    token, default_target = _line_config()
+    target = to or default_target
+    if not token or not target:
+        return False, "LINE 環境變數未設定"
+    alt = (card["tag"] + "：" + card["title"] + "｜" + "｜".join(f"{k}{v}" for k, v in (card.get("rows") or []) if v not in (None, "")))[:390]
+    try:
+        resp = requests.post(
+            LINE_PUSH_URL,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"to": target, "messages": [{"type": "flex", "altText": alt, "contents": _card_to_flex(card)}]},
+            timeout=15,
+        )
+        if resp.status_code < 400:
+            return True, ""
+        print(f"[_line_push_card] Flex 失敗，改用純文字：{resp.status_code} {resp.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[_line_push_card] Flex 例外，改用純文字：{e}", flush=True)
+    return _line_push_text(_card_plain_text(card), to=to)
+
+
+def _owner_str(name, phone):
+    return " ".join(x for x in [(name or "").strip(), (phone or "").strip()] if x)
+
+
 def send_deadline_reminders():
     token, target = _line_config()
     if not token:
@@ -3644,7 +3747,6 @@ def send_deadline_reminders():
         print(f"[send_deadline_reminders] 讀取任務失敗：{e}", flush=True)
         return
     now = datetime.now(timezone.utc)
-    base_url = os.environ.get("DASHBOARD_BASE_URL", "").strip().rstrip("/")
     for r in records:
         f = r["fields"]
         if f.get(FIELD_TASK_REMINDED):
@@ -3672,14 +3774,16 @@ def send_deadline_reminders():
         case_no = f.get(FIELD_TASK_CASE_NO, "")
         alias = f.get(FIELD_TASK_ALIAS, "")
         types = "、".join(f.get(FIELD_TASK_TYPE) or [])
-        lines = [
-            f"⏰ {who} 您好，{case_no} {alias}".rstrip(),
-            f"{types}時段還沒確認，回覆期限 {local.strftime('%H:%M')}，剩約 {max(1, round(remain_min))} 分鐘。",
-        ]
-        if f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_REP:
-            lines.append("窗口已選好時段，請進表單按「確認」。")
-        if base_url and f.get(FIELD_TASK_TOKEN):
-            lines.append(f"{base_url}/book.html?token={f[FIELD_TASK_TOKEN]}")
+        vendor = f.get(FIELD_TASK_VENDOR) or ""
+        title = f"{case_no} {alias}".strip()
+        dl_text = f"{local.strftime('%H:%M')}（剩約 {max(1, round(remain_min))} 分鐘）"
+        stage = f.get(FIELD_TASK_STAGE) or ""
+        rep_card = _card(
+            "⏰ 回覆期限快到了｜給業務", "#F2790C", title, subtitle=f"{who} 您好",
+            rows=[("項目", types), ("廠商", vendor), ("回覆期限", dl_text)],
+            note=("窗口已選好時段，請進表單按「確認」" if stage == TASK_STAGE_WAIT_REP else "還沒安排時間，請盡快回覆窗口"),
+            button=("打開填單", f"{_dash_url()}/book.html?token={f[FIELD_TASK_TOKEN]}") if f.get(FIELD_TASK_TOKEN) else None,
+        )
         rep_uid = None
         if f.get(FIELD_TASK_ASSIGNEE):
             try:
@@ -3688,11 +3792,10 @@ def send_deadline_reminders():
                 print(f"[send_deadline_reminders] 查綁定失敗：{e}", flush=True)
         rep_ok = False
         if rep_uid:
-            rep_ok, err = _line_push_text("\n".join(lines), to=rep_uid)
+            rep_ok, err = _line_push_card(rep_card, to=rep_uid)
             if not rep_ok:
                 print(f"[send_deadline_reminders] {case_no} 推播給業務失敗：{err}", flush=True)
         # 同時通知「安排人員」（建立任務的人）：期限快到、還沒安排完成＋目前狀態
-        stage = f.get(FIELD_TASK_STAGE) or ""
         stage_text = {
             TASK_STAGE_WAIT_REP: "已選好時間，等業務按確認",
         }.get(stage, "業務還沒安排")
@@ -3701,16 +3804,17 @@ def send_deadline_reminders():
         if creator:
             sched_ok = _notify_scheduler(
                 creator,
-                f"⏰ 回覆期限 {local.strftime('%H:%M')} 快到了（剩約 {max(1, round(remain_min))} 分鐘）\n"
-                f"{case_no} {alias}\n{types}｜指派：{who}\n目前狀態：{stage_text}",
+                _card("⏰ 業務尚未回覆｜給安排人員", "#1E46C4", title,
+                      rows=[("指派業務", who), ("項目", types), ("廠商", vendor), ("回覆期限", dl_text), ("目前狀態", stage_text)],
+                      button=("開啟主控台", _dash_url() + "/")),
             )
         ok = rep_ok or sched_ok
         if not ok:
             # 業務、安排人員都沒綁定（或推播失敗）→ 轉給預設對象，不要讓提醒默默消失
             if not target:
                 continue
-            lines.insert(0, f"（{who} 尚未綁定 LINE 或推播失敗，轉給你代為提醒）")
-            ok, err = _line_push_text("\n".join(lines))
+            rep_card["tag"] = f"⏰ 回覆期限快到了｜轉給你代為提醒（{who} 尚未綁定 LINE）"
+            ok, err = _line_push_card(rep_card)
             if not ok:
                 print(f"[send_deadline_reminders] {case_no} 推播失敗：{err}", flush=True)
                 continue
@@ -3751,7 +3855,8 @@ def _scheduler_summary(creator):
 
 
 def _notify_scheduler(creator, headline):
-    """推播給安排人員（用名字對應「業務LINE綁定」表）。沒綁定回 False。"""
+    """推播給安排人員（用名字對應「業務LINE綁定」表）。headline 可以是卡片（_card）或純文字。
+    沒綁定回 False。卡片會在底部附上「你名下的任務」狀態摘要。"""
     creator = (creator or "").strip()
     token, _ = _line_config()
     if not token or not creator:
@@ -3760,12 +3865,17 @@ def _notify_scheduler(creator, headline):
         uid = _get_line_binding(creator)
         if not uid:
             return False
-        text = headline
         try:
-            text += "\n\n" + _scheduler_summary(creator)
+            summary = _scheduler_summary(creator)
         except Exception as e:
+            summary = ""
             print(f"[_notify_scheduler] 組狀態摘要失敗：{e}", flush=True)
-        ok, err = _line_push_text(text, to=uid)
+        if isinstance(headline, dict):
+            card = dict(headline)
+            card["footer"] = summary
+            ok, err = _line_push_card(card, to=uid)
+        else:
+            ok, err = _line_push_text(headline + ("\n\n" + summary if summary else ""), to=uid)
         if not ok:
             print(f"[_notify_scheduler] 推播給 {creator} 失敗：{err}", flush=True)
         return ok
@@ -3806,7 +3916,7 @@ def _push_to_name(name, text):
         return False
     if not uid:
         return False
-    ok, err = _line_push_text(text, to=uid)
+    ok, err = _line_push_card(text, to=uid) if isinstance(text, dict) else _line_push_text(text, to=uid)
     if not ok:
         print(f"[_push_to_name] 推播給 {name} 失敗：{err}", flush=True)
     return ok
@@ -3865,29 +3975,31 @@ def _send_day_before_reminders_impl():
         case_no = f.get(FIELD_SLOT_CASE_NO, "")
         alias = f.get(FIELD_SLOT_ALIAS, "")
         types = "、".join(f.get(FIELD_SLOT_TYPE) or [])
-        wd = WEEKDAY_ZH[tomorrow.weekday()]
-        detail = (
-            f"{case_no} {alias}".rstrip()
-            + f"\n{types}｜明天 {tmr[5:].replace('-', '/')}（週{wd}）{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"
-            + f"\n廠商：{f.get(FIELD_SLOT_VENDOR, '')}"
-            + _owner_note_lines(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE), f.get(FIELD_SLOT_NOTE))
-        )
-        rep_ok = _push_to_name(
-            rep_name,
-            "📅 明天有行程，請記得跟屋主提醒！\n" + detail + "\n\n請今天聯絡屋主，提醒明天的行程 🙏",
-        )
+        title = f"{case_no} {alias}".strip()
+        base_rows = [
+            ("時間", f"明天 {_wd_label(tmr)} {f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"),
+            ("項目", types), ("廠商", f.get(FIELD_SLOT_VENDOR, "")),
+            ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
+            ("備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
+        ]
+        rep_card = _card("📅 明天有行程｜給業務", "#7C3AED", title, subtitle=f"{rep_name} 您好" if rep_name else "",
+                         rows=base_rows, note="請今天聯絡屋主，提醒明天的行程 🙏")
+        rep_ok = _push_to_name(rep_name, rep_card)
         sched_ok = False
         if creator and creator != rep_name:
             sched_ok = _push_to_name(
                 creator,
-                "📅 明天的行程提醒" + ("（已通知業務 " + rep_name + "）" if rep_ok else "（業務 " + (rep_name or "?") + " 沒綁定 LINE，請你確認有提醒屋主）") + "\n" + detail,
+                _card("📅 明天有行程｜給安排人員", "#7C3AED", title, rows=[("業務", rep_name)] + base_rows,
+                      note=(f"已通知業務 {rep_name}" if rep_ok else f"業務 {rep_name or '?'} 沒綁定 LINE，請你確認有提醒屋主"),
+                      button=("開啟主控台", _dash_url() + "/")),
             )
         ok = rep_ok or sched_ok
         if not ok:
             if not default_target:
                 continue
-            ok, err = _line_push_text(
-                "📅 明天的行程提醒（業務／安排人員都沒綁定 LINE，轉給你代為通知）\n" + detail
+            ok, err = _line_push_card(
+                _card("📅 明天有行程｜轉給你代為通知", "#7C3AED", title, rows=[("業務", rep_name)] + base_rows,
+                      note="業務／安排人員都沒綁定 LINE")
             )
             if not ok:
                 print(f"[send_day_before_reminders] {case_no} 推播失敗：{err}", flush=True)
@@ -4042,16 +4154,16 @@ def send_tomorrow_digest(force=False):
     by_vendor = {}
     for e in events:
         by_vendor.setdefault(e["vendor"] or "（廠商未知）", []).append(e)
-    lines = [f"📅 明天 {tmr[5:].replace('-', '/')}（週{WEEKDAY_ZH[tomorrow.weekday()]}）行程總覽，共 {len(events)} 筆"]
+    sections = []
     for vendor in sorted(by_vendor):
-        lines.append(f"\n【{vendor}】")
+        lines = []
         for e in sorted(by_vendor[vendor], key=lambda x: (x["time"] or "99", x["kind"])):
             head = f"• {e['kind']}" + (f" {e['time']}" if e["time"] else "")
             lines.append(f"{head}｜{e['case']} {e['alias']}".rstrip() + (f"（{e['extra']}）" if e["extra"] else ""))
-    text = "\n".join(lines)
-    if len(text) > 4800:
-        text = text[:4800] + "\n…（太長，後面略）"
-    ok, err = _line_push_text(text)
+        sections.append((f"【{vendor}】", lines))
+    card = _card("📅 明日行程總覽｜給你", "#0F766E", f"明天 {_wd_label(tmr)}", subtitle=f"共 {len(events)} 筆",
+                 sections=sections, button=("開啟主控台", _dash_url() + "/"))
+    ok, err = _line_push_card(card)
     if ok:
         DIGEST_STATE["sent_for"] = tmr
         try:
