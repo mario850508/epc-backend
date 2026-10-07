@@ -4635,6 +4635,9 @@ CERT_FIELD_FILE = "fldqHpiW4nxDPOKOe"          # 檔案（PDF 附件，懸浮視
 CERT_FIELD_LISTING = "fldPzyenX1YJnwyqN"       # 資料夾檔案（放置資料夾目前的檔案清單，一行一個）
 CERT_FIELD_RENAME_TO = "fldyc3EBmDTH0zWi8"     # 改名為（待處理的改名請求）
 CERT_FIELD_RENAME_RESULT = "fldchBvCfrWH9ieFO" # 改名結果
+# 2026-10-07 加入模組（元晶，Email → Apps Script → 收件匣 → 本機歸檔）後新增：
+CERT_FIELD_EQUIPMENT = "fldx2emVeNU4E6CPJ"     # 設備類型：變流器／模組
+CERT_FIELD_DOC_TYPE = "fldKeqpCoafrBw7Ex"      # 文件類型：出廠證明／序號表／發票／其他
 
 
 @app.route("/api/procurement/inverter-certs")
@@ -4645,6 +4648,7 @@ def procurement_inverter_certs():
             CERT_FIELD_STATUS, CERT_FIELD_ABBR_GUESSED, CERT_FIELD_SHIP_DATE,
             CERT_FIELD_FILED_AT, CERT_FIELD_VENDOR, CERT_FIELD_ABBR_OK,
             CERT_FIELD_FILE, CERT_FIELD_LISTING, CERT_FIELD_RENAME_TO, CERT_FIELD_RENAME_RESULT,
+            CERT_FIELD_EQUIPMENT, CERT_FIELD_DOC_TYPE,
         ])
     except Exception as e:
         return jsonify({"error": str(e)}), 502
@@ -4667,6 +4671,9 @@ def procurement_inverter_certs():
             "folder_files": [x for x in (f.get(CERT_FIELD_LISTING) or "").split("\n") if x],
             "rename_to": f.get(CERT_FIELD_RENAME_TO, ""),
             "rename_result": f.get(CERT_FIELD_RENAME_RESULT, ""),
+            "equipment": f.get(CERT_FIELD_EQUIPMENT, "") or "變流器",
+            "doc_type": f.get(CERT_FIELD_DOC_TYPE, "") or "出廠證明",
+            "file_name": (f.get(CERT_FIELD_FILE) or [{}])[0].get("filename", ""),
         })
     rows.sort(key=lambda x: x["filed_at"] or "", reverse=True)
     return jsonify({"certs": rows})
@@ -4681,7 +4688,7 @@ def procurement_inverter_cert_rename(record_id):
         return jsonify({"error": "請輸入新檔名"}), 400
     if any(c in new_name for c in '\\/:*?"<>|'):
         return jsonify({"error": '檔名不能含 \\ / : * ? " < > |'}), 400
-    if not new_name.lower().endswith(".pdf"):
+    if not os.path.splitext(new_name)[1]:  # 沒打副檔名才補 .pdf（序號表是 .xlsx）
         new_name += ".pdf"
     resp = requests.patch(
         f"{CERT_API_URL}/{record_id}",
