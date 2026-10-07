@@ -1166,11 +1166,19 @@ def propose_vendor_slot_alternatives(token):
         _patch_task(r["id"], fields)
     except Exception as e:
         return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    slot_lines = "\n".join(
+        f"{i + 1}. {sl['date'][5:].replace('-', '/')}（週{WEEKDAY_ZH[datetime.strptime(sl['date'], '%Y-%m-%d').weekday()]}）"
+        f"{sl['start_time']}-{sl['end_time']}"
+        for i, sl in enumerate(slots)
+    )
+    rep_note = (body.get("note") or "").strip()
     _notify_scheduler_async(
         task["creator"],
         f"📝 {task['assignee'] or '業務'} 回傳了屋主可配合的其他時間（{len(slots)} 組）\n"
-        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}\n"
-        "請到主控台「廠商時段協調」跟廠商確認後，選一個時間。",
+        f"{task['case']} {task['alias']}\n{'、'.join(task['type'])}｜{task['vendor']}\n\n"
+        f"屋主可以的時間：\n{slot_lines}"
+        + (f"\n\n業務備註：{rep_note}" if rep_note else "")
+        + "\n\n請到主控台「廠商時段協調」跟廠商確認後，選一個時間。",
     )
     return jsonify({"ok": True, "slots": slots})
 
