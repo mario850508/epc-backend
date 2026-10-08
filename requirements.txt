@@ -5,3 +5,4 @@ gunicorn
 APScheduler
 reportlab
 Pillow
+anthropic

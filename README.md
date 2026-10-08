@@ -74,3 +74,31 @@ Airtable PAT 需要有這個 Base 的 `data.records:read` 和 `data.records:writ
 日期格式一律 `YYYY-MM-DD`。`milestone_record_id` 從 `/api/pending-cases`（欄位
 `ship_milestone_record_id`）或 `/api/entry-cases`（欄位 `ship_milestone_record_id`／
 `entry_milestone_record_id`）取得，不是案件本身的 record_id。
+
+## PDF 公文更名（線上版，2026-10-08）
+
+原本的本機工具（V2.15，OCR）改成線上：主控台上傳 PDF → Airtable「公文更名佇列」
+（`tblreT71hQpJMuf1B`）→ 後端每分鐘檢查、依設定間隔背景辨識（Claude 讀 PDF 抽資料
+→ 程式比對「專案細節」全部案件的受理編號／電號／同意備案編號／地址 → Claude 對照候選
+案件再確認一次並給信心分數）。人工確認（或高信心自動確認）後，可把發文日期寫回「進度
+管理」對應里程碑的完成日期（只填空白）。
+
+**需要新增 Render 環境變數 `ANTHROPIC_API_KEY`**（可選 `PDF_RENAME_MODEL`，預設
+`claude-opus-5-5`）。命名格式、函文類型規則、排程間隔存在「系統狀態」表
+`pdf_rename_settings`，在主控台「⚙ 命名格式與函文規則」修改，也可以指定 Google Sheet
+發布的 CSV 網址當規則來源。
+
+| Method | Path | 說明 |
+|---|---|---|
+| GET | `/api/pdf-rename/status` | 各狀態數量、排程狀態、設定 |
+| GET | `/api/pdf-rename/items?status=` | 清單（`all`／`active`／單一狀態） |
+| POST | `/api/pdf-rename/upload` | multipart `files`（可多份，每份 ≤5MB）、`uploader`、`source` |
+| POST | `/api/pdf-rename/run` | 立即辨識一輪 |
+| POST | `/api/pdf-rename/settings` | 修改設定；`reload_csv: true` 從 Google Sheet 重新載入函文類型 |
+| POST | `/api/pdf-rename/preview-name` | 依命名格式產生檔名 |
+| POST | `/api/pdf-rename/<id>/confirm` | 確認（`case_no, doc_type, doc_date, final_name, user`），會寫回進度管理 |
+| POST | `/api/pdf-rename/<id>/retry` · `/reopen` | 重新辨識／改回待確認 |
+| DELETE | `/api/pdf-rename/<id>` | 刪除 |
+| GET | `/api/pdf-rename/<id>/file` | 用確認檔名下載（`?inline=1` 預覽） |
+| GET | `/api/pdf-rename/confirmed` | 本機歸檔程式用：已確認、待歸檔清單 |
+| POST | `/api/pdf-rename/<id>/archived` | 本機歸檔完成回報（`result`） |
