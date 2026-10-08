@@ -437,6 +437,7 @@ FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指�
 FIELD_TASK_OWNER_TOKEN = "fldEAVpfdwAot2wmx"      # 屋主Token
 FIELD_TASK_OWNER_WIN_START = "fldcshgkAyg8iA1mV"  # 屋主可選時段開始 HH:MM（預設 09:00）
 FIELD_TASK_OWNER_WIN_END = "fldZM3kKE3GWpyvvK"    # 屋主可選時段結束 HH:MM（預設 17:00，作業要在這之前結束）
+FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
@@ -768,7 +769,7 @@ def _task_fields():
         FIELD_TASK_DURATION_MIN, FIELD_TASK_OWNER_NAME, FIELD_TASK_OWNER_PHONE,
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
-        FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END,
+        FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
     ]
 
 
@@ -821,6 +822,7 @@ def _task_to_dict(r):
         "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
         "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
         "owner_win_end": f.get(FIELD_TASK_OWNER_WIN_END) or "",
+        "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
     }
 
 
@@ -1608,6 +1610,8 @@ def vendor_slot_task_owner_link(record_id):
         patch[FIELD_TASK_OWNER_WIN_START] = ws
         patch[FIELD_TASK_OWNER_WIN_END] = we
         task["owner_win_start"], task["owner_win_end"] = ws, we
+    if not task.get("owner_mode"):
+        patch[FIELD_TASK_OWNER_MODE] = True
     if patch:
         try:
             _patch_task(record_id, patch)
@@ -1619,6 +1623,8 @@ def vendor_slot_task_owner_link(record_id):
         "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we, "assignee": task["assignee"], "status": task["status"],
+        "assignee_bound": bool(task["assignee"] and _get_line_binding(task["assignee"])),
+        "rep_bind_url": _rep_bind_url(task["assignee"]),
     })
 
 
@@ -4360,10 +4366,16 @@ def send_deadline_reminders():
         title = f"{case_no} {alias}".strip()
         dl_text = f"{local.strftime('%H:%M')}（剩約 {max(1, round(remain_min))} 分鐘）"
         stage = f.get(FIELD_TASK_STAGE) or ""
+        owner_mode = bool(f.get(FIELD_TASK_OWNER_MODE))
+        if owner_mode:
+            rep_note = ("窗口已選好時間，請提醒屋主打開連結按「確認」" if stage == TASK_STAGE_WAIT_REP
+                        else "屋主還沒填預約表，請提醒屋主在期限前填好；也可以問好時間後自己按下面的按鈕幫屋主填")
+        else:
+            rep_note = "窗口已選好時段，請進表單按「確認」" if stage == TASK_STAGE_WAIT_REP else "還沒安排時間，請盡快回覆窗口"
         rep_card = _card(
-            "⏰ 回覆期限快到了｜給業務", "#F2790C", title, subtitle=f"{who} 您好",
+            "⏰ 屋主還沒填預約表｜給業務" if owner_mode else "⏰ 回覆期限快到了｜給業務", "#F2790C", title, subtitle=f"{who} 您好",
             rows=[("項目", types), ("廠商", vendor), ("回覆期限", dl_text)],
-            note=("窗口已選好時段，請進表單按「確認」" if stage == TASK_STAGE_WAIT_REP else "還沒安排時間，請盡快回覆窗口"),
+            note=rep_note,
             button=("打開填單", f"{_dash_url()}/book.html?token={f[FIELD_TASK_TOKEN]}") if f.get(FIELD_TASK_TOKEN) else None,
         )
         rep_uid = None
@@ -4378,15 +4390,18 @@ def send_deadline_reminders():
             if not rep_ok:
                 print(f"[send_deadline_reminders] {case_no} 推播給業務失敗：{err}", flush=True)
         # 同時通知「安排人員」（建立任務的人）：期限快到、還沒安排完成＋目前狀態
-        stage_text = {
-            TASK_STAGE_WAIT_REP: "已選好時間，等業務按確認",
-        }.get(stage, "業務還沒安排")
+        if owner_mode:
+            stage_text = "已選好時間，等屋主按確認" if stage == TASK_STAGE_WAIT_REP else "屋主還沒填預約表"
+        else:
+            stage_text = {
+                TASK_STAGE_WAIT_REP: "已選好時間，等業務按確認",
+            }.get(stage, "業務還沒安排")
         creator = (f.get(FIELD_TASK_CREATOR) or "").strip()
         sched_ok = False
         if creator:
             sched_ok = _notify_scheduler(
                 creator,
-                _card("⏰ 業務尚未回覆｜給安排人員", "#1E46C4", title,
+                _card("⏰ 屋主還沒填預約表｜給安排人員" if owner_mode else "⏰ 業務尚未回覆｜給安排人員", "#1E46C4", title,
                       rows=[("指派業務", who), ("項目", types), ("廠商", vendor), ("回覆期限", dl_text), ("目前狀態", stage_text)],
                       button=("開啟主控台", _dash_url() + "/")),
             )
@@ -4797,6 +4812,63 @@ def line_schedulers():
         return jsonify({"names": _list_scheduler_names()})
     except Exception as e:
         return jsonify({"error": str(e), "names": []}), 502
+
+
+def _rep_bind_url(name):
+    from urllib.parse import quote
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id or not (name or "").strip():
+        return ""
+    return f"https://liff.line.me/{liff_id}?bind=rep&name={quote(name.strip())}"
+
+
+@app.route("/api/line/bound-names")
+def line_bound_names():
+    """已綁定 LINE 的所有名字（業務＋安排人員），主控台用來顯示「業務有沒有綁定」。不回 userId。"""
+    try:
+        recs = airtable_get_all(LINE_BIND_API_URL, f"NOT({{{FIELD_BIND_UID}}}='')", [FIELD_BIND_NAME, FIELD_BIND_UID])
+        names = sorted({(r["fields"].get(FIELD_BIND_NAME) or "").strip() for r in recs if r["fields"].get(FIELD_BIND_UID)} - {""})
+        return jsonify({"names": names})
+    except Exception as e:
+        return jsonify({"error": str(e), "names": []}), 502
+
+
+@app.route("/api/line/rep-bind-url")
+def line_rep_bind_url():
+    name = (request.args.get("name") or "").strip()
+    return jsonify({"url": _rep_bind_url(name)})
+
+
+@app.route("/api/line/bind-rep", methods=["POST"])
+def line_bind_rep():
+    """業務自己用綁定連結（book.html?bind=rep&name=名字）綁 LINE，不需要先有任務連結。
+    跟安排人員綁定一樣用 access token 向 LINE 驗證 userId；不會動到「安排人員」勾選。body: {access_token, name}"""
+    body = request.get_json(force=True) or {}
+    access_token = (body.get("access_token") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not access_token or not name:
+        return jsonify({"error": "缺少名字或 LINE 登入資訊"}), 400
+    try:
+        prof = requests.get("https://api.line.me/v2/profile",
+                            headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        if prof.status_code >= 400:
+            return jsonify({"error": "LINE 驗證失敗，請重新開啟連結再試一次"}), 400
+        pj = prof.json()
+        user_id, display = pj.get("userId", ""), pj.get("displayName", "")
+        if not user_id:
+            return jsonify({"error": "LINE 驗證失敗"}), 400
+        fields = {FIELD_BIND_NAME: name, FIELD_BIND_UID: user_id, FIELD_BIND_DISPLAY: display}
+        existing = _find_line_binding_record(name)
+        if existing:
+            resp = requests.patch(f"{LINE_BIND_API_URL}/{existing['id']}", headers=airtable_headers(),
+                                  json={"fields": fields}, timeout=20)
+        else:
+            resp = requests.post(LINE_BIND_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "display_name": display, "name": name})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/line/bind-scheduler", methods=["POST"])
