@@ -1636,6 +1636,14 @@ def _vendor_notice_card(rec):
                 coords = _parse_coords(recs[0]["fields"].get(FIELD_PLANT_COORDS))
         except Exception as e:
             print(f"[_vendor_notice_card] 查地址失敗：{e}", flush=True)
+        # 座標以業務自治區為準（使用者指定），沒有才用 Airtable 案件表的電廠座標
+        try:
+            _ensure_biz_snapshots_loaded()
+            biz = _parse_coords(BIZ_COORDS_CACHE.get(case_no))
+            if biz:
+                coords = biz
+        except Exception as e:
+            print(f"[_vendor_notice_card] 查業務自治區座標失敗：{e}", flush=True)
     rep_name = f.get(FIELD_SLOT_REGISTRANT, "")
     try:
         trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + rec["id"] + "'", [FIELD_TASK_ASSIGNEE])
@@ -1813,9 +1821,19 @@ def site_survey_cancelled_sync():
             new_owner_cache[case_no] = {"name": name, "phone": phone}
     OWNER_CONTACT_CACHE.clear()
     OWNER_CONTACT_CACHE.update(new_owner_cache)
+    coords_in = body.get("plant_coords")
+    if isinstance(coords_in, list):
+        new_coords = {}
+        for c in coords_in:
+            if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("coords") or "").strip():
+                new_coords[c["case"].strip()] = c["coords"].strip()
+        BIZ_COORDS_CACHE.clear()
+        BIZ_COORDS_CACHE.update(new_coords)
+    threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
     print(
         f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號、"
-        f"{len(CERTIFIED_CASE_CACHE['cases'])} 筆已公證案件、{len(OWNER_CONTACT_CACHE)} 筆屋主聯絡資訊",
+        f"{len(CERTIFIED_CASE_CACHE['cases'])} 筆已公證案件、{len(OWNER_CONTACT_CACHE)} 筆屋主聯絡資訊、"
+        f"{len(BIZ_COORDS_CACHE)} 筆電廠座標",
         flush=True,
     )
     return jsonify({
@@ -1823,7 +1841,64 @@ def site_survey_cancelled_sync():
         "count": len(CANCELLED_CASE_CACHE["case_nos"]),
         "certified_count": len(CERTIFIED_CASE_CACHE["cases"]),
         "owner_contact_count": len(OWNER_CONTACT_CACHE),
+        "plant_coords_count": len(BIZ_COORDS_CACHE),
     })
+
+
+# 2026-10-08：業務自治區推送的「電廠座標」（{案號: 座標文字}）。給廠商通知卡片的地圖按鈕用，
+# 使用者指定以業務自治區為準（Airtable 案件表的電廠座標只當備援）。
+# 記憶體快取在 Render 重啟後會清空，所以每次推送也存一份 JSON 快照到「系統狀態」表的「長值」，
+# 快取是空的時候先從快照還原（公證書屋主資料 OWNER_CONTACT_CACHE 也一樣處理）。
+BIZ_COORDS_CACHE = {}
+STATE_FIELD_LONG = "fld4BuR3sfKTkDvsi"   # 系統狀態「長值」（multilineText）
+_BIZ_SNAPSHOT_LOADED = {"done": False}
+
+
+def _state_get_long(key):
+    esc = key.replace("'", chr(92) + "'")
+    recs = airtable_get_all(STATE_API_URL, "{" + STATE_FIELD_KEY + "}='" + esc + "'", [STATE_FIELD_KEY, STATE_FIELD_LONG])
+    return (recs[0]["fields"].get(STATE_FIELD_LONG) or "") if recs else ""
+
+
+def _state_set_long(key, text):
+    esc = key.replace("'", chr(92) + "'")
+    recs = airtable_get_all(STATE_API_URL, "{" + STATE_FIELD_KEY + "}='" + esc + "'", [STATE_FIELD_KEY])
+    fields = {STATE_FIELD_KEY: key, STATE_FIELD_LONG: text, STATE_FIELD_VALUE: datetime.now().isoformat()}
+    if recs:
+        resp = requests.patch(f"{STATE_API_URL}/{recs[0]['id']}", headers=airtable_headers(), json={"fields": fields}, timeout=30)
+    else:
+        resp = requests.post(STATE_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=30)
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
+
+
+def _persist_biz_snapshots():
+    try:
+        if BIZ_COORDS_CACHE:
+            _state_set_long("biz_plant_coords", json.dumps(BIZ_COORDS_CACHE, ensure_ascii=False))
+        if OWNER_CONTACT_CACHE:
+            _state_set_long("biz_owner_contacts", json.dumps(OWNER_CONTACT_CACHE, ensure_ascii=False))
+    except Exception as e:
+        print(f"[_persist_biz_snapshots] 存快照失敗：{e}", flush=True)
+
+
+def _ensure_biz_snapshots_loaded():
+    """快取是空的（剛重啟、Apps Script 還沒推送）時，從 Airtable 快照還原一次。"""
+    if _BIZ_SNAPSHOT_LOADED["done"]:
+        return
+    _BIZ_SNAPSHOT_LOADED["done"] = True
+    try:
+        if not BIZ_COORDS_CACHE:
+            raw = _state_get_long("biz_plant_coords")
+            if raw:
+                BIZ_COORDS_CACHE.update(json.loads(raw))
+        if not OWNER_CONTACT_CACHE:
+            raw = _state_get_long("biz_owner_contacts")
+            if raw:
+                OWNER_CONTACT_CACHE.update(json.loads(raw))
+    except Exception as e:
+        _BIZ_SNAPSHOT_LOADED["done"] = False
+        print(f"[_ensure_biz_snapshots_loaded] 還原快照失敗：{e}", flush=True)
 
 
 @app.route("/api/owner-contact")
@@ -1833,6 +1908,7 @@ def get_owner_contact():
     case_no = (request.args.get("case") or "").strip()
     if not case_no:
         return jsonify({"found": False})
+    _ensure_biz_snapshots_loaded()
     info = OWNER_CONTACT_CACHE.get(case_no)
     if not info:
         return jsonify({"found": False})
