@@ -1625,11 +1625,15 @@ def _vendor_notice_card(rec):
     f = rec.get("fields", {})
     case_no = f.get(FIELD_SLOT_CASE_NO, "")
     address = ""
+    coords = None
     if case_no:
         try:
             esc = case_no.replace("'", chr(92) + "'")
-            recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_ADDRESS])
-            address = " ".join((recs[0]["fields"].get(FIELD_ADDRESS) or "").split()) if recs else ""
+            recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'",
+                                    [FIELD_CASE_NO, FIELD_ADDRESS, FIELD_PLANT_COORDS])
+            if recs:
+                address = " ".join((recs[0]["fields"].get(FIELD_ADDRESS) or "").split())
+                coords = _parse_coords(recs[0]["fields"].get(FIELD_PLANT_COORDS))
         except Exception as e:
             print(f"[_vendor_notice_card] 查地址失敗：{e}", flush=True)
     rep_name = f.get(FIELD_SLOT_REGISTRANT, "")
@@ -1644,16 +1648,36 @@ def _vendor_notice_card(rec):
         "📋 施工排程通知｜給廠商", "#2563EB", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
         rows=[("廠商", f.get(FIELD_SLOT_VENDOR, "")), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])),
               ("時間", f"{_wd_label(date)} {f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"),
-              ("地址", address),
+              ("地址", address), ("座標", coords or ""),
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
               ("陽光備註", (f.get(FIELD_SLOT_PM_NOTE) or "").strip())],
-        buttons=_vendor_card_buttons(f, address),
+        buttons=_vendor_card_buttons(f, address, coords),
     )
 
 
-def _vendor_card_buttons(f, address):
-    """給廠商卡片的按鈕：撥號給屋主（tel:，手機會直接帶號碼到撥號畫面）、開啟地圖、複製屋主資料。"""
+# 2026-10-08：案件表「電廠座標」（業務標的，格式像「24.921159,121.071300」，偶爾有空白/tab）
+FIELD_PLANT_COORDS = "fldrgbALndLShwtxd"
+
+
+def _parse_coords(raw):
+    """從座標文字抓出 (緯度, 經度)；格式不對或不在合理範圍就回 None（改用地址）。"""
+    import re
+    nums = re.findall(r"-?\d+(?:\.\d+)?", raw or "")
+    if len(nums) < 2:
+        return None
+    sa, sb = nums[0], nums[1]
+    a, b = float(sa), float(sb)
+    if abs(a) > 90 and abs(b) <= 90:   # 經緯度填反
+        a, b, sa, sb = b, a, sb, sa
+    if not (-90 <= a <= 90 and -180 <= b <= 180) or (a == 0 and b == 0):
+        return None
+    return f"{sa},{sb}"
+
+
+def _vendor_card_buttons(f, address, coords=None):
+    """給廠商卡片的按鈕：撥號給屋主（tel:，手機會直接帶號碼到撥號畫面）、開啟地圖、複製屋主資料。
+    地圖優先用電廠座標（比地址查詢準），沒有座標才用地址。"""
     from urllib.parse import quote
     name = (f.get(FIELD_SLOT_OWNER_NAME) or "").strip()
     phone = (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip()
@@ -1661,9 +1685,12 @@ def _vendor_card_buttons(f, address):
     buttons = []
     if len(dial) >= 8:
         buttons.append(("📞 撥號給屋主", "tel:" + dial))
-    if address:
+    if coords:
+        buttons.append(("📍 開啟地圖（座標）", "https://www.google.com/maps/search/?api=1&query=" + quote(coords)))
+    elif address:
         buttons.append(("📍 開啟地圖", "https://www.google.com/maps/search/?api=1&query=" + quote(address)))
-    copy_lines = [x for x in [f"屋主：{_owner_str(name, phone)}" if (name or phone) else "", f"地址：{address}" if address else ""] if x]
+    copy_lines = [x for x in [f"屋主：{_owner_str(name, phone)}" if (name or phone) else "",
+                              f"地址：{address}" if address else "", f"座標：{coords}" if coords else ""] if x]
     if copy_lines:
         buttons.append(("📋 複製屋主資料", {"clipboard": "\n".join(copy_lines)}))
     return buttons
