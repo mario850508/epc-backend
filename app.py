@@ -208,6 +208,10 @@ EPC 出貨／進場排程 後端 API
 
 import os
 import io
+import re
+import csv
+import base64
+import difflib
 import json
 import time
 import uuid
@@ -218,7 +222,7 @@ import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前�
               # gunicorn worker 因 WORKER TIMEOUT 被砍掉，且完全沒有任何錯誤 log）。
 import requests
 from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -5817,6 +5821,972 @@ def procurement_inverter_cert_abbr_ok(record_id):
     )
     if resp.status_code >= 400:
         return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True})
+
+
+# ===================================================================
+# PDF 公文更名（線上版，2026-10-08）
+# ===================================================================
+# 原本是使用者電腦上的本機工具（V2.15，127.0.0.1:8779，OCR 辨識），辨識不夠準。
+# 改成線上：PDF 上傳到 Airtable「公文更名佇列」（狀態＝待辨識），後端背景排程
+# 慢慢辨識（準確度優先，不求快）：
+#   1. 第一次呼叫 Claude：讀整份 PDF，抽出函文類型／發文日期／字號／機關／主旨，
+#      以及所有可以對應到案件的識別資料（台電受理編號、電號、同意備案編號、
+#      契約編號、地址、申請人名稱…）。
+#   2. 程式自己用這些識別資料去比對「專案細節」全部案件（精確比對編號、地址相似度、
+#      送件名稱／別名），排出候選案件。
+#   3. 第二次呼叫 Claude：把 PDF＋候選案件的完整資料一起給它，重新確認案號、
+#      函文類型、日期，並給每一項信心分數。
+#   4. 程式再做一次規則檢查（編號精確比對是否跟模型選的案件一致、兩次判讀是否一致、
+#      日期合不合理），算出最終信心分數。高信心可設定自動確認，其餘留「待確認」。
+# 人工確認後（或自動確認），可選擇把發文日期寫回「進度管理」對應里程碑的完成日期
+# （只填空白的，不覆蓋既有日期）。實際歸檔到 G 槽仍由本機程式做：本機程式讀
+# GET /api/pdf-rename/confirmed 下載檔案、照「確認檔名」歸檔後回報 /archived。
+#
+# 需要 Render 環境變數 ANTHROPIC_API_KEY；模型可用 PDF_RENAME_MODEL 覆寫。
+# 設定（命名格式、函文類型規則、排程間隔…）存在「系統狀態」表 pdf_rename_settings。
+PDF_TABLE_ID = "tblreT71hQpJMuf1B"
+PDF_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{PDF_TABLE_ID}"
+PDF_F = {
+    "src_name": "fldb2SyKTU97wYsSY",     # 原檔名
+    "file": "fldm6cFHtMdFVogj4",         # 檔案（PDF 附件）
+    "status": "fldcqa8rjp5kc1g7u",       # 狀態
+    "source": "fldJzR4IBBLyk0KO4",       # 來源
+    "uploader": "fld8xLEBUTdmrjwqQ",     # 上傳人
+    "case_no": "fld9FxfJDGGt9cGUN",      # 案號
+    "alias": "fldpaTS6gTL06pwbr",        # 別名
+    "doc_type": "fldM0eJIPQibq9E94",     # 函文類型
+    "doc_date": "fldzeo6rFELXTT1Sq",     # 發文日期
+    "doc_number": "fld59pJX7EGbHwiQ7",   # 發文字號
+    "issuer": "fldBVeqKWB980gb40",       # 發文機關
+    "subject": "flda6JqqpOWMDHseB",      # 主旨
+    "suggested": "fldwNgB0tZBJU5UBC",    # 建議檔名
+    "final_name": "fld9tJ6RUyEoMqHTF",   # 確認檔名
+    "confidence": "fldK77eZ7eRT7sko0",   # 信心分數
+    "evidence": "fld7MlEN4jJ95Aq1I",     # 辨識依據
+    "result_json": "fldl2AhLoTIMfDXA3",  # 辨識結果JSON
+    "attempts": "fld5YVd5LE5QjMUAT",     # 辨識次數
+    "error": "fldEf6sJPs4gU4qPx",        # 錯誤訊息
+    "recognized_at": "fldrZP7DlNOW4P0C2",  # 辨識時間（辨識中時＝開始時間，用來判斷卡住）
+    "confirmed_at": "fldByrYevJJWzO9EN",   # 確認時間
+    "confirmed_by": "fld83V6N168l590Sv",   # 確認人
+    "writeback": "fldgx4NAfTB6Tv8hu",      # 寫回結果
+    "uploaded_at": "fldFYljqhbJy70LH3",    # 上傳時間
+}
+PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
+PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
+PDF_MAX_BYTES = 5 * 1024 * 1024   # Airtable uploadAttachment 單檔上限
+PDF_MAX_ATTEMPTS = 3
+PDF_STALE_MINUTES = 30
+PDF_MODEL = os.environ.get("PDF_RENAME_MODEL", "claude-opus-5-5").strip()
+PDF_STATE_KEY = "pdf_rename_settings"
+TW_TZ = timezone(timedelta(hours=8))
+
+# 「專案細節」比對用欄位（案號／別名／地址沿用上方常數）
+FIELD_CASE_SUBMIT_NAME = "fldBVa5jakioAkUTB"   # 送件名稱
+FIELD_CASE_EPC_PARTY = "fldQmtAOfu5Suld3o"     # EPC簽約對象
+FIELD_CASE_CONTRACT_NO = "fldEVxxXvcb7nrz6S"   # 合約編號
+FIELD_CASE_TP_ACCEPT_NO = "fldhkdJvJw6xDwtMl"  # 臺電受理編號
+FIELD_CASE_ELEC_NO = "fldsevnrPtGTG7aIo"       # 電號
+FIELD_CASE_TP_CONTRACT_NO = "fldgZkOWhJWi54wUD"  # 台電契約編號
+FIELD_CASE_PV_NO = "fldBU6s0FgcDojilc"         # 併聯PV編號
+FIELD_CASE_AGREE_NO = "fldOYJoRZy0Uoym41"      # 同意備案編號
+
+# 預設函文類型。milestone＝確認後要寫回「進度管理」哪一種里程碑的完成日期（空字串＝不寫回）。
+PDF_DEFAULT_DOC_TYPES = [
+    {"name": "併聯審查", "keywords": "併聯審查意見書、併聯審查結果、同意併聯", "milestone": "併聯審查", "note": "台電區處回覆併聯審查結果"},
+    {"name": "同意備案", "keywords": "同意備案、再生能源發電設備同意備案", "milestone": "同意備案", "note": "縣市政府或能源署核發"},
+    {"name": "細部協商", "keywords": "細部協商、併聯細部協商", "milestone": "細部協商", "note": ""},
+    {"name": "免雜", "keywords": "免請領雜項執照、免雜項執照、免雜", "milestone": "免雜", "note": "建管單位核發"},
+    {"name": "購售契約函文", "keywords": "購售電契約、檢送購售電契約", "milestone": "購售契約函文", "note": "台電寄送契約的函文"},
+    {"name": "台電購售契約", "keywords": "再生能源購售電契約書（契約本體）", "milestone": "台電購售契約", "note": "契約書本體"},
+    {"name": "併聯試運轉", "keywords": "併聯試運轉", "milestone": "併聯試運轉", "note": ""},
+    {"name": "正式售電函", "keywords": "正式購售電、正式售電、躉購費率", "milestone": "正式售電函", "note": ""},
+    {"name": "竣工備查", "keywords": "竣工、竣工備查", "milestone": "竣工備查", "note": ""},
+    {"name": "設備登記", "keywords": "設備登記、再生能源發電設備登記", "milestone": "設備登記", "note": ""},
+    {"name": "台電審訖圖", "keywords": "審訖、單線圖審訖", "milestone": "台電審訖圖", "note": ""},
+    {"name": "電表租約", "keywords": "電表租約、電表租用", "milestone": "電表租約", "note": ""},
+    {"name": "第一張電費單", "keywords": "電費通知單、購電費用", "milestone": "第一張電費單", "note": ""},
+]
+PDF_DEFAULT_SETTINGS = {
+    "enabled": True,                # 背景自動辨識
+    "interval_min": 5,              # 每幾分鐘檢查一次佇列
+    "batch_size": 5,                # 每輪最多辨識幾份（慢慢來，避免一次打太多 API）
+    "auto_confirm": False,          # 高信心直接確認（不用人工按）
+    "auto_confirm_threshold": 92,   # 自動確認門檻
+    "writeback": True,              # 確認後把發文日期寫回進度管理（只填空白）
+    "template": "{案號}_{函文類型}_{日期}",
+    "doc_types": PDF_DEFAULT_DOC_TYPES,
+    "rules_csv_url": "",            # 選填：Google Sheet「發布為 CSV」網址，欄位 函文類型/關鍵字/對應里程碑/說明
+}
+PDF_SETTINGS = {"data": None}
+PDF_RUN = {"running": False, "last_run_at": None, "last_finished_at": None, "last_error": None, "last_count": 0}
+PDF_LOCK = threading.Lock()
+PDF_CASE_REF = {"cases": [], "at": 0}
+_ANTHROPIC_CLIENT = {"c": None}
+
+
+def _tw_now_iso():
+    return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+
+def _pdf_settings():
+    if PDF_SETTINGS["data"] is None:
+        data = dict(PDF_DEFAULT_SETTINGS)
+        try:
+            raw = _state_get_long(PDF_STATE_KEY)
+            if raw:
+                data.update(json.loads(raw))
+        except Exception as e:
+            print(f"[pdf_rename] 讀取設定失敗，用預設值：{e}", flush=True)
+        PDF_SETTINGS["data"] = data
+    return PDF_SETTINGS["data"]
+
+
+def _pdf_save_settings(data):
+    _state_set_long(PDF_STATE_KEY, json.dumps(data, ensure_ascii=False))
+    PDF_SETTINGS["data"] = data
+
+
+def _pdf_load_rules_csv(url):
+    """Google Sheet「檔案 → 共用 → 發布到網路 → CSV」的網址。第一列是標題，
+    認得 函文類型/類型/名稱、關鍵字、對應里程碑/里程碑、說明/備註 這幾種欄名。"""
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    rows = list(csv.reader(io.StringIO(resp.content.decode("utf-8-sig"))))
+    if len(rows) < 2:
+        raise Exception("CSV 沒有資料列")
+    header = [h.strip() for h in rows[0]]
+
+    def col(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+    i_name = col("函文類型", "類型", "名稱", "文件類型")
+    if i_name is None:
+        raise Exception("CSV 找不到「函文類型」欄位（第一列標題）")
+    i_kw, i_ms, i_note = col("關鍵字", "辨識關鍵字"), col("對應里程碑", "里程碑", "進度管理"), col("說明", "備註")
+    out = []
+    for r in rows[1:]:
+        get = lambda i: (r[i].strip() if i is not None and i < len(r) else "")
+        if get(i_name):
+            out.append({"name": get(i_name), "keywords": get(i_kw), "milestone": get(i_ms), "note": get(i_note)})
+    if not out:
+        raise Exception("CSV 沒有任何函文類型")
+    return out
+
+
+def _pdf_get_record(record_id):
+    resp = requests.get(f"{PDF_API_URL}/{record_id}", headers=airtable_headers(),
+                        params={"returnFieldsByFieldId": "true"}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _pdf_patch(record_id, fields):
+    resp = requests.patch(f"{PDF_API_URL}/{record_id}", headers=airtable_headers(),
+                          json={"fields": fields}, timeout=30)
+    if resp.status_code >= 400:
+        raise Exception(resp.text)
+    return resp.json()
+
+
+def _pdf_record_to_dict(r):
+    f = r.get("fields", {})
+    g = lambda k: f.get(PDF_F[k])
+    att = (g("file") or [{}])[0]
+    try:
+        result = json.loads(g("result_json") or "{}")
+    except Exception:
+        result = {}
+    return {
+        "id": r["id"],
+        "src_name": g("src_name") or "",
+        "status": g("status") or "",
+        "source": g("source") or "",
+        "uploader": g("uploader") or "",
+        "uploaded_at": g("uploaded_at") or r.get("createdTime", ""),
+        "case_no": g("case_no") or "",
+        "alias": g("alias") or "",
+        "doc_type": g("doc_type") or "",
+        "doc_date": g("doc_date") or "",
+        "doc_number": g("doc_number") or "",
+        "issuer": g("issuer") or "",
+        "subject": g("subject") or "",
+        "suggested_name": g("suggested") or "",
+        "final_name": g("final_name") or "",
+        "confidence": g("confidence"),
+        "evidence": g("evidence") or "",
+        "issues": result.get("issues") or [],
+        "candidates": result.get("candidates") or [],
+        "attempts": g("attempts") or 0,
+        "error": g("error") or "",
+        "recognized_at": g("recognized_at") or "",
+        "confirmed_at": g("confirmed_at") or "",
+        "confirmed_by": g("confirmed_by") or "",
+        "writeback": g("writeback") or "",
+        "file_url": att.get("url", ""),
+        "file_size": att.get("size", 0),
+    }
+
+
+# ---------------- 案件比對 ----------------
+
+def _pdf_case_ref(force=False):
+    """全部「專案細節」案件的比對資料（含已結案的，舊案也可能收到函文）。6 小時更新一次。"""
+    if not force and PDF_CASE_REF["cases"] and time.time() - PDF_CASE_REF["at"] < 6 * 3600:
+        return PDF_CASE_REF["cases"]
+    fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_VENDOR, FIELD_CLOSE_STATUS,
+              FIELD_CASE_SUBMIT_NAME, FIELD_CASE_EPC_PARTY, FIELD_CASE_CONTRACT_NO, FIELD_CASE_TP_ACCEPT_NO,
+              FIELD_CASE_ELEC_NO, FIELD_CASE_TP_CONTRACT_NO, FIELD_CASE_PV_NO, FIELD_CASE_AGREE_NO]
+    records = airtable_get_all(CASE_API_URL, None, fields)
+    cases = []
+    for r in records:
+        f = r.get("fields", {})
+        case_no = (f.get(FIELD_CASE_NO) or "").strip()
+        if not case_no:
+            continue
+        cases.append({
+            "record_id": r["id"],
+            "case_no": case_no,
+            "alias": (f.get(FIELD_ALIAS) or "").strip(),
+            "address": (f.get(FIELD_ADDRESS) or "").strip(),
+            "vendor": f.get(FIELD_VENDOR) or "",
+            "closed": f.get(FIELD_CLOSE_STATUS) or "",
+            "submit_name": (f.get(FIELD_CASE_SUBMIT_NAME) or "").strip(),
+            "epc_party": (f.get(FIELD_CASE_EPC_PARTY) or "").strip(),
+            "ids": {
+                "合約編號": f.get(FIELD_CASE_CONTRACT_NO) or "",
+                "臺電受理編號": f.get(FIELD_CASE_TP_ACCEPT_NO) or "",
+                "電號": f.get(FIELD_CASE_ELEC_NO) or "",
+                "台電契約編號": f.get(FIELD_CASE_TP_CONTRACT_NO) or "",
+                "併聯PV編號": f.get(FIELD_CASE_PV_NO) or "",
+                "同意備案編號": f.get(FIELD_CASE_AGREE_NO) or "",
+            },
+        })
+    # 已公證但還沒建進 Airtable 的案件（業務自治區推送），只有案號／別名可比
+    known = {c["case_no"] for c in cases}
+    for c in CERTIFIED_CASE_CACHE.get("cases") or []:
+        if c["case"] not in known:
+            cases.append({"record_id": "", "case_no": c["case"], "alias": c.get("alias", ""), "address": "",
+                          "vendor": c.get("vendor", ""), "closed": "", "submit_name": "", "epc_party": "", "ids": {}})
+    PDF_CASE_REF["cases"] = cases
+    PDF_CASE_REF["at"] = time.time()
+    return cases
+
+
+_FULLWIDTH = str.maketrans("０１２３４５６７８９－（）", "0123456789-()")
+
+
+def _norm_id(s):
+    return re.sub(r"[^0-9A-Z]", "", (s or "").translate(_FULLWIDTH).upper())
+
+
+def _norm_text(s):
+    s = (s or "").translate(_FULLWIDTH).replace("台", "臺")
+    return re.sub(r"[\s,，、.。:：;；()（）\-]", "", s)
+
+
+# 抽出的識別資料 → 案件欄位
+_PDF_ID_MAP = {
+    "taipower_accept_no": ["臺電受理編號"],
+    "electricity_no": ["電號"],
+    "agree_record_no": ["同意備案編號"],
+    "contract_no": ["台電契約編號", "合約編號"],
+    "pv_no": ["併聯PV編號"],
+}
+
+
+def _pdf_match_cases(ext):
+    """回傳 (候選清單, 強比對案號集合)。強比對＝某個編號精確相同（受理編號、電號…）。"""
+    idents = ext.get("identifiers") or {}
+    scores = {}
+
+    def add(c, pts, why):
+        s = scores.setdefault(c["case_no"], {"case": c, "score": 0, "why": [], "strong": False})
+        s["score"] += pts
+        s["why"].append(why)
+        return s
+
+    cases = _pdf_case_ref()
+    for key, case_fields in _PDF_ID_MAP.items():
+        for raw in idents.get(key) or []:
+            v = _norm_id(raw)
+            if len(v) < 5:
+                continue
+            for c in cases:
+                for cf in case_fields:
+                    cv = _norm_id(c["ids"].get(cf))
+                    if cv and (cv == v or (len(v) >= 8 and (cv in v or v in cv))):
+                        add(c, 100, f"{cf}相同（{raw}）")["strong"] = True
+    for raw in idents.get("case_no_like") or []:
+        v = _norm_text(raw)
+        for c in cases:
+            if v and _norm_text(c["case_no"]) == v:
+                add(c, 80, f"文件內出現案號 {raw}")["strong"] = True
+    for raw in idents.get("addresses") or []:
+        a = _norm_text(raw)
+        if len(a) < 6:
+            continue
+        for c in cases:
+            ca = _norm_text(c["address"])
+            if len(ca) < 6:
+                continue
+            ratio = difflib.SequenceMatcher(None, a, ca).ratio()
+            # 門牌／地號數字是關鍵：數字對不上的只算「相近」，不算相符
+            nums_ok = set(re.findall(r"\d+", ca)) <= set(re.findall(r"\d+", a))
+            if ca in a or a in ca or (ratio >= 0.7 and nums_ok):
+                add(c, 60, f"地址相符（{raw}）")
+            elif ratio >= 0.75:
+                add(c, 15, f"地址相近 {int(ratio * 100)}%（{raw}）")
+    texts = [_norm_text(x) for x in (idents.get("names") or []) + [ext.get("subject") or "", ext.get("recipient") or ""]]
+    texts = [t for t in texts if t]
+    for c in cases:
+        for label, val, pts in (("送件名稱", c["submit_name"], 40), ("別名", c["alias"], 30)):
+            v = _norm_text(val)
+            if len(v) >= 3 and any(v in t for t in texts):
+                add(c, pts, f"{label}「{val}」出現在文件")
+    ranked = sorted(scores.values(), key=lambda s: -s["score"])[:8]
+    strong = {s["case"]["case_no"] for s in ranked if s["strong"]}
+    return ranked, strong
+
+
+# ---------------- Claude 辨識 ----------------
+
+def _anthropic():
+    if _ANTHROPIC_CLIENT["c"] is None:
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise Exception("後端沒有設定 ANTHROPIC_API_KEY（Render → Environment）")
+        import anthropic
+        _ANTHROPIC_CLIENT["c"] = anthropic.Anthropic(max_retries=4, timeout=600)
+    return _ANTHROPIC_CLIENT["c"]
+
+
+def _pdf_system_prompt(settings):
+    lines = []
+    for t in settings.get("doc_types") or []:
+        extra = "；".join(x for x in [t.get("keywords") and f"關鍵字：{t['keywords']}", t.get("note")] if x)
+        lines.append(f"- {t['name']}" + (f"（{extra}）" if extra else ""))
+    return (
+        "你是台灣太陽光電 EPC 公司的公文判讀助理。公司會收到台電、縣市政府、能源署、建管單位等機關的函文"
+        "與文件，需要正確判斷：這份文件屬於哪個案場（案號）、是哪一種函文、發文日期。判讀結果會直接拿來"
+        "幫檔案改名並更新案件進度，所以準確比速度重要：\n"
+        "- 每一個欄位都要以文件上實際印出的文字為依據，看不清楚或文件沒有寫就留空字串，絕對不要猜或編造。\n"
+        "- 發文日期以函文上的「發文日期」為準（不是收文日、不是附件日期、不是契約生效日）。民國年要換算成"
+        "西元（民國年＋1911），輸出 YYYY-MM-DD。沒有發文日期的文件（例如契約書、電費單）用文件上最主要的"
+        "開立／簽訂日期，並在說明中註明。\n"
+        "- 識別資料（台電受理編號、電號、同意備案編號、契約編號、地址、申請人名稱）要完整照抄，包括文件"
+        "附件、說明欄、受文者欄位裡出現的，一份文件可能有多個。\n"
+        "- 函文類型只能從下列清單選，判斷依據是函文主旨與內容，不要只看關鍵字；都不符合就選「其他」：\n"
+        + "\n".join(lines) + "\n- 其他"
+    )
+
+
+def _pdf_doc_type_enum(settings):
+    names = [t["name"] for t in settings.get("doc_types") or [] if t.get("name")]
+    return list(dict.fromkeys(names + ["其他"]))
+
+
+def _pdf_ask(system, pdf_b64, instruction, schema):
+    """PDF 放在最前面並標 cache_control，兩次呼叫（抽取、確認）共用同一份快取。"""
+    client = _anthropic()
+    resp = client.beta.messages.create(
+        model=PDF_MODEL,
+        max_tokens=16000,
+        betas=["server-side-fallback-2026-07-01"],
+        extra_body={"fallbacks": "default"},
+        output_config={"effort": "high", "format": {"type": "json_schema", "schema": schema}},
+        system=system,
+        messages=[{"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": instruction},
+        ]}],
+    )
+    if resp.stop_reason == "refusal":
+        raise Exception("模型拒絕處理這份文件")
+    if resp.stop_reason == "max_tokens":
+        raise Exception("模型輸出被截斷（max_tokens）")
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    return json.loads(text)
+
+
+def _str_list():
+    return {"type": "array", "items": {"type": "string"}}
+
+
+def _pdf_extract(settings, system, pdf_b64):
+    schema = {
+        "type": "object",
+        "properties": {
+            "doc_type": {"type": "string", "enum": _pdf_doc_type_enum(settings)},
+            "doc_type_reason": {"type": "string"},
+            "doc_date": {"type": "string"},
+            "doc_date_raw": {"type": "string"},
+            "doc_number": {"type": "string"},
+            "issuer": {"type": "string"},
+            "recipient": {"type": "string"},
+            "subject": {"type": "string"},
+            "identifiers": {
+                "type": "object",
+                "properties": {k: _str_list() for k in ("taipower_accept_no", "electricity_no", "agree_record_no",
+                                                         "contract_no", "pv_no", "case_no_like", "addresses", "names")},
+                "required": ["taipower_accept_no", "electricity_no", "agree_record_no", "contract_no", "pv_no",
+                             "case_no_like", "addresses", "names"],
+                "additionalProperties": False,
+            },
+            "notes": {"type": "string"},
+        },
+        "required": ["doc_type", "doc_type_reason", "doc_date", "doc_date_raw", "doc_number", "issuer",
+                     "recipient", "subject", "identifiers", "notes"],
+        "additionalProperties": False,
+    }
+    instruction = (
+        "請仔細讀完整份文件（每一頁，包括附件），輸出：函文類型與判斷理由、發文日期（YYYY-MM-DD）與文件上"
+        "原始寫法、發文字號、發文機關、受文者、主旨，以及所有識別資料：台電受理編號(taipower_accept_no)、"
+        "電號(electricity_no)、同意備案編號(agree_record_no)、契約編號(contract_no)、併聯/PV 編號(pv_no)、"
+        "看起來像公司內部案號的字串(case_no_like)、設置地址或地號(addresses)、申請人/發電業者/案場名稱(names)。"
+        "notes 寫下任何不確定或特殊的地方。"
+    )
+    return _pdf_ask(system, pdf_b64, instruction, schema)
+
+
+def _pdf_verify(settings, system, pdf_b64, ext, ranked):
+    cands = [{
+        "案號": s["case"]["case_no"], "別名": s["case"]["alias"], "地址": s["case"]["address"],
+        "送件名稱": s["case"]["submit_name"], "EPC簽約對象": s["case"]["epc_party"],
+        "施作廠商": s["case"]["vendor"], "結案狀態": s["case"]["closed"],
+        **{k: v for k, v in s["case"]["ids"].items() if v},
+        "程式比對依據": s["why"],
+    } for s in ranked]
+    schema = {
+        "type": "object",
+        "properties": {
+            "case_no": {"type": "string"},
+            "case_reason": {"type": "string"},
+            "case_confidence": {"type": "integer"},
+            "doc_type": {"type": "string", "enum": _pdf_doc_type_enum(settings)},
+            "doc_type_confidence": {"type": "integer"},
+            "doc_date": {"type": "string"},
+            "doc_date_confidence": {"type": "integer"},
+            "issues": _str_list(),
+        },
+        "required": ["case_no", "case_reason", "case_confidence", "doc_type", "doc_type_confidence",
+                     "doc_date", "doc_date_confidence", "issues"],
+        "additionalProperties": False,
+    }
+    instruction = (
+        "這是第二次確認。先前一次判讀結果如下（可能有錯）：\n"
+        + json.dumps({k: ext.get(k) for k in ("doc_type", "doc_date", "doc_date_raw", "doc_number", "issuer",
+                                                  "subject", "identifiers")}, ensure_ascii=False)
+        + "\n\n程式依識別資料比對出的候選案件（依分數排序，可能都不對）：\n"
+        + (json.dumps(cands, ensure_ascii=False) if cands else "（沒有任何候選案件）")
+        + "\n\n請重新對照文件原文逐項確認：\n"
+        "1. case_no：只能填上面候選清單裡的案號，或空字串。必須有文件上的具體證據（編號完全相同、地址"
+        "相同、申請人相同）才選，case_reason 寫出對照到的文件文字與案件欄位。證據不足或互相矛盾就留空。\n"
+        "2. doc_type、doc_date（YYYY-MM-DD）：重新看一次文件判斷，不要直接沿用上一次的結果。\n"
+        "3. 每一項給 0–100 的信心分數：100＝文件上清楚明確且與案件資料完全吻合；70＝大致確定但有一點疑慮；"
+        "40 以下＝主要靠推測。\n"
+        "4. issues：列出所有需要人工注意的地方（例如兩個案件都可能、日期模糊、文件不完整、跟上一次判讀不一致）。"
+    )
+    return _pdf_ask(system, pdf_b64, instruction, schema)
+
+
+def _pdf_valid_date(s):
+    try:
+        d = datetime.strptime((s or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    today = datetime.now(TW_TZ).date()
+    if d > today + timedelta(days=3) or d < today - timedelta(days=365 * 8):
+        return None
+    return d
+
+
+def _pdf_build_name(template, case, doc_type, doc_date):
+    d = _pdf_valid_date(doc_date) if doc_date else None
+    vals = {
+        "案號": case.get("case_no", "") if case else "",
+        "別名": case.get("alias", "") if case else "",
+        "函文類型": doc_type or "",
+        "日期": d.strftime("%Y%m%d") if d else "",
+        "西元日期": d.strftime("%Y-%m-%d") if d else "",
+        "民國日期": f"{d.year - 1911:03d}{d.month:02d}{d.day:02d}" if d else "",
+    }
+    name = re.sub(r"\{(\S+?)\}", lambda m: vals.get(m.group(1), m.group(0)), template or PDF_DEFAULT_SETTINGS["template"])
+    name = re.sub(r'[\\/:*?"<>|\r\n]', "", name)
+    name = re.sub(r"_+", "_", name).strip("_ ")
+    return (name or "未命名") + ".pdf"
+
+
+def _pdf_recognize(rec):
+    settings = _pdf_settings()
+    f = rec.get("fields", {})
+    att = (f.get(PDF_F["file"]) or [{}])[0]
+    if not att.get("url"):
+        raise Exception("記錄裡沒有 PDF 檔案")
+    pdf = requests.get(att["url"], timeout=120)
+    pdf.raise_for_status()
+    pdf_b64 = base64.b64encode(pdf.content).decode()
+    system = _pdf_system_prompt(settings)
+
+    ext = _pdf_extract(settings, system, pdf_b64)
+    ranked, strong = _pdf_match_cases(ext)
+    ver = _pdf_verify(settings, system, pdf_b64, ext, ranked)
+
+    issues = list(ver.get("issues") or [])
+    by_no = {s["case"]["case_no"]: s for s in ranked}
+    case_no = (ver.get("case_no") or "").strip()
+    if case_no and case_no not in by_no:
+        issues.append(f"模型選的案號 {case_no} 不在候選清單，已清除")
+        case_no = ""
+    case_conf = int(ver.get("case_confidence") or 0) if case_no else 0
+    if case_no and case_no in strong:
+        case_conf = max(case_conf, 95) if len(strong) == 1 else min(case_conf, 70)
+        if len(strong) > 1:
+            issues.append("多個案件的編號都跟文件吻合：" + "、".join(sorted(strong)))
+    elif case_no and strong:
+        case_conf = min(case_conf, 40)
+        issues.append("模型選的案件跟編號精確比對到的案件不同：" + "、".join(sorted(strong)))
+    elif case_no:
+        case_conf = min(case_conf, 80)   # 沒有任何編號精確吻合，只靠地址／名稱
+    if not case_no:
+        issues.append("無法確定案號，請人工選擇")
+
+    doc_type = ver.get("doc_type") or ext.get("doc_type") or "其他"
+    type_conf = int(ver.get("doc_type_confidence") or 0)
+    if ext.get("doc_type") and ext["doc_type"] != doc_type:
+        type_conf = min(type_conf, 55)
+        issues.append(f"兩次判讀函文類型不一致：{ext['doc_type']} / {doc_type}")
+    if doc_type == "其他":
+        type_conf = min(type_conf, 50)
+        issues.append("函文類型不在規則清單內")
+
+    doc_date = (ver.get("doc_date") or "").strip()
+    date_conf = int(ver.get("doc_date_confidence") or 0)
+    if doc_date and not _pdf_valid_date(doc_date):
+        issues.append(f"發文日期 {doc_date} 格式或範圍不合理，已清除")
+        doc_date = ""
+    if (ext.get("doc_date") or "").strip() and ext["doc_date"].strip() != doc_date:
+        date_conf = min(date_conf, 55)
+        issues.append(f"兩次判讀發文日期不一致：{ext['doc_date']} / {doc_date or '（空）'}")
+    if not doc_date:
+        date_conf = 0
+        issues.append("找不到發文日期")
+
+    confidence = max(0, min(100, min(case_conf, type_conf, date_conf)))
+    case = by_no[case_no]["case"] if case_no else None
+    suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
+    evidence = "\n".join(x for x in [
+        f"案號：{ver.get('case_reason') or '—'}（信心 {case_conf}）",
+        f"函文類型：{ext.get('doc_type_reason') or '—'}（信心 {type_conf}）",
+        f"發文日期：文件寫「{ext.get('doc_date_raw') or '—'}」（信心 {date_conf}）",
+        ext.get("notes") and f"備註：{ext['notes']}",
+    ] if x)
+    result = {
+        "model": PDF_MODEL,
+        "extract": ext,
+        "verify": ver,
+        "issues": issues,
+        "candidates": [{"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
+                        "why": s["why"], "strong": s["strong"]} for s in ranked],
+    }
+    fields = {
+        PDF_F["case_no"]: case_no,
+        PDF_F["alias"]: case["alias"] if case else "",
+        PDF_F["doc_type"]: doc_type,
+        PDF_F["doc_date"]: doc_date or None,
+        PDF_F["doc_number"]: ext.get("doc_number") or "",
+        PDF_F["issuer"]: ext.get("issuer") or "",
+        PDF_F["subject"]: ext.get("subject") or "",
+        PDF_F["suggested"]: suggested,
+        PDF_F["final_name"]: suggested,
+        PDF_F["confidence"]: confidence,
+        PDF_F["evidence"]: evidence,
+        PDF_F["result_json"]: json.dumps(result, ensure_ascii=False)[:95000],
+        PDF_F["error"]: "",
+        PDF_F["recognized_at"]: _tw_now_iso(),
+        PDF_F["status"]: PDF_ST_REVIEW,
+    }
+    auto = (settings.get("auto_confirm") and case_no and doc_date and doc_type != "其他"
+            and confidence >= int(settings.get("auto_confirm_threshold") or 92))
+    if auto:
+        fields[PDF_F["status"]] = PDF_ST_CONFIRMED
+        fields[PDF_F["confirmed_at"]] = _tw_now_iso()
+        fields[PDF_F["confirmed_by"]] = f"自動確認（信心 {confidence}）"
+    _pdf_patch(rec["id"], fields)
+    if auto and settings.get("writeback"):
+        _pdf_writeback(rec["id"], case, doc_type, doc_date)
+    return confidence
+
+
+def _pdf_writeback(record_id, case, doc_type, doc_date):
+    """把發文日期寫回「進度管理」對應里程碑的完成日期。只填空白；已有不同日期就不動、記下來給人看。"""
+    msg = _pdf_writeback_msg(case, doc_type, doc_date)
+    try:
+        _pdf_patch(record_id, {PDF_F["writeback"]: msg})
+    except Exception as e:
+        print(f"[pdf_rename] 寫回結果記錄失敗：{e}", flush=True)
+    return msg
+
+
+def _pdf_writeback_msg(case, doc_type, doc_date):
+    rule = next((t for t in _pdf_settings().get("doc_types") or [] if t.get("name") == doc_type), None)
+    milestone = (rule or {}).get("milestone", "").strip()
+    if not milestone:
+        return "—（此函文類型沒有設定對應里程碑，不寫回）"
+    if not case or not case.get("record_id"):
+        return f"⚠ 案件不在 Airtable 專案細節，無法寫回「{milestone}」"
+    if not doc_date:
+        return "⚠ 沒有發文日期，無法寫回"
+    try:
+        resp = requests.get(f"{CASE_API_URL}/{case['record_id']}", headers=airtable_headers(),
+                            params={"returnFieldsByFieldId": "true"}, timeout=30)
+        resp.raise_for_status()
+        ms_ids = resp.json().get("fields", {}).get(FIELD_MS_LINK_ON_CASE) or []
+        found = []
+        for i in range(0, len(ms_ids), 50):
+            batch = ms_ids[i:i + 50]
+            formula = "AND(OR(" + ",".join(f"RECORD_ID()='{m}'" for m in batch) + \
+                      "),{" + FIELD_MS_TYPE + "}='" + milestone.replace("'", "\\'") + "')"
+            found += airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE])
+        if found:
+            ms_id = found[0]["id"]
+            existing = found[0].get("fields", {}).get(FIELD_MS_ACTUAL_DATE)
+            if existing == doc_date:
+                return f"✓ 進度管理「{milestone}」完成日期已是 {doc_date}"
+            if existing:
+                return f"⚠ 進度管理「{milestone}」已有完成日期 {existing}（文件 {doc_date}），未覆蓋，請人工確認"
+        else:
+            ms_id = ensure_milestone_record(case["record_id"], milestone)
+        r = requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
+                           json={"fields": {FIELD_MS_ACTUAL_DATE: doc_date}}, timeout=30)
+        if r.status_code >= 400:
+            raise Exception(r.text)
+        return f"✓ 已寫入進度管理「{milestone}」完成日期 {doc_date}"
+    except Exception as e:
+        return f"✗ 寫回失敗：{str(e)[:300]}"
+
+
+def _pdf_counts():
+    recs = airtable_get_all(PDF_API_URL, None, [PDF_F["status"]])
+    counts = {}
+    for r in recs:
+        st = r.get("fields", {}).get(PDF_F["status"]) or ""
+        counts[st] = counts.get(st, 0) + 1
+    return counts
+
+
+def pdf_rename_run(force=False):
+    """背景排程每分鐘叫一次；距上次執行超過設定的間隔才真的跑（force＝手動「立即辨識」）。"""
+    settings = _pdf_settings()
+    if not force:
+        if not settings.get("enabled"):
+            return
+        last = PDF_RUN["last_run_at"]
+        if last and time.time() - last < max(1, int(settings.get("interval_min") or 5)) * 60:
+            return
+    # 還沒設 API key 就先不動佇列（不然檔案會被計入失敗次數、最後變成「辨識失敗」）
+    if not AIRTABLE_TOKEN or not os.environ.get("ANTHROPIC_API_KEY"):
+        if force:
+            PDF_RUN["last_error"] = "後端沒有設定 ANTHROPIC_API_KEY（Render → Environment）"
+        return
+    if not PDF_LOCK.acquire(blocking=False):
+        return
+    PDF_RUN.update(running=True, last_run_at=time.time(), last_error=None, last_count=0)
+    try:
+        # 卡在「辨識中」太久（process 被重啟之類）的放回佇列
+        stale = airtable_get_all(PDF_API_URL, "{" + PDF_F["status"] + "}='" + PDF_ST_RUNNING + "'",
+                                 [PDF_F["recognized_at"]])
+        for r in stale:
+            started = r.get("fields", {}).get(PDF_F["recognized_at"]) or ""
+            try:
+                age = datetime.now(TW_TZ) - datetime.fromisoformat(started)
+            except ValueError:
+                age = timedelta(days=1)
+            if age > timedelta(minutes=PDF_STALE_MINUTES):
+                _pdf_patch(r["id"], {PDF_F["status"]: PDF_ST_QUEUED})
+        queued = airtable_get_all(PDF_API_URL, "{" + PDF_F["status"] + "}='" + PDF_ST_QUEUED + "'",
+                                  list(PDF_F.values()))
+        queued.sort(key=lambda r: r.get("createdTime", ""))
+        for rec in queued[:max(1, int(settings.get("batch_size") or 5))]:
+            attempts = int(rec.get("fields", {}).get(PDF_F["attempts"]) or 0) + 1
+            _pdf_patch(rec["id"], {PDF_F["status"]: PDF_ST_RUNNING, PDF_F["attempts"]: attempts,
+                                   PDF_F["recognized_at"]: _tw_now_iso()})
+            try:
+                conf = _pdf_recognize(rec)
+                PDF_RUN["last_count"] += 1
+                print(f"[pdf_rename] {rec['id']} 辨識完成，信心 {conf}", flush=True)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"[:2000]
+                print(f"[pdf_rename] {rec['id']} 第 {attempts} 次辨識失敗：{err}", flush=True)
+                _pdf_patch(rec["id"], {PDF_F["error"]: err,
+                                       PDF_F["status"]: PDF_ST_FAILED if attempts >= PDF_MAX_ATTEMPTS else PDF_ST_QUEUED})
+                PDF_RUN["last_error"] = err
+                if "ANTHROPIC_API_KEY" in err:
+                    break
+    except Exception as e:
+        PDF_RUN["last_error"] = f"{type(e).__name__}: {e}"[:2000]
+        print(f"[pdf_rename] 執行失敗：{PDF_RUN['last_error']}", flush=True)
+    finally:
+        PDF_RUN.update(running=False, last_finished_at=_tw_now_iso())
+        PDF_LOCK.release()
+
+
+def _pdf_run_async():
+    threading.Thread(target=pdf_rename_run, kwargs={"force": True}, daemon=True).start()
+
+
+scheduler.add_job(pdf_rename_run, CronTrigger(minute="*"), id="pdf_rename", replace_existing=True,
+                  max_instances=1, coalesce=True)
+
+
+# ---------------- API ----------------
+
+@app.route("/api/pdf-rename/status")
+def pdf_rename_status():
+    try:
+        counts = _pdf_counts()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    s = _pdf_settings()
+    return jsonify({
+        "counts": counts,
+        "running": PDF_RUN["running"],
+        "last_run_at": datetime.fromtimestamp(PDF_RUN["last_run_at"], TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        if PDF_RUN["last_run_at"] else None,
+        "last_finished_at": PDF_RUN["last_finished_at"],
+        "last_error": PDF_RUN["last_error"],
+        "last_count": PDF_RUN["last_count"],
+        "api_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "model": PDF_MODEL,
+        "settings": s,
+    })
+
+
+@app.route("/api/pdf-rename/items")
+def pdf_rename_items():
+    status = (request.args.get("status") or "").strip()
+    formula = None
+    if status == "active":
+        formula = "{" + PDF_F["status"] + "}!='" + PDF_ST_ARCHIVED + "'"
+    elif status:
+        formula = "{" + PDF_F["status"] + "}='" + status.replace("'", "\\'") + "'"
+    try:
+        recs = airtable_get_all(PDF_API_URL, formula, list(PDF_F.values()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    items = [_pdf_record_to_dict(r) for r in recs]
+    items.sort(key=lambda x: x["uploaded_at"] or "", reverse=True)
+    return jsonify({"items": items})
+
+
+@app.route("/api/pdf-rename/upload", methods=["POST"])
+def pdf_rename_upload():
+    """主控台拖拉上傳，或其他程式（LINE 收件、本機資料夾監看）推送。
+    multipart：files[]（可多份），表單欄位 uploader、source。"""
+    files = request.files.getlist("files") or request.files.getlist("files[]")
+    if not files:
+        return jsonify({"error": "沒有收到檔案"}), 400
+    if len(files) > 30:
+        return jsonify({"error": "一次最多 30 份"}), 400
+    uploader = (request.form.get("uploader") or "").strip()[:50]
+    source = (request.form.get("source") or "主控台上傳").strip()[:50]
+    results = []
+    for fs in files:
+        name = os.path.basename(fs.filename or "未命名.pdf")
+        data = fs.read()
+        if not data.startswith(b"%PDF"):
+            results.append({"name": name, "ok": False, "error": "不是 PDF 檔"})
+            continue
+        if len(data) > PDF_MAX_BYTES:
+            results.append({"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"})
+            continue
+        try:
+            resp = requests.post(PDF_API_URL, headers=airtable_headers(), json={"fields": {
+                PDF_F["src_name"]: name, PDF_F["status"]: PDF_ST_QUEUED, PDF_F["source"]: source,
+                PDF_F["uploader"]: uploader, PDF_F["uploaded_at"]: _tw_now_iso(), PDF_F["attempts"]: 0,
+            }}, timeout=30)
+            if resp.status_code >= 400:
+                raise Exception(resp.text)
+            rid = resp.json()["id"]
+            try:
+                upload_attachment_to_ops_record(rid, PDF_F["file"], base64.b64encode(data).decode(), name,
+                                                content_type="application/pdf")
+            except Exception:
+                requests.delete(f"{PDF_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+                raise
+            results.append({"name": name, "ok": True, "id": rid})
+        except Exception as e:
+            results.append({"name": name, "ok": False, "error": str(e)[:300]})
+    if any(r["ok"] for r in results) and _pdf_settings().get("enabled"):
+        _pdf_run_async()
+    return jsonify({"results": results})
+
+
+@app.route("/api/pdf-rename/run", methods=["POST"])
+def pdf_rename_run_now():
+    if PDF_RUN["running"]:
+        return jsonify({"ok": True, "message": "已經在辨識中"})
+    _pdf_run_async()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pdf-rename/settings", methods=["POST"])
+def pdf_rename_save_settings():
+    body = request.get_json(force=True) or {}
+    s = dict(_pdf_settings())
+    for k in ("enabled", "auto_confirm", "writeback"):
+        if k in body:
+            s[k] = bool(body[k])
+    for k, lo, hi in (("interval_min", 1, 1440), ("batch_size", 1, 30), ("auto_confirm_threshold", 50, 100)):
+        if k in body:
+            try:
+                s[k] = max(lo, min(hi, int(body[k])))
+            except (TypeError, ValueError):
+                return jsonify({"error": f"{k} 必須是數字"}), 400
+    if "template" in body:
+        t = (body.get("template") or "").strip()
+        if not t:
+            return jsonify({"error": "命名格式不能空白"}), 400
+        s["template"] = t
+    if "rules_csv_url" in body:
+        s["rules_csv_url"] = (body.get("rules_csv_url") or "").strip()
+    if "doc_types" in body:
+        types = [{"name": (t.get("name") or "").strip(), "keywords": (t.get("keywords") or "").strip(),
+                  "milestone": (t.get("milestone") or "").strip(), "note": (t.get("note") or "").strip()}
+                 for t in body.get("doc_types") or [] if isinstance(t, dict) and (t.get("name") or "").strip()]
+        if not types:
+            return jsonify({"error": "至少要有一種函文類型"}), 400
+        s["doc_types"] = types
+    if body.get("reload_csv"):
+        if not s.get("rules_csv_url"):
+            return jsonify({"error": "還沒填 Google Sheet CSV 網址"}), 400
+        try:
+            s["doc_types"] = _pdf_load_rules_csv(s["rules_csv_url"])
+        except Exception as e:
+            return jsonify({"error": f"讀取 Google Sheet 失敗：{e}"}), 400
+    try:
+        _pdf_save_settings(s)
+    except Exception as e:
+        return jsonify({"error": f"儲存設定失敗：{e}"}), 502
+    return jsonify({"ok": True, "settings": s})
+
+
+@app.route("/api/pdf-rename/preview-name", methods=["POST"])
+def pdf_rename_preview_name():
+    body = request.get_json(force=True) or {}
+    case_no = (body.get("case_no") or "").strip()
+    case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None) if case_no else None
+    return jsonify({"name": _pdf_build_name(_pdf_settings().get("template"), case or {"case_no": case_no},
+                                            body.get("doc_type") or "", body.get("doc_date") or ""),
+                    "alias": (case or {}).get("alias", ""), "known_case": bool(case)})
+
+
+@app.route("/api/pdf-rename/<record_id>/confirm", methods=["POST"])
+def pdf_rename_confirm(record_id):
+    """人工確認（可同時修改案號／類型／日期／檔名）。"""
+    body = request.get_json(force=True) or {}
+    case_no = (body.get("case_no") or "").strip()
+    doc_type = (body.get("doc_type") or "").strip()
+    doc_date = (body.get("doc_date") or "").strip()
+    final_name = (body.get("final_name") or "").strip()
+    if not case_no or not doc_type or not final_name:
+        return jsonify({"error": "案號、函文類型、檔名都要填"}), 400
+    if doc_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", doc_date):
+        return jsonify({"error": "日期格式要是 YYYY-MM-DD"}), 400
+    if any(c in final_name for c in '\\/:*?"<>|'):
+        return jsonify({"error": '檔名不能含 \\ / : * ? " < > |'}), 400
+    if not final_name.lower().endswith(".pdf"):
+        final_name += ".pdf"
+    try:
+        case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
+        _pdf_patch(record_id, {
+            PDF_F["case_no"]: case_no, PDF_F["alias"]: (case or {}).get("alias", ""),
+            PDF_F["doc_type"]: doc_type, PDF_F["doc_date"]: doc_date or None,
+            PDF_F["final_name"]: final_name, PDF_F["status"]: PDF_ST_CONFIRMED,
+            PDF_F["confirmed_at"]: _tw_now_iso(), PDF_F["confirmed_by"]: (body.get("user") or "主控台").strip()[:50],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    wb = ""
+    if _pdf_settings().get("writeback") and body.get("writeback", True):
+        wb = _pdf_writeback(record_id, case, doc_type, doc_date)
+    return jsonify({"ok": True, "writeback": wb, "final_name": final_name})
+
+
+@app.route("/api/pdf-rename/<record_id>/retry", methods=["POST"])
+def pdf_rename_retry(record_id):
+    try:
+        _pdf_patch(record_id, {PDF_F["status"]: PDF_ST_QUEUED, PDF_F["attempts"]: 0, PDF_F["error"]: ""})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    _pdf_run_async()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pdf-rename/<record_id>/reopen", methods=["POST"])
+def pdf_rename_reopen(record_id):
+    try:
+        _pdf_patch(record_id, {PDF_F["status"]: PDF_ST_REVIEW})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pdf-rename/<record_id>", methods=["DELETE"])
+def pdf_rename_delete(record_id):
+    resp = requests.delete(f"{PDF_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pdf-rename/<record_id>/file")
+def pdf_rename_file(record_id):
+    """用確認檔名（或建議檔名）下載。?inline=1 給預覽用。"""
+    from urllib.parse import quote
+    try:
+        d = _pdf_record_to_dict(_pdf_get_record(record_id))
+        if not d["file_url"]:
+            return jsonify({"error": "沒有檔案"}), 404
+        pdf = requests.get(d["file_url"], timeout=120)
+        pdf.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    name = d["final_name"] or d["suggested_name"] or d["src_name"] or "document.pdf"
+    disp = "inline" if request.args.get("inline") else "attachment"
+    return Response(pdf.content, mimetype="application/pdf", headers={
+        "Content-Disposition": f"{disp}; filename=\"document.pdf\"; filename*=UTF-8''{quote(name)}"})
+
+
+# 本機歸檔程式用：拿已確認待歸檔的清單，歸檔完回報。
+@app.route("/api/pdf-rename/confirmed")
+def pdf_rename_confirmed():
+    try:
+        recs = airtable_get_all(PDF_API_URL, "{" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "'",
+                                list(PDF_F.values()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"items": [_pdf_record_to_dict(r) for r in recs]})
+
+
+@app.route("/api/pdf-rename/<record_id>/archived", methods=["POST"])
+def pdf_rename_archived(record_id):
+    body = request.get_json(force=True) or {}
+    note = (body.get("result") or "").strip()
+    fields = {PDF_F["status"]: PDF_ST_ARCHIVED}
+    if note:
+        try:
+            old = _pdf_get_record(record_id).get("fields", {}).get(PDF_F["writeback"]) or ""
+        except Exception:
+            old = ""
+        fields[PDF_F["writeback"]] = (old + "\n" if old else "") + f"歸檔：{note}"
+    try:
+        _pdf_patch(record_id, fields)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True})
 
 
