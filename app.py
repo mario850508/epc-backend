@@ -925,9 +925,26 @@ def _find_line_binding_record(name):
     return recs[0] if recs else None
 
 
+def _binding_name_candidates(name):
+    """「林嘉偉(Mika)」這種寫法也要對得上只綁「Mika」或「林嘉偉」的人：依序試完整名字、括號內、括號外。"""
+    import re
+    name = (name or "").strip()
+    out = [name] if name else []
+    m = re.match(r"^(.*?)[(（]\s*(.+?)\s*[)）]\s*$", name)
+    if m:
+        for part in (m.group(2).strip(), m.group(1).strip()):
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
 def _get_line_binding(name):
-    rec = _find_line_binding_record(name)
-    return (rec["fields"].get(FIELD_BIND_UID) if rec else None) or None
+    for cand in _binding_name_candidates(name):
+        rec = _find_line_binding_record(cand)
+        uid = (rec["fields"].get(FIELD_BIND_UID) if rec else None) or None
+        if uid:
+            return uid
+    return None
 
 
 def _find_task_by_token(token):
