@@ -83,8 +83,11 @@ Airtable PAT 需要有這個 Base 的 `data.records:read` 和 `data.records:writ
 案件再確認一次並給信心分數）。人工確認（或高信心自動確認）後，可把發文日期寫回「進度
 管理」對應里程碑的完成日期（只填空白）。
 
-**需要新增 Render 環境變數 `ANTHROPIC_API_KEY`**（可選 `PDF_RENAME_MODEL`，預設
-`claude-opus-5-5`）。命名格式、函文類型規則、排程間隔存在「系統狀態」表
+**辨識方式（設定 `engine`）預設是 `free`，完全免費**：電子檔 PDF 直接讀文字層（pypdf），
+掃描檔送到使用者 Google 帳號部署的 Apps Script（Google 雲端硬碟內建 OCR，程式碼在主控台設定畫面
+可以複製），再用規則抓發文日期／字號／主旨／函文類型，並拿每個案件的受理編號、電號、同意備案編號、
+案號直接在全文裡比對。`hybrid`＝免費辨識信心不夠的才交給 Claude；`ai`＝全部用 Claude，這兩種才
+需要 Render 環境變數 `ANTHROPIC_API_KEY`（可選 `PDF_RENAME_MODEL`，預設 `claude-opus-5-5`）。命名格式、函文類型規則、排程間隔存在「系統狀態」表
 `pdf_rename_settings`，在主控台「⚙ 命名格式與函文規則」修改，也可以指定 Google Sheet
 發布的 CSV 網址當規則來源。
 
@@ -95,6 +98,7 @@ Airtable PAT 需要有這個 Base 的 `data.records:read` 和 `data.records:writ
 | POST | `/api/pdf-rename/upload` | multipart `files`（可多份，每份 ≤5MB）、`uploader`、`source` |
 | POST | `/api/pdf-rename/run` | 立即辨識一輪 |
 | POST | `/api/pdf-rename/settings` | 修改設定；`reload_csv: true` 從 Google Sheet 重新載入函文類型 |
+| POST | `/api/pdf-rename/test-ocr` | 測試 Apps Script OCR 網址 |
 | POST | `/api/pdf-rename/preview-name` | 依命名格式產生檔名 |
 | POST | `/api/pdf-rename/<id>/confirm` | 確認（`case_no, doc_type, doc_date, final_name, user`），會寫回進度管理 |
 | POST | `/api/pdf-rename/<id>/retry` · `/reopen` | 重新辨識／改回待確認 |

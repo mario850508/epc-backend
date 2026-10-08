@@ -5898,8 +5898,8 @@ PDF_DEFAULT_DOC_TYPES = [
     {"name": "同意備案", "keywords": "同意備案、再生能源發電設備同意備案", "milestone": "同意備案", "note": "縣市政府或能源署核發"},
     {"name": "細部協商", "keywords": "細部協商、併聯細部協商", "milestone": "細部協商", "note": ""},
     {"name": "免雜", "keywords": "免請領雜項執照、免雜項執照、免雜", "milestone": "免雜", "note": "建管單位核發"},
-    {"name": "購售契約函文", "keywords": "購售電契約、檢送購售電契約", "milestone": "購售契約函文", "note": "台電寄送契約的函文"},
-    {"name": "台電購售契約", "keywords": "再生能源購售電契約書（契約本體）", "milestone": "台電購售契約", "note": "契約書本體"},
+    {"name": "購售契約函文", "keywords": "檢送購售電契約、檢送再生能源購售電契約", "milestone": "購售契約函文", "note": "台電寄送契約的函文（主旨是「檢送」）"},
+    {"name": "台電購售契約", "keywords": "購售電契約書、立契約書人", "milestone": "台電購售契約", "note": "契約書本體"},
     {"name": "併聯試運轉", "keywords": "併聯試運轉", "milestone": "併聯試運轉", "note": ""},
     {"name": "正式售電函", "keywords": "正式購售電、正式售電、躉購費率", "milestone": "正式售電函", "note": ""},
     {"name": "竣工備查", "keywords": "竣工、竣工備查", "milestone": "竣工備查", "note": ""},
@@ -5918,6 +5918,8 @@ PDF_DEFAULT_SETTINGS = {
     "template": "{案號}_{函文類型}_{日期}",
     "doc_types": PDF_DEFAULT_DOC_TYPES,
     "rules_csv_url": "",            # 選填：Google Sheet「發布為 CSV」網址，欄位 函文類型/關鍵字/對應里程碑/說明
+    "engine": "free",               # free＝完全免費（文字層＋Google OCR＋規則）／hybrid＝沒把握的才用 AI／ai＝全部用 AI
+    "ocr_url": "",                  # 掃描檔用：使用者部署的 Apps Script 網址（Google 雲端硬碟 OCR）
 }
 PDF_SETTINGS = {"data": None}
 PDF_RUN = {"running": False, "last_run_at": None, "last_finished_at": None, "last_error": None, "last_count": 0}
@@ -6020,6 +6022,8 @@ def _pdf_record_to_dict(r):
         "evidence": g("evidence") or "",
         "issues": result.get("issues") or [],
         "candidates": result.get("candidates") or [],
+        "engine": result.get("engine") or "",
+        "text_excerpt": result.get("text_excerpt") or "",
         "attempts": g("attempts") or 0,
         "error": g("error") or "",
         "recognized_at": g("recognized_at") or "",
@@ -6098,8 +6102,9 @@ _PDF_ID_MAP = {
 }
 
 
-def _pdf_match_cases(ext):
-    """回傳 (候選清單, 強比對案號集合)。強比對＝某個編號精確相同（受理編號、電號…）。"""
+def _pdf_match_cases(ext, fulltext=None):
+    """回傳 (候選清單, 強比對案號集合)。強比對＝某個編號精確相同（受理編號、電號…）。
+    fulltext（免費辨識用）：另外拿每個案件的編號／案號直接在全文裡找。"""
     idents = ext.get("identifiers") or {}
     scores = {}
 
@@ -6110,6 +6115,8 @@ def _pdf_match_cases(ext):
         return s
 
     cases = _pdf_case_ref()
+    if fulltext:
+        _pdf_scan_fulltext(fulltext, add)
     for key, case_fields in _PDF_ID_MAP.items():
         for raw in idents.get(key) or []:
             v = _norm_id(raw)
@@ -6320,17 +6327,202 @@ def _pdf_build_name(template, case, doc_type, doc_date):
     return (name or "未命名") + ".pdf"
 
 
-def _pdf_recognize(rec):
-    settings = _pdf_settings()
-    f = rec.get("fields", {})
-    att = (f.get(PDF_F["file"]) or [{}])[0]
-    if not att.get("url"):
-        raise Exception("記錄裡沒有 PDF 檔案")
-    pdf = requests.get(att["url"], timeout=120)
-    pdf.raise_for_status()
-    pdf_b64 = base64.b64encode(pdf.content).decode()
-    system = _pdf_system_prompt(settings)
+# ---------------- 免費辨識（2026-10-08 改為預設）----------------
+# 不呼叫付費 AI：電子檔 PDF 直接讀文字層；掃描檔交給使用者 Google 帳號底下的 Apps Script
+# （Google 雲端硬碟內建 OCR，免費）轉文字；再用規則抓發文日期／字號／主旨／函文類型，
+# 並拿 Airtable 每個案件的受理編號、電號、同意備案編號、案號直接在全文裡找，對到就幾乎確定。
+# 設定 engine：free（預設，完全免費）／hybrid（免費辨識沒把握的才交給 AI）／ai（全部用 AI）。
+PDF_MIN_TEXT_CHARS = 40
 
+
+def _pdf_text_layer(pdf_bytes):
+    """電子檔 PDF 的文字層（掃描檔會幾乎抽不到字）。"""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:10])
+    except Exception as e:
+        print(f"[pdf_rename] 讀取文字層失敗：{e}", flush=True)
+        return ""
+
+
+def _pdf_ocr(pdf_bytes, url):
+    """呼叫使用者部署的 Apps Script（Google 雲端硬碟 OCR）。"""
+    resp = requests.post(url, json={"pdf": base64.b64encode(pdf_bytes).decode()}, timeout=300)
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise Exception("OCR 服務回傳的不是 JSON，請確認 Apps Script 部署時「存取權」選「所有人」")
+    if not data.get("ok"):
+        raise Exception("OCR 失敗：" + str(data.get("error") or "未知錯誤"))
+    return data.get("text") or ""
+
+
+def _pdf_get_text(pdf_bytes, settings):
+    text = _pdf_text_layer(pdf_bytes)
+    if len(re.sub(r"\s", "", text)) >= PDF_MIN_TEXT_CHARS:
+        return text, "PDF 文字層"
+    url = (settings.get("ocr_url") or "").strip()
+    if not url:
+        raise Exception("這份是掃描檔（PDF 裡沒有文字），需要先在「⚙ 命名格式與函文規則」設定 Google OCR 網址")
+    return _pdf_ocr(pdf_bytes, url), "Google OCR"
+
+
+def _pdf_flat(text):
+    t = (text or "").translate(_FULLWIDTH)
+    t = t.replace("：", ":").replace("　", " ")
+    return re.sub(r"\s+", "", t)
+
+
+def _pdf_rule_date(flat):
+    """回傳 (YYYY-MM-DD, 文件原文, 信心)。"""
+    pats = [
+        (r"發文日期:?(?:中華民國)?(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 95),
+        (r"發文日期:?(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})", True, 90),
+        (r"中華民國(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 65),
+        (r"(20\d{2})年(\d{1,2})月(\d{1,2})日", False, 55),
+        (r"(?<!\d)(\d{3})年(\d{1,2})月(\d{1,2})日", True, 55),
+    ]
+    for pat, roc, conf in pats:
+        for m in re.finditer(pat, flat):
+            y, mo, d = (int(x) for x in m.groups())
+            if roc:
+                y += 1911
+            iso = f"{y:04d}-{mo:02d}-{d:02d}"
+            if _pdf_valid_date(iso):
+                return iso, m.group(0), conf
+    return "", "", 0
+
+
+def _pdf_rule_doc_type(flat, subject, settings):
+    """依函文規則的關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。"""
+    results = []
+    for t in settings.get("doc_types") or []:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        raw = re.sub(r"[（(][^）)]*[）)]", "", (t.get("keywords") or ""))
+        kws = {k.strip() for k in re.split(r"[、,，;；/\s]+", raw) if len(k.strip()) >= 2}
+        kws.add(name)
+        score, hits = 0, []
+        for k in kws:
+            kf = _pdf_flat(k)
+            if kf and kf in subject:
+                score += 3
+                hits.append(f"主旨有「{k}」")
+            elif kf and kf in flat:
+                score += 1
+                hits.append(f"內文有「{k}」")
+        if score:
+            results.append((score, name, hits))
+    if not results:
+        return "其他", 0, "沒有命中任何函文類型關鍵字"
+    results.sort(key=lambda x: -x[0])
+    best = results[0]
+    second = results[1][0] if len(results) > 1 else 0
+    in_subject = any(h.startswith("主旨") for h in best[2])
+    if in_subject and best[0] - second >= 2:
+        conf = 92
+    elif in_subject and best[0] > second:
+        conf = 75
+    elif best[0] > second:
+        conf = 60
+    else:
+        conf = 40
+    reason = "、".join(best[2][:4])
+    if second and best[0] - second < 2:
+        reason += f"（也可能是：{results[1][1]}）"
+    return best[1], conf, reason
+
+
+def _pdf_rule_extract(text, settings):
+    flat = _pdf_flat(text)
+    m = re.search(r"主旨:(.+?)(?:說明:|辦法:|正本:|附件:|$)", flat)
+    subject = m.group(1)[:300] if m else ""
+    m = re.search(r"發文字號:(.{2,40}?號)", flat)
+    doc_number = m.group(1) if m else ""
+    m = re.search(r"(臺灣電力股份有限公司[一-鿿]{0,12}?(?:區營業處|處|分處|公司)|台灣電力股份有限公司[一-鿿]{0,12}?(?:區營業處|處|分處|公司)"
+                  r"|經濟部能源署|經濟部[一-鿿]{0,6}局|[一-鿿]{2,3}[縣市]政府(?:[一-鿿]{1,6}?(?:局|處))?)", flat)
+    issuer = m.group(1) if m else ""
+    doc_date, date_raw, date_conf = _pdf_rule_date(flat)
+    doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
+    addresses = re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿0-9\-之巷弄段路街村里鄰]{2,30}?號", flat)
+    addresses += re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿]{1,8}段[0-9\-、]{1,30}地號", flat)
+    ext = {
+        "doc_type": doc_type, "doc_type_reason": type_reason, "doc_date": doc_date, "doc_date_raw": date_raw,
+        "doc_number": doc_number, "issuer": issuer, "recipient": "", "subject": subject,
+        "identifiers": {"addresses": list(dict.fromkeys(addresses))[:10], "names": [flat]},
+        "notes": "",
+    }
+    return ext, type_conf, date_conf
+
+
+def _pdf_scan_fulltext(flat, scores_add):
+    """拿每個案件的編號／案號在全文裡找（OCR 可能把 - 或空白弄亂，所以比對前都去掉符號）。"""
+    digits = _norm_id(flat)
+    textn = _norm_text(flat)
+    for c in _pdf_case_ref():
+        for label, val in c["ids"].items():
+            v = _norm_id(val)
+            if len(v) >= 8 and v in digits:
+                scores_add(c, 100, f"{label} {val} 出現在文件")["strong"] = True
+        cn = _norm_text(c["case_no"])
+        if len(cn) >= 4 and cn in textn:
+            scores_add(c, 80, f"文件內出現案號 {c['case_no']}")["strong"] = True
+
+
+def _pdf_free_analyze(text, source, settings):
+    ext, type_conf, date_conf = _pdf_rule_extract(text, settings)
+    ranked, strong = _pdf_match_cases(ext, fulltext=_pdf_flat(text))
+    issues = []
+    case_no, case_conf, case_reason = "", 0, ""
+    if len(strong) == 1:
+        case_no = next(iter(strong))
+        case_conf = 95
+        case_reason = "；".join(next(s["why"] for s in ranked if s["case"]["case_no"] == case_no))
+    elif len(strong) > 1:
+        top = [s for s in ranked if s["strong"]]
+        case_no, case_conf = top[0]["case"]["case_no"], 50
+        case_reason = "；".join(top[0]["why"])
+        issues.append("多個案件的編號都出現在文件：" + "、".join(sorted(strong)))
+    elif ranked:
+        top = ranked[0]
+        second = ranked[1]["score"] if len(ranked) > 1 else 0
+        case_no = top["case"]["case_no"]
+        case_reason = "；".join(top["why"])
+        case_conf = 75 if top["score"] >= 60 and top["score"] - second >= 30 else 40
+        issues.append("文件裡找不到案件編號，案號是用地址／名稱推測的，請確認")
+    else:
+        issues.append("無法確定案號，請人工選擇")
+    if ext["doc_type"] == "其他":
+        issues.append("函文類型沒有命中規則關鍵字，請人工選擇（也可以到規則裡補關鍵字）")
+    elif type_conf < 75:
+        issues.append(f"函文類型不太確定：{ext['doc_type_reason']}")
+    if not ext["doc_date"]:
+        issues.append("找不到發文日期")
+    elif date_conf < 90:
+        issues.append(f"沒有找到「發文日期」欄位，日期取自文件中的「{ext['doc_date_raw']}」，請確認")
+    case = next((s["case"] for s in ranked if s["case"]["case_no"] == case_no), None)
+    evidence = "\n".join([
+        f"文字來源：{source}",
+        f"案號：{case_reason or '—'}（信心 {case_conf}）",
+        f"函文類型：{ext['doc_type_reason']}（信心 {type_conf}）",
+        f"發文日期：文件寫「{ext['doc_date_raw'] or '—'}」（信心 {date_conf}）",
+    ])
+    ext_store = dict(ext, identifiers={"addresses": ext["identifiers"]["addresses"]})
+    return {
+        "case": case, "case_no": case_no, "doc_type": ext["doc_type"], "doc_date": ext["doc_date"],
+        "doc_number": ext["doc_number"], "issuer": ext["issuer"], "subject": ext["subject"],
+        "confidence": max(0, min(case_conf, type_conf, date_conf)), "evidence": evidence, "issues": issues,
+        "ranked": ranked,
+        "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:4000]},
+    }
+
+
+def _pdf_ai_analyze(pdf_bytes, settings):
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    system = _pdf_system_prompt(settings)
     ext = _pdf_extract(settings, system, pdf_b64)
     ranked, strong = _pdf_match_cases(ext)
     ver = _pdf_verify(settings, system, pdf_b64, ext, ranked)
@@ -6375,42 +6567,77 @@ def _pdf_recognize(rec):
         date_conf = 0
         issues.append("找不到發文日期")
 
-    confidence = max(0, min(100, min(case_conf, type_conf, date_conf)))
-    case = by_no[case_no]["case"] if case_no else None
-    suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
     evidence = "\n".join(x for x in [
+        "文字來源：AI 讀 PDF",
         f"案號：{ver.get('case_reason') or '—'}（信心 {case_conf}）",
         f"函文類型：{ext.get('doc_type_reason') or '—'}（信心 {type_conf}）",
         f"發文日期：文件寫「{ext.get('doc_date_raw') or '—'}」（信心 {date_conf}）",
         ext.get("notes") and f"備註：{ext['notes']}",
     ] if x)
-    result = {
-        "model": PDF_MODEL,
-        "extract": ext,
-        "verify": ver,
-        "issues": issues,
-        "candidates": [{"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
-                        "why": s["why"], "strong": s["strong"]} for s in ranked],
+    return {
+        "case": by_no[case_no]["case"] if case_no else None, "case_no": case_no, "doc_type": doc_type,
+        "doc_date": doc_date, "doc_number": ext.get("doc_number") or "", "issuer": ext.get("issuer") or "",
+        "subject": ext.get("subject") or "",
+        "confidence": max(0, min(100, min(case_conf, type_conf, date_conf))), "evidence": evidence,
+        "issues": issues, "ranked": ranked,
+        "result": {"engine": "ai", "model": PDF_MODEL, "extract": ext, "verify": ver},
     }
+
+
+def _pdf_engine(settings):
+    eng = settings.get("engine") or "free"
+    return eng if eng in ("free", "hybrid", "ai") else "free"
+
+
+def _pdf_recognize(rec):
+    settings = _pdf_settings()
+    f = rec.get("fields", {})
+    att = (f.get(PDF_F["file"]) or [{}])[0]
+    if not att.get("url"):
+        raise Exception("記錄裡沒有 PDF 檔案")
+    pdf = requests.get(att["url"], timeout=120)
+    pdf.raise_for_status()
+
+    engine = _pdf_engine(settings)
+    threshold = int(settings.get("auto_confirm_threshold") or 92)
+    if engine == "ai":
+        out = _pdf_ai_analyze(pdf.content, settings)
+    else:
+        try:
+            text, source = _pdf_get_text(pdf.content, settings)
+            out = _pdf_free_analyze(text, source, settings)
+        except Exception:
+            if engine != "hybrid" or not os.environ.get("ANTHROPIC_API_KEY"):
+                raise
+            out = None
+        if engine == "hybrid" and os.environ.get("ANTHROPIC_API_KEY") and (out is None or out["confidence"] < threshold):
+            out = _pdf_ai_analyze(pdf.content, settings)
+
+    case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
+    confidence = out["confidence"]
+    suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
+    result = dict(out["result"], issues=out["issues"], candidates=[
+        {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
+         "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
     fields = {
         PDF_F["case_no"]: case_no,
         PDF_F["alias"]: case["alias"] if case else "",
         PDF_F["doc_type"]: doc_type,
         PDF_F["doc_date"]: doc_date or None,
-        PDF_F["doc_number"]: ext.get("doc_number") or "",
-        PDF_F["issuer"]: ext.get("issuer") or "",
-        PDF_F["subject"]: ext.get("subject") or "",
+        PDF_F["doc_number"]: out["doc_number"],
+        PDF_F["issuer"]: out["issuer"],
+        PDF_F["subject"]: out["subject"],
         PDF_F["suggested"]: suggested,
         PDF_F["final_name"]: suggested,
         PDF_F["confidence"]: confidence,
-        PDF_F["evidence"]: evidence,
+        PDF_F["evidence"]: out["evidence"],
         PDF_F["result_json"]: json.dumps(result, ensure_ascii=False)[:95000],
         PDF_F["error"]: "",
         PDF_F["recognized_at"]: _tw_now_iso(),
         PDF_F["status"]: PDF_ST_REVIEW,
     }
     auto = (settings.get("auto_confirm") and case_no and doc_date and doc_type != "其他"
-            and confidence >= int(settings.get("auto_confirm_threshold") or 92))
+            and confidence >= threshold)
     if auto:
         fields[PDF_F["status"]] = PDF_ST_CONFIRMED
         fields[PDF_F["confirmed_at"]] = _tw_now_iso()
@@ -6488,7 +6715,7 @@ def pdf_rename_run(force=False):
         if last and time.time() - last < max(1, int(settings.get("interval_min") or 5)) * 60:
             return
     # 還沒設 API key 就先不動佇列（不然檔案會被計入失敗次數、最後變成「辨識失敗」）
-    if not AIRTABLE_TOKEN or not os.environ.get("ANTHROPIC_API_KEY"):
+    if not AIRTABLE_TOKEN or (_pdf_engine(settings) == "ai" and not os.environ.get("ANTHROPIC_API_KEY")):
         if force:
             PDF_RUN["last_error"] = "後端沒有設定 ANTHROPIC_API_KEY（Render → Environment）"
         return
@@ -6524,7 +6751,7 @@ def pdf_rename_run(force=False):
                 _pdf_patch(rec["id"], {PDF_F["error"]: err,
                                        PDF_F["status"]: PDF_ST_FAILED if attempts >= PDF_MAX_ATTEMPTS else PDF_ST_QUEUED})
                 PDF_RUN["last_error"] = err
-                if "ANTHROPIC_API_KEY" in err:
+                if "ANTHROPIC_API_KEY" in err or "Google OCR 網址" in err:
                     break
     except Exception as e:
         PDF_RUN["last_error"] = f"{type(e).__name__}: {e}"[:2000]
@@ -6653,6 +6880,15 @@ def pdf_rename_save_settings():
         s["template"] = t
     if "rules_csv_url" in body:
         s["rules_csv_url"] = (body.get("rules_csv_url") or "").strip()
+    if "engine" in body:
+        if body["engine"] not in ("free", "hybrid", "ai"):
+            return jsonify({"error": "engine 只能是 free／hybrid／ai"}), 400
+        s["engine"] = body["engine"]
+    if "ocr_url" in body:
+        u = (body.get("ocr_url") or "").strip()
+        if u and not u.startswith("https://script.google.com/"):
+            return jsonify({"error": "OCR 網址應該是 https://script.google.com/ 開頭的 Apps Script 網址"}), 400
+        s["ocr_url"] = u
     if "doc_types" in body:
         types = [{"name": (t.get("name") or "").strip(), "keywords": (t.get("keywords") or "").strip(),
                   "milestone": (t.get("milestone") or "").strip(), "note": (t.get("note") or "").strip()}
@@ -6672,6 +6908,22 @@ def pdf_rename_save_settings():
     except Exception as e:
         return jsonify({"error": f"儲存設定失敗：{e}"}), 502
     return jsonify({"ok": True, "settings": s})
+
+
+@app.route("/api/pdf-rename/test-ocr", methods=["POST"])
+def pdf_rename_test_ocr():
+    """測試 Apps Script OCR 網址能不能連（Apps Script 的 doGet 會回 {ok: true}）。"""
+    url = ((request.get_json(force=True) or {}).get("ocr_url") or _pdf_settings().get("ocr_url") or "").strip()
+    if not url:
+        return jsonify({"error": "還沒填 OCR 網址"}), 400
+    try:
+        resp = requests.get(url, timeout=60)
+        data = resp.json()
+    except Exception as e:
+        return jsonify({"error": f"連不到，或回傳的不是 JSON（部署時「存取權」要選「所有人」）：{str(e)[:200]}"}), 400
+    if not data.get("ok"):
+        return jsonify({"error": str(data.get("error") or data)[:300]}), 400
+    return jsonify({"ok": True, "message": data.get("message") or "連線成功"})
 
 
 @app.route("/api/pdf-rename/preview-name", methods=["POST"])
