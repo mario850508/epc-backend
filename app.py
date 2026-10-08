@@ -383,6 +383,10 @@ FIELD_SLOT_TYPE = "fldxwQTU9dB1aDPqX"        # 項目類型(多選)：掛表／�
 FIELD_SLOT_REGISTRANT = "fldgzpUmVlN51Abf6"  # 登記人
 FIELD_SLOT_NOTE = "fld0l1iExfCns0iNa"        # 備註
 FIELD_SLOT_OWNER_NAME = "fld3ljzB0bpzQzaXL"  # 屋主姓名，2026-10-01 新增
+# 2026-10-08：「通知廠商」——PM 確認屋主資料後，用 LIFF shareTargetPicker 把卡片轉發到廠商群組
+FIELD_SLOT_VENDOR_TOKEN = "fldny0M5w7oBVr14z"     # 廠商通知Token
+FIELD_SLOT_PM_NOTE = "flddfOVk2OdqMElSm"          # 給廠商備註
+FIELD_SLOT_VENDOR_NOTIFIED = "fldCC1k8KciTDtK61"  # 廠商通知時間（ISO 字串）
 FIELD_SLOT_OWNER_PHONE = "fldT1YrJY2Rp8L33S"  # 屋主電話，2026-10-01 新增
 SLOT_KIND_WINDOW = "開放時段"
 SLOT_KIND_BOOKING = "已預約"
@@ -467,6 +471,7 @@ def list_vendor_slots():
             FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START,
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
             FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
+            FIELD_SLOT_VENDOR_NOTIFIED,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
@@ -490,6 +495,7 @@ def list_vendor_slots():
                 "note": f.get(FIELD_SLOT_NOTE, ""),
                 "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
                 "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""),
+                "vendor_notified_at": f.get(FIELD_SLOT_VENDOR_NOTIFIED, ""),
             })
             bookings.append(item)
         else:
@@ -1599,6 +1605,120 @@ def vendor_slot_task_owner_link(record_id):
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we, "assignee": task["assignee"], "status": task["status"],
     })
+
+
+# ===================================================================
+# 2026-10-08：通知廠商。主控台「完成安排」每筆預約按「📤 通知廠商」→ PM 確認屋主聯絡資料
+# （預設帶公證書/合約上的資料）→ 產生 LIFF 分享連結 → PM 用手機 LINE 開啟、用
+# shareTargetPicker 選廠商群組，把卡片以 PM 本人身分傳進群組（機器人不需要在群組裡、
+# 也不需要 groupId）。傳送完成後回寫「廠商通知時間」。
+# 需要在 LINE Developers「陽光填單」channel 的 LIFF 頁打開 shareTargetPicker。
+# ===================================================================
+def _get_booking(record_id):
+    resp = requests.get(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(),
+                        params={"returnFieldsByFieldId": "true"}, timeout=20)
+    return resp.json() if resp.status_code < 400 else None
+
+
+def _vendor_notice_card(rec):
+    from urllib.parse import quote
+    f = rec.get("fields", {})
+    case_no = f.get(FIELD_SLOT_CASE_NO, "")
+    address = ""
+    if case_no:
+        try:
+            esc = case_no.replace("'", chr(92) + "'")
+            recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_ADDRESS])
+            address = " ".join((recs[0]["fields"].get(FIELD_ADDRESS) or "").split()) if recs else ""
+        except Exception as e:
+            print(f"[_vendor_notice_card] 查地址失敗：{e}", flush=True)
+    rep_name = f.get(FIELD_SLOT_REGISTRANT, "")
+    try:
+        trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + rec["id"] + "'", [FIELD_TASK_ASSIGNEE])
+        if trs and trs[0]["fields"].get(FIELD_TASK_ASSIGNEE):
+            rep_name = trs[0]["fields"][FIELD_TASK_ASSIGNEE]
+    except Exception:
+        pass
+    date = f.get(FIELD_SLOT_DATE, "")
+    return _card(
+        "📋 施工排程通知｜給廠商", "#2563EB", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
+        rows=[("廠商", f.get(FIELD_SLOT_VENDOR, "")), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])),
+              ("時間", f"{_wd_label(date)} {f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"),
+              ("地址", address),
+              ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
+              ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
+              ("陽光備註", (f.get(FIELD_SLOT_PM_NOTE) or "").strip())],
+        button=("📍 開啟地圖", "https://www.google.com/maps/search/?api=1&query=" + quote(address)) if address else None,
+    )
+
+
+def _card_alt(card):
+    return (card["tag"] + "：" + card["title"] + "｜" + "｜".join(f"{k}{v}" for k, v in (card.get("rows") or []) if v not in (None, "")))[:390]
+
+
+@app.route("/api/vendor-slots/<record_id>/vendor-notice", methods=["POST"])
+def vendor_slot_vendor_notice(record_id):
+    """存屋主聯絡資料（＋給廠商備註），產生 LIFF 分享連結。body: {owner_name, owner_phone, pm_note}"""
+    body = request.get_json(force=True) or {}
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    f = rec.get("fields", {})
+    token = f.get(FIELD_SLOT_VENDOR_TOKEN) or secrets.token_urlsafe(16)
+    patch = {
+        FIELD_SLOT_OWNER_NAME: (body.get("owner_name") or "").strip()[:40],
+        FIELD_SLOT_OWNER_PHONE: (body.get("owner_phone") or "").strip()[:40],
+        FIELD_SLOT_PM_NOTE: (body.get("pm_note") or "").strip()[:500],
+        FIELD_SLOT_VENDOR_TOKEN: token,
+    }
+    resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    rec = resp.json()
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    return jsonify({
+        "ok": True,
+        "liff_url": f"https://liff.line.me/{liff_id}?vshare={token}" if liff_id else "",
+        "plain_text": _card_plain_text(_vendor_notice_card(rec)),
+    })
+
+
+def _find_booking_by_vendor_token(token):
+    token = (token or "").strip()
+    if len(token) < 10:
+        return None
+    esc = token.replace("'", chr(92) + "'")
+    recs = airtable_get_all(SLOT_API_URL, "{" + FIELD_SLOT_VENDOR_TOKEN + "}='" + esc + "'", [FIELD_SLOT_VENDOR_TOKEN])
+    return _get_booking(recs[0]["id"]) if recs else None
+
+
+@app.route("/api/vendor-share/<token>")
+def vendor_share_get(token):
+    try:
+        rec = _find_booking_by_vendor_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not rec:
+        return jsonify({"error": "找不到這則廠商通知，可能已失效，請回主控台重新產生"}), 404
+    card = _vendor_notice_card(rec)
+    return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card),
+                    "sent_at": rec.get("fields", {}).get(FIELD_SLOT_VENDOR_NOTIFIED, "")})
+
+
+@app.route("/api/vendor-share/<token>/sent", methods=["POST"])
+def vendor_share_sent(token):
+    try:
+        rec = _find_booking_by_vendor_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not rec:
+        return jsonify({"error": "找不到這則廠商通知"}), 404
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    resp = requests.patch(f"{SLOT_API_URL}/{rec['id']}", headers=airtable_headers(),
+                          json={"fields": {FIELD_SLOT_VENDOR_NOTIFIED: now}}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True, "sent_at": now})
 
 
 @app.route("/api/site-survey-cancelled-sync", methods=["POST"])
