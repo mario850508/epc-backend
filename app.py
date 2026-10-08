@@ -390,6 +390,9 @@ FIELD_SLOT_VENDOR_NOTIFIED = "fldCC1k8KciTDtK61"  # 廠商通知時間（ISO 字
 FIELD_SLOT_OWNER_PHONE = "fldT1YrJY2Rp8L33S"  # 屋主電話，2026-10-01 新增
 SLOT_KIND_WINDOW = "開放時段"
 SLOT_KIND_BOOKING = "已預約"
+SLOT_KIND_CANCELLED = "已取消"   # 2026-10-08：取消的預約保留紀錄，但不再佔時段
+FIELD_SLOT_CANCEL_REASON = "fld75wrXrUpPZUbzZ"   # 取消原因
+FIELD_SLOT_CANCELLED_AT = "fldYfmiei6CcseaqB"    # 取消時間（ISO）
 SLOT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{SLOT_TABLE_ID}"
 
 # ---- 廠商時段任務（2026-10-01 新增，「廠商時段協調」的延伸）----
@@ -440,6 +443,7 @@ FIELD_TASK_OWNER_WIN_END = "fldZM3kKE3GWpyvvK"    # 屋主可選時段結束 HH:
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
+TASK_STATUS_CANCELLED = "已取消"   # 2026-10-08：窗口取消預約、且不重新約
 TASK_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{TASK_TABLE_ID}"
 
 
@@ -472,12 +476,12 @@ def list_vendor_slots():
             FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START,
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
             FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
-            FIELD_SLOT_VENDOR_NOTIFIED,
+            FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_CANCEL_REASON, FIELD_SLOT_CANCELLED_AT,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-    windows, bookings = [], []
+    windows, bookings, cancelled = [], [], []
     for r in records:
         f = r["fields"]
         item = {
@@ -485,7 +489,17 @@ def list_vendor_slots():
             "vendor": f.get(FIELD_SLOT_VENDOR),
             "date": f.get(FIELD_SLOT_DATE),
         }
-        if f.get(FIELD_SLOT_KIND) == SLOT_KIND_BOOKING:
+        if f.get(FIELD_SLOT_KIND) == SLOT_KIND_CANCELLED:
+            item.update({
+                "start_time": f.get(FIELD_SLOT_START), "end_time": f.get(FIELD_SLOT_END),
+                "case": f.get(FIELD_SLOT_CASE_NO, ""), "alias": f.get(FIELD_SLOT_ALIAS, ""),
+                "type": f.get(FIELD_SLOT_TYPE) or [], "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
+                "note": f.get(FIELD_SLOT_NOTE, ""), "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
+                "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""), "cancelled": True,
+                "cancel_reason": f.get(FIELD_SLOT_CANCEL_REASON, ""), "cancelled_at": f.get(FIELD_SLOT_CANCELLED_AT, ""),
+            })
+            cancelled.append(item)
+        elif f.get(FIELD_SLOT_KIND) == SLOT_KIND_BOOKING:
             item.update({
                 "start_time": f.get(FIELD_SLOT_START),
                 "end_time": f.get(FIELD_SLOT_END),
@@ -504,7 +518,8 @@ def list_vendor_slots():
             windows.append(item)
     windows.sort(key=lambda w: (w.get("date") or "", w.get("vendor") or ""))
     bookings.sort(key=lambda b: (b.get("date") or "", b.get("start_time") or ""))
-    return jsonify({"windows": windows, "bookings": bookings})
+    cancelled.sort(key=lambda b: (b.get("date") or "", b.get("start_time") or ""))
+    return jsonify({"windows": windows, "bookings": bookings, "cancelled": cancelled})
 
 
 @app.route("/api/vendor-slots/windows", methods=["POST"])
@@ -684,6 +699,119 @@ def _sync_booking_to_case_dates(case_no, slot_type, date):
                 if c["record_id"] == rid:
                     c["planned_date"] = date
                     break
+
+
+def _revert_case_dates(case_no, slot_type, date):
+    """取消預約時，把當初自動寫回的預計日期清掉（只清「還是這一天」的，避免蓋掉之後手動改過的日期）。"""
+    types = set(slot_type or [])
+    if not case_no:
+        return
+    esc = case_no.replace("\\", "\\\\").replace("'", "\\'")
+    if types & {"掛表", "植筋", "進場"}:
+        recs = airtable_get_all(CASE_API_URL, f"{{{FIELD_CASE_NO}}}='{esc}'", [FIELD_CASE_NO])
+        if recs:
+            case_record_id = recs[0]["id"]
+            existing = app_data_find_case_row(case_record_id)
+            if existing:
+                ef = existing.get("fields", {})
+                patch = {}
+                if "掛表" in types and ef.get("預計掛表日期") == date:
+                    patch["預計掛表日期"] = None
+                if "植筋" in types and ef.get("植筋日期") == date:
+                    patch["植筋日期"] = None
+                if patch:
+                    app_data_update(existing["id"], patch)
+            if "進場" in types:
+                ms_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_ENTRY)
+                ms = requests.get(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
+                                  params={"returnFieldsByFieldId": "true"}, timeout=20)
+                if ms.status_code < 400 and ms.json().get("fields", {}).get(FIELD_MS_ACTUAL_DATE) == date:
+                    requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
+                                   json={"fields": {FIELD_MS_ACTUAL_DATE: None}}, timeout=20)
+                    threading.Thread(target=refresh_cache, daemon=True).start()
+    if "場勘" in types:
+        recs = airtable_get_all(SURVEY_API_URL, f"{{{SURVEY_FIELD_CASE_NO}}}='{esc}'", [SURVEY_FIELD_CASE_NO, SURVEY_FIELD_PLANNED_DATE])
+        if recs and recs[0]["fields"].get(SURVEY_FIELD_PLANNED_DATE) == date:
+            rid = recs[0]["id"]
+            requests.patch(f"{SURVEY_API_URL}/{rid}", headers=airtable_headers(),
+                           json={"fields": {SURVEY_FIELD_PLANNED_DATE: None}}, timeout=20)
+            for c in SURVEY_CACHE["cases"]:
+                if c["record_id"] == rid:
+                    c["planned_date"] = None
+                    break
+
+
+@app.route("/api/vendor-slots/<record_id>/cancel", methods=["POST"])
+def cancel_vendor_slot_booking(record_id):
+    """2026-10-08：窗口取消一筆預約（例如發現還不能進場）。
+    - 預約改成「已取消」（保留紀錄，但不再佔廠商時段）
+    - 當初自動寫回的預計日期清掉（還是這一天的才清）
+    - 任務：reopen=true 退回「待業務安排」之後重新約；否則標「已取消」（業務／屋主連結都不能再約）
+    - 通知業務（LINE 卡片附「複製給屋主的取消訊息」按鈕），API 也回傳這段訊息讓窗口自己轉傳
+    body: {reason, reopen, notify}"""
+    body = request.get_json(force=True) or {}
+    reason = (body.get("reason") or "").strip()[:300]
+    reopen = bool(body.get("reopen"))
+    notify = body.get("notify", True) is not False
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    f = rec.get("fields", {})
+    if f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "這筆已經不是有效的預約（可能已經取消過）"}), 409
+    case_no = f.get(FIELD_SLOT_CASE_NO, "")
+    types = f.get(FIELD_SLOT_TYPE) or []
+    date, start, end = f.get(FIELD_SLOT_DATE, ""), f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, "")
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": {
+        FIELD_SLOT_KIND: SLOT_KIND_CANCELLED, FIELD_SLOT_CANCEL_REASON: reason, FIELD_SLOT_CANCELLED_AT: now,
+    }}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    try:
+        _revert_case_dates(case_no, types, date)
+    except Exception as e:
+        print(f"[cancel_vendor_slot_booking] 清除預計日期失敗（預約已取消）：{e}", flush=True)
+    task = None
+    try:
+        trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + record_id + "'", _task_fields())
+        if trs:
+            task = _task_to_dict(trs[0])
+            if reopen:
+                _patch_task(task["record_id"], {
+                    FIELD_TASK_STATUS: TASK_STATUS_PENDING, FIELD_TASK_BOOKING_ID: "", FIELD_TASK_STAGE: None,
+                    FIELD_TASK_ALT_SLOTS: "", FIELD_TASK_CHOSEN_SLOT: "", FIELD_TASK_REMINDED: False, FIELD_TASK_DEADLINE: None,
+                })
+            else:
+                _patch_task(task["record_id"], {FIELD_TASK_STATUS: TASK_STATUS_CANCELLED})
+    except Exception as e:
+        print(f"[cancel_vendor_slot_booking] 更新任務失敗（預約已取消）：{e}", flush=True)
+    registrant = (f.get(FIELD_SLOT_REGISTRANT) or "").strip()
+    rep_name = (task and task.get("assignee")) or ("" if registrant.startswith("屋主") else registrant)
+    owner_name = (f.get(FIELD_SLOT_OWNER_NAME) or "").strip()
+    owner_phone = (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip()
+    items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in types)
+    msg = (f"{owner_name or '屋主'} 您好，原本約在 {_wd_label(date)} {start}–{end} 的「{items}」，"
+           f"因為{reason or '施工安排需要調整'}，這次行程先取消，造成您的不便很抱歉。"
+           + ("我們會再跟您約新的時間。" if reopen else "後續安排會再跟您聯絡。")
+           + ("\n—陽光伏特家 " + rep_name if rep_name else "\n—陽光伏特家"))
+    rep_ok = False
+    if notify and rep_name:
+        dial = "".join(c for c in owner_phone if c.isdigit() or c == "+")
+        buttons = [("📋 複製給屋主的取消訊息", {"clipboard": msg})]
+        if len(dial) >= 8:
+            buttons.append(("📞 撥號給屋主", "tel:" + dial))
+        rep_ok = _push_to_name(rep_name, _card(
+            "❌ 預約已取消｜給業務", "#DC2626", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
+            subtitle=f"{rep_name} 您好",
+            rows=[("項目", "、".join(types)), ("廠商", f.get(FIELD_SLOT_VENDOR, "")),
+                  ("原訂時間", f"{_wd_label(date)} {start}-{end}"), ("屋主", _owner_str(owner_name, owner_phone)),
+                  ("取消原因", reason), ("後續", "會再重新約時間" if reopen else "")],
+            note="請通知屋主這次行程取消：按下方「複製給屋主的取消訊息」貼給屋主，或直接打電話",
+            buttons=buttons,
+        ))
+    return jsonify({"ok": True, "owner_message": msg, "rep_name": rep_name, "rep_notified": rep_ok,
+                    "vendor_was_notified": bool(f.get(FIELD_SLOT_VENDOR_NOTIFIED)), "reopened": reopen})
 
 
 @app.route("/api/vendor-slots/<record_id>/detail")
@@ -1088,6 +1216,8 @@ def book_vendor_slot_task(token):
     if not r:
         return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個任務已經完成預約了，如果要改時間請聯絡窗口處理"}), 409
 
@@ -1177,6 +1307,8 @@ def propose_vendor_slot_alternatives(token):
     if not r:
         return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個任務已經完成預約了"}), 409
     body = request.get_json(force=True)
@@ -1304,6 +1436,8 @@ def confirm_vendor_slot_chosen(token):
     if not r:
         return jsonify({"error": "找不到這個連結對應的任務，可能已經被刪除"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個任務已經完成預約了"}), 409
     chosen = task["chosen_slot"]
@@ -1452,7 +1586,9 @@ def owner_booking_get(otoken):
     task = _task_to_dict(r)
     ws, we = _owner_window(task)
     stage = task["stage"]
-    if task["status"] == TASK_STATUS_DONE:
+    if task["status"] == TASK_STATUS_CANCELLED:
+        status = "cancelled"
+    elif task["status"] == TASK_STATUS_DONE:
         status = "done"
     elif stage == TASK_STAGE_WAIT_PM:
         status = "wait_pm"
@@ -1501,6 +1637,8 @@ def owner_booking_book(otoken):
     if not r:
         return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
     body = request.get_json(force=True) or {}
@@ -1546,6 +1684,8 @@ def owner_booking_propose(otoken):
     if not r:
         return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
     body = request.get_json(force=True) or {}
@@ -1597,6 +1737,8 @@ def owner_booking_confirm(otoken):
     if not r:
         return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
     task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個預約已經完成了"}), 409
     chosen = task["chosen_slot"]
