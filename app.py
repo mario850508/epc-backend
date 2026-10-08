@@ -6809,7 +6809,7 @@ def pdf_rename_items():
     formula = None
     if status == "active":
         formula = "{" + PDF_F["status"] + "}!='" + PDF_ST_ARCHIVED + "'"
-    elif status:
+    elif status and status != "all":
         formula = "{" + PDF_F["status"] + "}='" + status.replace("'", "\\'") + "'"
     try:
         recs = airtable_get_all(PDF_API_URL, formula, list(PDF_F.values()))
