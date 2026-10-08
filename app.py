@@ -1217,9 +1217,21 @@ def choose_vendor_slot_alternative(record_id):
         return jsonify({"error": "這個任務目前沒有待選擇的備選時段"}), 409
     body = request.get_json(force=True)
     try:
-        slot = task["alt_slots"][int(body.get("index"))]
+        slot = dict(task["alt_slots"][int(body.get("index"))])
     except Exception:
         return jsonify({"error": "選的備選時段不存在"}), 400
+    # 2026-10-08：屋主版只給日期，窗口選的時候補開始時間（結束時間＝開始＋作業時長，也可直接帶 end_time）
+    if body.get("start_time"):
+        try:
+            st = _parse_hhmm(body["start_time"])
+            et = _parse_hhmm(body["end_time"]) if body.get("end_time") else st + _owner_duration(task)
+        except Exception:
+            return jsonify({"error": "時間格式不對，要像 09:00"}), 400
+        if et <= st:
+            return jsonify({"error": "結束時間要晚於開始時間"}), 400
+        slot["start_time"], slot["end_time"] = f"{st // 60:02d}:{st % 60:02d}", f"{et // 60:02d}:{et % 60:02d}"
+    if not slot.get("start_time") or not slot.get("end_time"):
+        return jsonify({"error": "這個備選只有日期，請先填開始時間"}), 400
     try:
         conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"])
     except Exception as e:
@@ -1502,18 +1514,21 @@ def owner_booking_propose(otoken):
     if err_msg:
         return jsonify({"error": err_msg}), 400
     slots, seen = [], set()
+    # 2026-10-08：屋主只選「哪幾天方便」，不選時間；窗口跟廠商確認後選一天並決定時間
     for sl in (body.get("slots") or [])[:10]:
         if not isinstance(sl, dict):
             continue
-        slot, err_msg = _owner_slot_from_start(task, (sl.get("date") or "").strip(), sl.get("start_time"))
-        if err_msg:
-            return jsonify({"error": err_msg}), 400
-        key = (slot["date"], slot["start_time"])
-        if key not in seen:
-            seen.add(key)
-            slots.append(slot)
+        d = (sl.get("date") or "").strip()
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            return jsonify({"error": "日期格式不正確"}), 400
+        if d not in seen:
+            seen.add(d)
+            slots.append({"date": d, "start_time": "", "end_time": ""})
+    slots.sort(key=lambda x: x["date"])
     if not slots:
-        return jsonify({"error": "請至少填一組您方便的日期和時間"}), 400
+        return jsonify({"error": "請至少選一天您方便的日期"}), 400
     note = (body.get("note") or "").strip()[:300]
     try:
         _patch_task(r["id"], {
@@ -1524,12 +1539,12 @@ def owner_booking_propose(otoken):
         })
     except Exception as e:
         return jsonify({"error": "送出失敗，請稍後再試", "detail": str(e)}), 502
-    slot_lines = "\n".join(f"{i + 1}. {_wd_label(sl['date'])} {sl['start_time']}-{sl['end_time']}" for i, sl in enumerate(slots))
+    slot_lines = "\n".join(f"{i + 1}. {_wd_label(sl['date'])}" for i, sl in enumerate(slots))
     _notify_owner_action(
-        task, "🏠 屋主提供其他時間｜給安排人員", "🏠 屋主提供其他時間｜給業務", "#D97706",
+        task, "🏠 屋主提供其他日期｜給安排人員", "🏠 屋主提供其他日期｜給業務", "#D97706",
         [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
-         (f"屋主方便的時間（{len(slots)} 組）", slot_lines), ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
-        note_rep="窗口跟廠商確認後會選一個時間，屋主可以在同一個連結按確認",
+         (f"屋主方便的日期（{len(slots)} 天）", slot_lines), ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+        note_rep="窗口跟廠商確認後會選一天並決定時間，屋主可以在同一個連結按確認",
     )
     return jsonify({"ok": True, "slots": slots})
 
