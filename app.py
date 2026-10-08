@@ -1648,8 +1648,25 @@ def _vendor_notice_card(rec):
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
               ("陽光備註", (f.get(FIELD_SLOT_PM_NOTE) or "").strip())],
-        button=("📍 開啟地圖", "https://www.google.com/maps/search/?api=1&query=" + quote(address)) if address else None,
+        buttons=_vendor_card_buttons(f, address),
     )
+
+
+def _vendor_card_buttons(f, address):
+    """給廠商卡片的按鈕：撥號給屋主（tel:，手機會直接帶號碼到撥號畫面）、開啟地圖、複製屋主資料。"""
+    from urllib.parse import quote
+    name = (f.get(FIELD_SLOT_OWNER_NAME) or "").strip()
+    phone = (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip()
+    dial = "".join(c for c in phone if c.isdigit() or c == "+")
+    buttons = []
+    if len(dial) >= 8:
+        buttons.append(("📞 撥號給屋主", "tel:" + dial))
+    if address:
+        buttons.append(("📍 開啟地圖", "https://www.google.com/maps/search/?api=1&query=" + quote(address)))
+    copy_lines = [x for x in [f"屋主：{_owner_str(name, phone)}" if (name or phone) else "", f"地址：{address}" if address else ""] if x]
+    if copy_lines:
+        buttons.append(("📋 複製屋主資料", {"clipboard": "\n".join(copy_lines)}))
+    return buttons
 
 
 def _card_alt(card):
@@ -4086,9 +4103,9 @@ def _wd_label(date_str):
         return date_str or ""
 
 
-def _card(tag, color, title, subtitle="", rows=None, sections=None, note="", button=None, footer=""):
+def _card(tag, color, title, subtitle="", rows=None, sections=None, note="", button=None, footer="", buttons=None):
     return {"tag": tag, "color": color, "title": title, "subtitle": subtitle, "rows": rows or [],
-            "sections": sections or [], "note": note, "button": button, "footer": footer}
+            "sections": sections or [], "note": note, "button": button, "footer": footer, "buttons": buttons or []}
 
 
 def _card_to_flex(card):
@@ -4116,10 +4133,21 @@ def _card_to_flex(card):
         "body": {"type": "box", "layout": "vertical", "paddingAll": "14px", "contents": contents},
     }
     footer = []
+    buttons = list(card.get("buttons") or [])
     if card.get("button"):
-        label, uri = card["button"]
-        footer.append({"type": "button", "style": "primary", "color": card["color"], "height": "sm",
-                       "action": {"type": "uri", "label": label, "uri": uri}})
+        buttons.insert(0, card["button"])
+    for i, (label, target) in enumerate(buttons):
+        if isinstance(target, dict) and "clipboard" in target:
+            # LINE 卡片上的文字不能直接複製，用「複製」按鈕把內容放進剪貼簿
+            action = {"type": "clipboard", "label": label, "clipboardText": target["clipboard"][:1000]}
+        else:
+            action = {"type": "uri", "label": label, "uri": target}
+        btn = {"type": "button", "height": "sm", "action": action, "margin": "sm" if i else "none"}
+        if i == 0:
+            btn.update({"style": "primary", "color": card["color"]})
+        else:
+            btn.update({"style": "secondary"})
+        footer.append(btn)
     if card.get("footer"):
         footer.append({"type": "text", "text": card["footer"], "size": "xs", "color": "#6B7280", "wrap": True, "margin": "md"})
     if footer:
