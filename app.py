@@ -6346,14 +6346,25 @@ def _pdf_text_layer(pdf_bytes):
         return ""
 
 
+PDF_OCR_LOGIN_HINT = ("Google 要求登入，代表 Apps Script 的存取權不是真正的「所有人」。公司 Workspace 帳號"
+                      "（網址有 /a/macros/公司網域/）通常只能選「公司內的所有人」，請改用個人 Gmail 帳號部署，"
+                      "或請公司 Google 管理員開放外部存取")
+
+
+def _pdf_ocr_json(resp):
+    """Apps Script 回應轉 JSON；被導到 Google 登入頁時給明確的原因。"""
+    if "accounts.google.com" in resp.url or "ServiceLogin" in resp.text[:5000]:
+        raise Exception(PDF_OCR_LOGIN_HINT)
+    try:
+        return resp.json()
+    except ValueError:
+        raise Exception("OCR 服務回傳的不是 JSON（HTTP %s），請確認部署時選「網頁應用程式」、存取權「所有人」" % resp.status_code)
+
+
 def _pdf_ocr(pdf_bytes, url):
     """呼叫使用者部署的 Apps Script（Google 雲端硬碟 OCR）。"""
     resp = requests.post(url, json={"pdf": base64.b64encode(pdf_bytes).decode()}, timeout=300)
-    resp.raise_for_status()
-    try:
-        data = resp.json()
-    except ValueError:
-        raise Exception("OCR 服務回傳的不是 JSON，請確認 Apps Script 部署時「存取權」選「所有人」")
+    data = _pdf_ocr_json(resp)
     if not data.get("ok"):
         raise Exception("OCR 失敗：" + str(data.get("error") or "未知錯誤"))
     return data.get("text") or ""
@@ -6916,11 +6927,13 @@ def pdf_rename_test_ocr():
     url = ((request.get_json(force=True) or {}).get("ocr_url") or _pdf_settings().get("ocr_url") or "").strip()
     if not url:
         return jsonify({"error": "還沒填 OCR 網址"}), 400
+    if "/a/macros/" in url:
+        return jsonify({"error": PDF_OCR_LOGIN_HINT}), 400
     try:
         resp = requests.get(url, timeout=60)
-        data = resp.json()
+        data = _pdf_ocr_json(resp)
     except Exception as e:
-        return jsonify({"error": f"連不到，或回傳的不是 JSON（部署時「存取權」要選「所有人」）：{str(e)[:200]}"}), 400
+        return jsonify({"error": f"連線失敗：{str(e)[:300]}"}), 400
     if not data.get("ok"):
         return jsonify({"error": str(data.get("error") or data)[:300]}), 400
     return jsonify({"ok": True, "message": data.get("message") or "連線成功"})
