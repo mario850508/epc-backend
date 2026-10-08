@@ -1360,6 +1360,24 @@ def _valid_hhmm(raw, default):
         return default
 
 
+def _case_address(case_no):
+    """案件地址：Airtable 案件表優先，沒有的話用場勘快取裡的地址。"""
+    case_no = (case_no or "").strip()
+    if not case_no:
+        return ""
+    try:
+        esc = case_no.replace("'", chr(92) + "'")
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_ADDRESS])
+        if recs and recs[0]["fields"].get(FIELD_ADDRESS):
+            return " ".join(recs[0]["fields"][FIELD_ADDRESS].split())
+    except Exception as e:
+        print(f"[_case_address] 查地址失敗：{e}", flush=True)
+    for c in SURVEY_CACHE.get("cases") or []:
+        if c.get("case") == case_no and c.get("address"):
+            return " ".join(c["address"].split())
+    return ""
+
+
 def _owner_find_task(otoken):
     otoken = (otoken or "").strip()
     if len(otoken) < 10:
@@ -1448,6 +1466,8 @@ def owner_booking_get(otoken):
         "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we,
         "rep_name": task["assignee"],
+        # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
+        "address": _case_address(task["case"]),
         "status": status,
         "chosen_slot": task["chosen_slot"] if status == "wait_confirm" else None,
         "proposed": task["alt_slots"] if status == "wait_pm" else [],
