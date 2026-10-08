@@ -1674,7 +1674,7 @@ def vendor_slot_vendor_notice(record_id):
     resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
-    rec = resp.json()
+    rec = _get_booking(record_id) or rec   # PATCH 的回傳用欄位名稱當 key，重新用欄位 ID 讀一次
     liff_id = os.environ.get("LIFF_ID", "").strip()
     return jsonify({
         "ok": True,
