@@ -6487,7 +6487,12 @@ def pdf_rename_run(force=False):
         last = PDF_RUN["last_run_at"]
         if last and time.time() - last < max(1, int(settings.get("interval_min") or 5)) * 60:
             return
-    if not AIRTABLE_TOKEN or not PDF_LOCK.acquire(blocking=False):
+    # 還沒設 API key 就先不動佇列（不然檔案會被計入失敗次數、最後變成「辨識失敗」）
+    if not AIRTABLE_TOKEN or not os.environ.get("ANTHROPIC_API_KEY"):
+        if force:
+            PDF_RUN["last_error"] = "後端沒有設定 ANTHROPIC_API_KEY（Render → Environment）"
+        return
+    if not PDF_LOCK.acquire(blocking=False):
         return
     PDF_RUN.update(running=True, last_run_at=time.time(), last_error=None, last_count=0)
     try:
