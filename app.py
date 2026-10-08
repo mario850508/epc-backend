@@ -786,6 +786,20 @@ def cancel_vendor_slot_booking(record_id):
                 _patch_task(task["record_id"], {FIELD_TASK_STATUS: TASK_STATUS_CANCELLED})
     except Exception as e:
         print(f"[cancel_vendor_slot_booking] 更新任務失敗（預約已取消）：{e}", flush=True)
+    notice = _cancel_notice(rec, task, reason, reopen)
+    rep_ok = _push_to_name(notice["rep_name"], notice["rep_card"]) if (notify and notice["rep_name"]) else False
+    sched_ok = _send_cancel_to_scheduler(notice, task)
+    return jsonify({"ok": True, "owner_message": notice["msg"], "rep_name": notice["rep_name"], "rep_notified": rep_ok,
+                    "scheduler_notified": sched_ok,
+                    "vendor_was_notified": bool(f.get(FIELD_SLOT_VENDOR_NOTIFIED)), "reopened": reopen})
+
+
+def _cancel_notice(rec, task, reason, reopen):
+    """組取消通知：給屋主的訊息、給業務的卡片、給安排人員的卡片。"""
+    f = rec.get("fields", {})
+    case_no = f.get(FIELD_SLOT_CASE_NO, "")
+    types = f.get(FIELD_SLOT_TYPE) or []
+    date, start, end = f.get(FIELD_SLOT_DATE, ""), f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, "")
     registrant = (f.get(FIELD_SLOT_REGISTRANT) or "").strip()
     rep_name = (task and task.get("assignee")) or ("" if registrant.startswith("屋主") else registrant)
     owner_name = (f.get(FIELD_SLOT_OWNER_NAME) or "").strip()
@@ -795,23 +809,62 @@ def cancel_vendor_slot_booking(record_id):
            f"因為{reason or '施工安排需要調整'}，這次行程先取消，造成您的不便很抱歉。"
            + ("我們會再跟您約新的時間。" if reopen else "後續安排會再跟您聯絡。")
            + ("\n—陽光伏特家 " + rep_name if rep_name else "\n—陽光伏特家"))
-    rep_ok = False
-    if notify and rep_name:
-        dial = "".join(c for c in owner_phone if c.isdigit() or c == "+")
-        buttons = [("📋 複製給屋主的取消訊息", {"clipboard": msg})]
-        if len(dial) >= 8:
-            buttons.append(("📞 撥號給屋主", "tel:" + dial))
-        rep_ok = _push_to_name(rep_name, _card(
-            "❌ 預約已取消｜給業務", "#DC2626", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
-            subtitle=f"{rep_name} 您好",
-            rows=[("項目", "、".join(types)), ("廠商", f.get(FIELD_SLOT_VENDOR, "")),
-                  ("原訂時間", f"{_wd_label(date)} {start}-{end}"), ("屋主", _owner_str(owner_name, owner_phone)),
-                  ("取消原因", reason), ("後續", "會再重新約時間" if reopen else "")],
-            note="請通知屋主這次行程取消：按下方「複製給屋主的取消訊息」貼給屋主，或直接打電話",
-            buttons=buttons,
-        ))
-    return jsonify({"ok": True, "owner_message": msg, "rep_name": rep_name, "rep_notified": rep_ok,
-                    "vendor_was_notified": bool(f.get(FIELD_SLOT_VENDOR_NOTIFIED)), "reopened": reopen})
+    dial = "".join(c for c in owner_phone if c.isdigit() or c == "+")
+    buttons = [("📋 複製給屋主的取消訊息", {"clipboard": msg})]
+    if len(dial) >= 8:
+        buttons.append(("📞 撥號給屋主", "tel:" + dial))
+    title = f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip()
+    rows = [("項目", "、".join(types)), ("廠商", f.get(FIELD_SLOT_VENDOR, "")),
+            ("原訂時間", f"{_wd_label(date)} {start}-{end}"), ("屋主", _owner_str(owner_name, owner_phone)),
+            ("取消原因", reason), ("後續", "會再重新約時間" if reopen else "")]
+    rep_card = _card("❌ 預約已取消｜給業務", "#DC2626", title, subtitle=f"{rep_name} 您好" if rep_name else "",
+                     rows=rows, note="請通知屋主這次行程取消：按下方「複製給屋主的取消訊息」貼給屋主，或直接打電話",
+                     buttons=buttons)
+    sched_card = _card("❌ 預約已取消｜給安排人員", "#DC2626", title, rows=[("業務", rep_name)] + rows,
+                       note="如果業務沒通知到屋主，可以按下方按鈕複製取消訊息自己傳",
+                       buttons=buttons + [("開啟主控台", _dash_url() + "/")])
+    return {"msg": msg, "rep_name": rep_name, "rep_card": rep_card, "sched_card": sched_card}
+
+
+def _send_cancel_to_scheduler(notice, task):
+    """取消通知也發給安排人員（任務建立人）；沒有建立人（例如 PM 直接預約的）就發給預設對象（許家豪）。"""
+    creator = ((task or {}).get("creator") or "").strip()
+    try:
+        if creator:
+            return _push_to_name(creator, notice["sched_card"])
+        ok, _ = _line_push_card(notice["sched_card"])
+        return ok
+    except Exception as e:
+        print(f"[_send_cancel_to_scheduler] 推播失敗：{e}", flush=True)
+        return False
+
+
+@app.route("/api/vendor-slots/<record_id>/cancel-notice", methods=["POST"])
+def resend_cancel_notice(record_id):
+    """重新發送已取消預約的通知。body: {targets: ["scheduler", "rep"]}（預設只發安排人員）"""
+    body = request.get_json(force=True) or {}
+    targets = body.get("targets") or ["scheduler"]
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    f = rec.get("fields", {})
+    if f.get(FIELD_SLOT_KIND) != SLOT_KIND_CANCELLED:
+        return jsonify({"error": "這筆不是已取消的預約"}), 409
+    task = None
+    try:
+        trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + record_id + "'", _task_fields())
+        if trs:
+            task = _task_to_dict(trs[0])
+    except Exception:
+        pass
+    reopen = bool(task and task.get("status") == TASK_STATUS_PENDING)
+    notice = _cancel_notice(rec, task, (f.get(FIELD_SLOT_CANCEL_REASON) or "").strip(), reopen)
+    out = {"ok": True}
+    if "scheduler" in targets:
+        out["scheduler_notified"] = _send_cancel_to_scheduler(notice, task)
+    if "rep" in targets and notice["rep_name"]:
+        out["rep_notified"] = _push_to_name(notice["rep_name"], notice["rep_card"])
+    return jsonify(out)
 
 
 @app.route("/api/vendor-slots/<record_id>/detail")
