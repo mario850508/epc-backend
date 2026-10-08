@@ -119,16 +119,31 @@ def flat(text):
 
 # ---------------- 收集 ----------------
 
-def find_targets(root):
-    """找出所有 03/04/06/07 資料夾，回傳 (分類, 案場資料夾, 區域, 資料夾路徑)。"""
-    for dirpath, dirnames, _ in os.walk(root):
-        for d in list(dirnames):
-            m = CATEGORY_RE.match(d.strip())
-            if m:
-                case_dir = os.path.basename(dirpath)
-                region = os.path.basename(os.path.dirname(dirpath))
-                yield CATEGORY_NAMES[m.group(1)], case_dir, region, os.path.join(dirpath, d)
-                dirnames.remove(d)  # 分類資料夾底下自己處理，不再往下找
+def find_targets(root, max_depth=5):
+    """找出所有 03/04/06/07 資料夾，回傳 (分類, 案場資料夾, 區域, 資料夾路徑)。
+    雲端硬碟每打開一個資料夾都要連網路，所以一找到「案場」（底下有 03/04/06/07 的資料夾）
+    就只進這幾個分類，案場裡其他資料夾（施工照片、空拍…動輒上千個檔案）完全不打開。"""
+    queue = [(root, 0)]
+    scanned = 0
+    while queue:
+        path, depth = queue.pop(0)
+        try:
+            subdirs = sorted(e.name for e in os.scandir(path) if e.is_dir())
+        except OSError as e:
+            log(f"  讀不到資料夾，略過：{path}（{e}）")
+            continue
+        scanned += 1
+        if scanned % 20 == 0:
+            log(f"  已掃描 {scanned} 個資料夾…（目前：{os.path.basename(path)}）")
+        cats = [(d, CATEGORY_RE.match(d.strip())) for d in subdirs]
+        cats = [(d, m) for d, m in cats if m]
+        if cats:  # 這是案場資料夾
+            region = os.path.basename(os.path.dirname(path))
+            for d, m in cats:
+                yield CATEGORY_NAMES[m.group(1)], os.path.basename(path), region, os.path.join(path, d)
+            continue
+        if depth < max_depth:
+            queue.extend((os.path.join(path, d), depth + 1) for d in subdirs)
 
 
 def collect(args, out_dir):
@@ -145,10 +160,14 @@ def collect(args, out_dir):
     log(f"已快取 {len(cache)} 份，開始掃描資料夾（雲端硬碟第一次讀取會比較慢）…")
 
     files = []
+    n_folders = 0
     for cat, case_dir, region, folder in find_targets(args.root):
+        n_folders += 1
         for dirpath, _, fnames in os.walk(folder):
             for fn in fnames:
                 files.append((cat, case_dir, region, os.path.join(dirpath, fn), fn))
+        if n_folders % 20 == 0:
+            log(f"  已找到 {n_folders} 個分類資料夾、{len(files)} 個檔案…")
     log(f"找到 {len(files)} 個檔案（含非 PDF）")
 
     ocr_url = args.ocr_url
