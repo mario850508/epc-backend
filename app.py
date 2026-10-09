@@ -1775,6 +1775,28 @@ def _owner_find_task(otoken):
     return recs[0] if recs else None
 
 
+# 2026-10-10：「進場」施工要 3～5 天，不是幾小時。屋主頁只選「進場日期」（不選時間），
+# 預約記錄佔那天的整個可選時段（預設 09:00–17:00），顯示「預計施工 3～5 天」。
+OWNER_MULTIDAY_LABEL = {"進場": "3～5 天"}
+
+
+def _owner_date_only(task):
+    return any(t in OWNER_MULTIDAY_LABEL for t in (task.get("type") or []))
+
+
+def _owner_multiday_label(task):
+    for t in task.get("type") or []:
+        if t in OWNER_MULTIDAY_LABEL:
+            return OWNER_MULTIDAY_LABEL[t]
+    return ""
+
+
+def _owner_time_text(task, date, start, end):
+    if _owner_date_only(task):
+        return f"{_wd_label(date)}（預計施工 {_owner_multiday_label(task)}）"
+    return f"{_wd_label(date)} {start}-{end}"
+
+
 def _owner_duration(task):
     return task.get("duration_min") or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in task.get("type") or []) or 60
 
@@ -1854,6 +1876,8 @@ def owner_booking_get(otoken):
         "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
         "candidate_dates": task["candidate_dates"],
         "duration_min": _owner_duration(task),
+        "date_only": _owner_date_only(task),
+        "duration_label": _owner_multiday_label(task),
         "window_start": ws, "window_end": we,
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
@@ -1899,16 +1923,21 @@ def owner_booking_book(otoken):
     date = (body.get("date") or "").strip()
     if date not in task["candidate_dates"]:
         return jsonify({"error": "請從頁面上的日期裡選一天"}), 400
-    slot, err_msg = _owner_slot_from_start(task, date, body.get("start_time"))
-    if err_msg:
-        return jsonify({"error": err_msg}), 400
+    if _owner_date_only(task):
+        ws, we = _owner_window(task)
+        slot = {"date": date, "start_time": ws, "end_time": we}
+    else:
+        slot, err_msg = _owner_slot_from_start(task, date, body.get("start_time"))
+        if err_msg:
+            return jsonify({"error": err_msg}), 400
     name, phone, err_msg = _owner_contact(body)
     if err_msg:
         return jsonify({"error": err_msg}), 400
     note = (body.get("note") or "").strip()[:300]
+    db_note = note + (("　" if note else "") + f"［預計施工 {_owner_multiday_label(task)}］" if _owner_date_only(task) else "")
     record, err = _book_vendor_slot(
         task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
-        f"屋主 {name}", note, owner_name=name, owner_phone=phone,
+        f"屋主 {name}", db_note, owner_name=name, owner_phone=phone,
     )
     if err:
         err_body, status = err
@@ -1922,7 +1951,7 @@ def owner_booking_book(otoken):
     _notify_owner_action(
         task, "🏠 屋主已自行預約｜給安排人員", "🏠 屋主已自行預約｜給業務", "#16A34A",
         [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
-         ("時間", f"{_wd_label(date)} {slot['start_time']}-{slot['end_time']}"),
+         ("時間", _owner_time_text(task, date, slot['start_time'], slot['end_time'])),
          ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
         note_rep="屋主已經自己選好時間，前一天請記得再跟屋主確認",
     )
@@ -2019,7 +2048,7 @@ def owner_booking_confirm(otoken):
     _notify_owner_action(
         task, "🏠 屋主已確認時間｜給安排人員", "🏠 屋主已確認時間｜給業務", "#16A34A",
         [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
-         ("時間", f"{_wd_label(chosen['date'])} {chosen['start_time']}-{chosen['end_time']}"),
+         ("時間", _owner_time_text(task, chosen['date'], chosen['start_time'], chosen['end_time'])),
          ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
         note_rep="屋主已確認時間，前一天請記得再跟屋主確認",
     )
