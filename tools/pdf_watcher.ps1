@@ -4,6 +4,8 @@
 跑在每位 PM 自己的電腦上（Windows 內建 PowerShell，不用另外安裝）：
   每分鐘到主控台讀「這位 PM 的 LINE 收件資料夾」設定，資料夾（含子資料夾）裡有新的 PDF，
   就送到主控台的辨識佇列；同一份內容重複下載不會重複辨識（後端比對檔案雜湊）。
+  若主控台指定這台電腦負責「自動歸檔」，也會把「已確認」的檔案用確認檔名放進
+  「案場資料夾 → 03/04/06/07」，同名檔案不覆蓋。
   電腦關機期間下載的檔案，下次開機會自動補送。每分鐘回報一次狀態，主控台看得到。
 
 安裝（只要一次，會設定成開機自動在背景執行，不會跳視窗）：
@@ -20,7 +22,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.0"
+$Version = "1.1"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -156,7 +158,95 @@ $firstRun = -not (Test-Path -LiteralPath $SeenPath)
 $saved = Read-JsonFile $SeenPath
 if ($saved) { foreach ($p in $saved.PSObject.Properties) { $seen[$p.Name] = [string]$p.Value } }
 
-$stats = @{ uploaded_total = 0; skipped = 0; last_error = ""; last_upload = "" }
+$stats = @{ uploaded_total = 0; skipped = 0; last_error = ""; last_upload = "";
+            archived_total = 0; last_archive = ""; archive_error = ""; case_folders = 0 }
+
+# ---------------- 自動歸檔 ----------------
+$caseIndex = @{}          # 案號 → 案場資料夾完整路徑
+$caseIndexAt = [datetime]::MinValue
+$archiveFailedAt = @{}    # 記錄 id → 上次失敗時間（失敗的 30 分鐘後再試）
+
+function Update-CaseIndex([string[]]$roots) {
+    # 根目錄往下最多 4 層找「001 潤特桃園1號_…」這種案場資料夾（名稱開頭是編號＋案號）
+    $idx = @{}
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $queue = New-Object System.Collections.Queue
+        $queue.Enqueue(@($root, 0))
+        while ($queue.Count -gt 0) {
+            $item = $queue.Dequeue(); $dir = $item[0]; $depth = $item[1]
+            $subs = @(Get-ChildItem -LiteralPath $dir -Directory -ErrorAction SilentlyContinue)
+            foreach ($d in $subs) {
+                if ($d.Name -match '^\s*\d+\s*[-_.、 ]?\s*([^\s_（(]+?號)') {
+                    if (-not $idx.ContainsKey($Matches[1])) { $idx[$Matches[1]] = $d.FullName }
+                } elseif ($depth -lt 3) {
+                    $queue.Enqueue(@($d.FullName, ($depth + 1)))
+                }
+            }
+        }
+    }
+    return $idx
+}
+
+function Invoke-Archive($arc) {
+    $roots = @($arc.roots)
+    if ($roots.Count -eq 0) { $stats.archive_error = "主控台還沒設定案場資料夾根目錄"; return }
+    if (((Get-Date) - $script:caseIndexAt).TotalMinutes -gt 30 -or $script:caseIndex.Count -eq 0) {
+        $script:caseIndex = Update-CaseIndex $roots
+        $script:caseIndexAt = Get-Date
+        $stats.case_folders = $script:caseIndex.Count
+        Write-Log "案場資料夾索引：找到 $($script:caseIndex.Count) 個案場"
+    }
+    $items = @((Invoke-Api "GET" "/api/pdf-rename/confirmed").items)
+    $stats.archive_error = ""
+    foreach ($it in $items) {
+        if ($script:archiveFailedAt.ContainsKey($it.id) -and ((Get-Date) - $script:archiveFailedAt[$it.id]).TotalMinutes -lt 30) { continue }
+        $fail = ""
+        $target = ""
+        $caseDir = $script:caseIndex[[string]$it.case_no]
+        if (-not $it.case_no) { $fail = "沒有案號" }
+        elseif (-not $caseDir) {
+            # 可能是新案場，重新整理一次索引再找
+            $script:caseIndex = Update-CaseIndex $roots; $script:caseIndexAt = Get-Date
+            $caseDir = $script:caseIndex[[string]$it.case_no]
+            if (-not $caseDir) { $fail = "在根目錄底下找不到案場資料夾「$($it.case_no)」" }
+        }
+        if (-not $fail) {
+            $cat = [string]$it.category
+            if (-not $cat) { $fail = "文件類型「$($it.doc_type)」沒有設定要放哪個分類資料夾（03/04/06/07）" }
+            else {
+                $n = [int]$cat
+                $sub = @(Get-ChildItem -LiteralPath $caseDir -Directory -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match ('^\s*0?' + $n + '(\D|$)') }) | Select-Object -First 1
+                if (-not $sub) { $fail = "案場資料夾裡找不到「$cat」開頭的分類資料夾：$caseDir" }
+                else { $target = Join-Path $sub.FullName ([string]$it.final_name) }
+            }
+        }
+        if (-not $fail -and (Test-Path -LiteralPath $target)) {
+            $fail = "資料夾裡已經有同名檔案（不覆蓋，請手動處理）：$target"
+        }
+        if (-not $fail) {
+            $tmp = Join-Path $AppDir ("dl_" + $it.id + ".pdf")
+            try {
+                Invoke-WebRequest -Uri ($Backend + "/api/pdf-rename/" + $it.id + "/file") -OutFile $tmp -TimeoutSec 300 -UseBasicParsing
+                [IO.File]::Move($tmp, $target)   # 不用 Move-Item：檔名有 [ ] 會被當成萬用字元
+                Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archived") @{ ok = $true; result = "已放到 $target（$env:COMPUTERNAME）" } | Out-Null
+                $stats.archived_total++
+                $stats.last_archive = $target
+                Write-Log "已歸檔：$target"
+            } catch {
+                $fail = "下載或搬移失敗：" + (Get-ErrorText $_)
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        if ($fail) {
+            $script:archiveFailedAt[$it.id] = Get-Date
+            $stats.archive_error = $fail
+            Write-Log "歸檔失敗（$($it.final_name)）：$fail"
+            try { Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archived") @{ ok = $false; result = $fail } | Out-Null } catch { }
+        }
+    }
+}
 Write-Log "背景程式啟動（v$Version，PM：$Pm）"
 
 while ($true) {
@@ -225,6 +315,12 @@ while ($true) {
             }
             $stats.last_error = $errorThisRound
         }
+        if ($cfg.archive -and $cfg.archive.enabled) {
+            try { Invoke-Archive $cfg.archive } catch {
+                $stats.archive_error = "歸檔時發生錯誤：" + (Get-ErrorText $_)
+                Write-Log $stats.archive_error
+            }
+        }
     } catch {
         $stats.last_error = "連不到主控台：" + (Get-ErrorText $_)
         Write-Log $stats.last_error
@@ -234,6 +330,8 @@ while ($true) {
             pm = $Pm; host = $env:COMPUTERNAME; folder = $folder; folder_ok = $folderOk; version = $Version
             uploaded_total = $stats.uploaded_total; skipped = $stats.skipped
             last_error = $stats.last_error; last_upload = $stats.last_upload
+            archived_total = $stats.archived_total; last_archive = $stats.last_archive
+            archive_error = $stats.archive_error; case_folders = $stats.case_folders
         } | Out-Null
     } catch { }
     if ($Once) { break }
