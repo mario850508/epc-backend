@@ -24,7 +24,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.4"
+$Version = "1.5"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -122,8 +122,17 @@ if ($Install) {
     if (-not $Pm) { Write-Host "沒有輸入名字，取消安裝。"; exit 1 }
     try {
         $cfg = Invoke-Api "GET" ("/api/pdf-rename/watcher-config?pm=" + [uri]::EscapeDataString($Pm))
-        Write-Host "主控台設定的資料夾：$($cfg.folder)"
-        if (-not (Test-Path -LiteralPath $cfg.folder)) { Write-Host "⚠ 這台電腦找不到這個資料夾，請到主控台確認路徑（之後改網站設定就好，不用重裝）" }
+        if ($cfg.folder) {
+            Write-Host "主控台設定的 LINE 收件資料夾：$($cfg.folder)"
+            if (-not (Test-Path -LiteralPath $cfg.folder)) { Write-Host "⚠ 這台電腦找不到這個資料夾，請到主控台確認路徑（之後改網站設定就好，不用重裝）" }
+        } else {
+            Write-Host "沒有設定 LINE 收件資料夾：這台電腦只負責自動歸檔"
+        }
+        if ($cfg.archive -and $cfg.archive.enabled) {
+            $found = @(@($cfg.archive.roots) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+            if ($found.Count -gt 0) { Write-Host "✓ 找得到案場資料夾根目錄：$($found -join '、')" }
+            else { Write-Host "⚠ 這台電腦找不到案場資料夾根目錄（$(@($cfg.archive.roots) -join '、')）。請確認已安裝 Google 雲端硬碟並登入公司帳號、看得到「共用雲端硬碟」；磁碟代號不是 G 的話，到主控台把路徑加一行" }
+        }
     } catch {
         Write-Host "⚠ $(Get-ErrorText $_)（先到主控台設定好資料夾，之後會自動套用，不用重裝）"
     }
@@ -297,7 +306,10 @@ while ($true) {
         if ($cfg.image_max_mb) { $imageMaxBytes = [int64]$cfg.image_max_mb * 1MB }
         if (-not $cfg.enabled) {
             $stats.last_error = "主控台設定為停用"
-        } elseif (-not $folder -or -not (Test-Path -LiteralPath $folder)) {
+        } elseif (-not $folder) {
+            # 沒設定 LINE 收件資料夾：這台電腦只負責把確認過的檔案歸檔到 G 槽（例如家裡的電腦）
+            $stats.last_error = ""
+        } elseif (-not (Test-Path -LiteralPath $folder)) {
             $stats.last_error = "這台電腦找不到資料夾：$folder"
         } else {
             $folderOk = $true
@@ -371,6 +383,7 @@ while ($true) {
     try {
         Invoke-Api "POST" "/api/pdf-rename/watcher-heartbeat" @{
             pm = $Pm; host = $env:COMPUTERNAME; folder = $folder; folder_ok = $folderOk; version = $Version
+            archive_only = (-not $folder)
             uploaded_total = $stats.uploaded_total; skipped = $stats.skipped
             last_error = $stats.last_error; last_upload = $stats.last_upload
             archived_total = $stats.archived_total; last_archive = $stats.last_archive
