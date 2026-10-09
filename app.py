@@ -210,6 +210,7 @@ import os
 import io
 import re
 import csv
+import collections
 import base64
 import difflib
 import json
@@ -217,6 +218,7 @@ import time
 import uuid
 import secrets
 import threading
+import gzip
 import netrc  # noqa: F401  # 見下方說明：必須在多執行緒啟動前先 import 一次，避免 requests 內部
               # 的 get_netrc_auth() 在多執行緒同時第一次 import 這個模組時卡死（曾造成
               # gunicorn worker 因 WORKER TIMEOUT 被砍掉，且完全沒有任何錯誤 log）。
@@ -6643,14 +6645,38 @@ def _pdf_rule_date(flat, date_keys=""):
 PDF_MODEL_CACHE = {"data": None, "loaded": False}
 
 
+STATE_FIELD_FILE = "fldH0DQwlC7RX9oDG"   # 系統狀態「檔案」（附件）
+PDF_MODEL_STATE_KEY = "pdf_model"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _state_record(key):
+    esc = key.replace("'", chr(92) + "'")
+    recs = airtable_get_all(STATE_API_URL, "{" + STATE_FIELD_KEY + "}='" + esc + "'",
+                            [STATE_FIELD_KEY, STATE_FIELD_LONG, STATE_FIELD_FILE])
+    return recs[0] if recs else None
+
+
 def _pdf_model():
+    """分類模型：優先用每天自動重新學習存在 Airtable 的版本，沒有才用程式內建的 pdf_model.json。"""
     if not PDF_MODEL_CACHE["loaded"]:
         PDF_MODEL_CACHE["loaded"] = True
         try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_model.json"), encoding="utf-8") as f:
-                PDF_MODEL_CACHE["data"] = json.load(f)
+            rec = _state_record(PDF_MODEL_STATE_KEY)
+            att = ((rec or {}).get("fields", {}).get(STATE_FIELD_FILE) or [{}])[0]
+            if att.get("url"):
+                r = requests.get(att["url"], timeout=60)
+                r.raise_for_status()
+                PDF_MODEL_CACHE["data"] = r.json()
+                print(f"[pdf_rename] 用自動重新學習的模型（{PDF_MODEL_CACHE['data'].get('trained_at')}）", flush=True)
         except Exception as e:
-            print(f"[pdf_rename] 沒有分類模型，改用關鍵字規則：{e}", flush=True)
+            print(f"[pdf_rename] 讀取自動重新學習的模型失敗，改用內建模型：{e}", flush=True)
+        if not PDF_MODEL_CACHE["data"]:
+            try:
+                with open(os.path.join(_HERE, "pdf_model.json"), encoding="utf-8") as f:
+                    PDF_MODEL_CACHE["data"] = json.load(f)
+            except Exception as e:
+                print(f"[pdf_rename] 沒有分類模型，改用關鍵字規則：{e}", flush=True)
     return PDF_MODEL_CACHE["data"]
 
 
@@ -6659,20 +6685,9 @@ def _pdf_model_doc_type(flat, settings):
     model = _pdf_model()
     if not model:
         return None
+    import pdf_learncore as LC
     allowed = {t.get("name") for t in settings.get("doc_types") or []}
-    head = flat[: int(model.get("head") or 1500)]
-    grams = set()
-    for seg in re.findall(r"[\u4e00-\u9fff]+", head):
-        for n in (2, 3, 4):
-            for i in range(len(seg) - n + 1):
-                grams.add(seg[i:i + n])
-    scored = []
-    for name, m in (model.get("classes") or {}).items():
-        if name not in allowed:
-            continue
-        hits = [(w, x) for x, w in m["w"].items() if x in grams]
-        scored.append((sum(w for w, _ in hits) + 0.3 * m["prior"], name, hits))
-    scored.sort(key=lambda x: -x[0])
+    scored = LC.classify(model.get("classes") or {}, LC.grams(flat, int(model.get("head") or LC.HEAD)), allowed)
     if not scored or not scored[0][2]:
         return None
     margin = scored[0][0] - (scored[1][0] if len(scored) > 1 else 0)
@@ -6971,7 +6986,9 @@ def _pdf_recognize(rec):
     case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
     confidence = out["confidence"]
     suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
-    result = dict(out["result"], issues=out["issues"], candidates=[
+    # pred＝系統一開始的判斷；使用者確認（可能有修改）後拿來算真實準確度，也是自動重新學習的依據
+    result = dict(out["result"], issues=out["issues"],
+                  pred={"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date, "name": suggested}, candidates=[
         {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
          "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
     fields = {
@@ -7192,6 +7209,100 @@ def _pdf_run_async():
     threading.Thread(target=pdf_rename_run, kwargs={"force": True}, daemon=True).start()
 
 
+# ---------------- 自動重新學習（越用越準）----------------
+# 每份在主控台確認過的檔案都是正確答案（使用者改過的類型／日期／案號／檔名）。每天凌晨把
+# 「歷史資料的用字統計（pdf_base_stats.json.gz）＋所有確認過的檔案」重新算一次分類模型與各類日期前文，
+# 存到「系統狀態」pdf_model 的附件（Render 重啟也不會遺失）；也從確認的檔名學新的案場簡稱，
+# 並統計「系統一開始的判斷」跟「最後確認的結果」的差異，當作真實準確度給主控台看。
+PDF_RETRAIN = {"running": False, "last_error": None}
+PDF_CONFIRMED_WEIGHT = 2   # 確認過的檔案比歷史樣本更新、更準，權重加倍
+
+
+def pdf_retrain():
+    import pdf_learncore as LC
+    if PDF_RETRAIN["running"] or not AIRTABLE_TOKEN:
+        return None
+    PDF_RETRAIN.update(running=True, last_error=None)
+    try:
+        with gzip.open(os.path.join(_HERE, "pdf_base_stats.json.gz"), "rt", encoding="utf-8") as f:
+            base = json.load(f)
+        settings = _pdf_settings()
+        allowed = {t.get("name") for t in settings.get("doc_types") or []}
+        recs = airtable_get_all(PDF_API_URL, "OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',{" + PDF_F["status"]
+                                + "}='" + PDF_ST_ARCHIVED + "')",
+                                [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["case_no"], PDF_F["final_name"],
+                                 PDF_F["result_json"], PDF_F["confirmed_by"], PDF_F["confirmed_at"]])
+        docs, date_ctx, live, learned_alias = [], {}, [], {}
+        for r in recs:
+            g = r.get("fields", {})
+            try:
+                res = json.loads(g.get(PDF_F["result_json"]) or "{}")
+            except ValueError:
+                res = {}
+            label, case_no, doc_date = g.get(PDF_F["doc_type"]), g.get(PDF_F["case_no"]) or "", g.get(PDF_F["doc_date"]) or ""
+            text = res.get("text_excerpt") or ""
+            if label in allowed and len(LC.flat(text)) >= 40:
+                docs.append((label, case_no or r["id"], LC.grams(text)))
+                for k in LC.date_context(text, doc_date) if doc_date else []:
+                    date_ctx.setdefault(label, {})[k] = date_ctx.get(label, {}).get(k, 0) + PDF_CONFIRMED_WEIGHT
+            pred = res.get("pred")
+            if pred and not str(g.get(PDF_F["confirmed_by"]) or "").startswith("自動確認"):
+                live.append({"at": g.get(PDF_F["confirmed_at"]) or "",
+                             "type": pred.get("doc_type") == label, "date": pred.get("doc_date") == doc_date,
+                             "case": pred.get("case_no") == case_no, "name": pred.get("name") == g.get(PDF_F["final_name"])})
+            # 從確認的檔名學案場簡稱：檔名開頭「桃95_…」跟目前推出來的不一樣，就記住使用者的寫法
+            prefix = (g.get(PDF_F["final_name"]) or "").split("_")[0]
+            if case_no and re.match(r"^[\u4e00-\u9fff]{1,3}\d+$", prefix):
+                learned_alias.setdefault(case_no, collections.Counter())[prefix] += 1
+        add = LC.stats_from_docs(docs, weight=PDF_CONFIRMED_WEIGHT)
+        add["date_ctx"] = date_ctx
+        st = LC.merge_stats(base, add)
+        live.sort(key=lambda x: x["at"], reverse=True)
+        recent = live[:100]
+        acc = {k: round(sum(1 for x in recent if x[k]) / len(recent), 3) for k in ("type", "date", "case", "name")} if recent else {}
+        model = {"version": 2, "trained_at": _tw_now_iso(), "base_docs": base.get("N", 0),
+                 "confirmed_docs": len(docs), "head": LC.HEAD, "classes": LC.model_from_stats(st),
+                 "date_keys": LC.date_keys_from_ctx(st.get("date_ctx")), "calib": base.get("calib") or [],
+                 "cv_accuracy": base.get("cv_accuracy"), "live": dict(acc, n=len(recent))}
+        # 存到系統狀態：長值放摘要、附件放完整模型
+        meta = {k: v for k, v in model.items() if k not in ("classes", "date_keys", "calib")}
+        _state_set_long(PDF_MODEL_STATE_KEY, json.dumps(meta, ensure_ascii=False))
+        rec = _state_record(PDF_MODEL_STATE_KEY)
+        requests.patch(f"{STATE_API_URL}/{rec['id']}", headers=airtable_headers(),
+                       json={"fields": {STATE_FIELD_FILE: []}}, timeout=30).raise_for_status()
+        upload_attachment_to_ops_record(rec["id"], STATE_FIELD_FILE,
+                                        base64.b64encode(json.dumps(model, ensure_ascii=False).encode()).decode(),
+                                        "pdf_model.json", content_type="application/json")
+        PDF_MODEL_CACHE.update(data=model, loaded=True)
+        # 同一案場確認時最常用的簡稱；跟目前推出來的不同才記
+        learned_alias = {c: cnt.most_common(1)[0][0] for c, cnt in learned_alias.items()}
+        learned_alias = {c: p for c, p in learned_alias.items() if _pdf_short_name(c) != p}
+        if learned_alias:
+            al = _pdf_aliases()
+            al["map"].update(learned_alias)
+            _state_set_long(PDF_ALIAS_KEY, json.dumps(al, ensure_ascii=False))
+        print(f"[pdf_rename] 重新學習完成：歷史 {base.get('N', 0)} 份＋確認 {len(docs)} 份，新簡稱 {len(learned_alias)} 個", flush=True)
+        return meta
+    except Exception as e:
+        PDF_RETRAIN["last_error"] = f"{type(e).__name__}: {e}"[:500]
+        print(f"[pdf_rename] 重新學習失敗：{PDF_RETRAIN['last_error']}", flush=True)
+        return None
+    finally:
+        PDF_RETRAIN["running"] = False
+
+
+scheduler.add_job(pdf_retrain, CronTrigger(hour=2, minute=30), id="pdf_retrain", replace_existing=True,
+                  max_instances=1, coalesce=True)
+
+
+@app.route("/api/pdf-rename/retrain", methods=["POST"])
+def pdf_rename_retrain_now():
+    if PDF_RETRAIN["running"]:
+        return jsonify({"ok": True, "message": "已經在重新學習中"})
+    threading.Thread(target=pdf_retrain, daemon=True).start()
+    return jsonify({"ok": True, "message": "開始重新學習，約 1 分鐘"})
+
+
 scheduler.add_job(pdf_rename_run, CronTrigger(minute="*"), id="pdf_rename", replace_existing=True,
                   max_instances=1, coalesce=True)
 
@@ -7216,6 +7327,8 @@ def pdf_rename_status():
         "api_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "alias_count": len(_pdf_aliases()["map"]),
         "watchers_status": PDF_WATCHER_STATUS,
+        "learn_model": {k: v for k, v in (_pdf_model() or {}).items() if k not in ("classes", "date_keys", "calib")},
+        "retrain": PDF_RETRAIN,
         "model": PDF_MODEL,
         "settings": s,
     })
