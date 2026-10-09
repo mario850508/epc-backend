@@ -5872,6 +5872,8 @@ PDF_F = {
     "confirmed_by": "fld83V6N168l590Sv",   # 確認人
     "writeback": "fldgx4NAfTB6Tv8hu",      # 寫回結果
     "uploaded_at": "fldFYljqhbJy70LH3",    # 上傳時間
+    "hash": "fldMrCmFdyyt5WQWJ",           # 檔案雜湊（SHA1，擋重複上傳）
+    "src_path": "fldzoWNBfEWLtfflB",       # 來源路徑（LINE 收件資料夾裡的原始路徑）
 }
 PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
 PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
@@ -6006,7 +6008,11 @@ PDF_DEFAULT_SETTINGS = {
     "rules_csv_url": "",            # 選填：Google Sheet「發布為 CSV」網址，欄位 函文類型/關鍵字/對應里程碑/說明
     "engine": "free",               # free＝完全免費（文字層＋Google OCR＋規則）／hybrid＝沒把握的才用 AI／ai＝全部用 AI
     "ocr_url": "",                  # 掃描檔用：使用者部署的 Apps Script 網址（Google 雲端硬碟 OCR）
+    # LINE 收件資料夾（每位 PM 一個）：PM 電腦上的 tools/pdf_watcher.ps1 每分鐘讀這裡的設定，
+    # 資料夾有新的 PDF 就送進佇列。[{pm, folder, enabled}]
+    "watchers": [],
 }
+PDF_WATCHER_STATUS = {}   # {pm: 最後一次回報}，記憶體即可（背景程式每分鐘回報一次）
 PDF_SETTINGS = {"data": None}
 # 案號 → 簡稱（例如 潤特桃園1號 → 桃1、舊案保留原本的 千82／風29），從使用者 G 槽資料夾＋檔名學來，
 # 存在「系統狀態」pdf_rename_aliases：{"map": {案號: 簡稱}, "rules": {案號前綴: 簡稱前綴}}。
@@ -6171,6 +6177,7 @@ def _pdf_record_to_dict(r):
         "source": g("source") or "",
         "uploader": g("uploader") or "",
         "uploaded_at": g("uploaded_at") or r.get("createdTime", ""),
+        "src_path": g("src_path") or "",
         "case_no": g("case_no") or "",
         "alias": g("alias") or "",
         "doc_type": g("doc_type") or "",
@@ -6987,6 +6994,7 @@ def pdf_rename_status():
         "last_count": PDF_RUN["last_count"],
         "api_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "alias_count": len(_pdf_aliases()["map"]),
+        "watchers_status": PDF_WATCHER_STATUS,
         "model": PDF_MODEL,
         "settings": s,
     })
@@ -7009,10 +7017,42 @@ def pdf_rename_items():
     return jsonify({"items": items})
 
 
+def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", src_path=""):
+    """建立一筆待辨識記錄並上傳 PDF。同一份內容（SHA1 相同）已經在佇列裡就不重複建立。"""
+    import hashlib
+    name = os.path.basename(name or "未命名.pdf")
+    if not data.startswith(b"%PDF"):
+        return {"name": name, "ok": False, "error": "不是 PDF 檔"}
+    if len(data) > PDF_MAX_BYTES:
+        return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"}
+    digest = hashlib.sha1(data).hexdigest()
+    try:
+        dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'", [PDF_F["status"], PDF_F["src_name"]])
+        if dup:
+            return {"name": name, "ok": True, "duplicate": True, "id": dup[0]["id"],
+                    "status": dup[0].get("fields", {}).get(PDF_F["status"], "")}
+        resp = requests.post(PDF_API_URL, headers=airtable_headers(), json={"fields": {
+            PDF_F["src_name"]: name, PDF_F["status"]: PDF_ST_QUEUED, PDF_F["source"]: source[:50],
+            PDF_F["uploader"]: (uploader or "")[:50], PDF_F["uploaded_at"]: _tw_now_iso(), PDF_F["attempts"]: 0,
+            PDF_F["hash"]: digest, PDF_F["src_path"]: (src_path or "")[:500],
+        }}, timeout=30)
+        if resp.status_code >= 400:
+            raise Exception(resp.text)
+        rid = resp.json()["id"]
+        try:
+            upload_attachment_to_ops_record(rid, PDF_F["file"], base64.b64encode(data).decode(), name,
+                                            content_type="application/pdf")
+        except Exception:
+            requests.delete(f"{PDF_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+            raise
+        return {"name": name, "ok": True, "id": rid}
+    except Exception as e:
+        return {"name": name, "ok": False, "error": str(e)[:300]}
+
+
 @app.route("/api/pdf-rename/upload", methods=["POST"])
 def pdf_rename_upload():
-    """主控台拖拉上傳，或其他程式（LINE 收件、本機資料夾監看）推送。
-    multipart：files[]（可多份），表單欄位 uploader、source。"""
+    """主控台拖拉上傳。multipart：files[]（可多份），表單欄位 uploader、source。"""
     files = request.files.getlist("files") or request.files.getlist("files[]")
     if not files:
         return jsonify({"error": "沒有收到檔案"}), 400
@@ -7020,36 +7060,57 @@ def pdf_rename_upload():
         return jsonify({"error": "一次最多 30 份"}), 400
     uploader = (request.form.get("uploader") or "").strip()[:50]
     source = (request.form.get("source") or "主控台上傳").strip()[:50]
-    results = []
-    for fs in files:
-        name = os.path.basename(fs.filename or "未命名.pdf")
-        data = fs.read()
-        if not data.startswith(b"%PDF"):
-            results.append({"name": name, "ok": False, "error": "不是 PDF 檔"})
-            continue
-        if len(data) > PDF_MAX_BYTES:
-            results.append({"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"})
-            continue
-        try:
-            resp = requests.post(PDF_API_URL, headers=airtable_headers(), json={"fields": {
-                PDF_F["src_name"]: name, PDF_F["status"]: PDF_ST_QUEUED, PDF_F["source"]: source,
-                PDF_F["uploader"]: uploader, PDF_F["uploaded_at"]: _tw_now_iso(), PDF_F["attempts"]: 0,
-            }}, timeout=30)
-            if resp.status_code >= 400:
-                raise Exception(resp.text)
-            rid = resp.json()["id"]
-            try:
-                upload_attachment_to_ops_record(rid, PDF_F["file"], base64.b64encode(data).decode(), name,
-                                                content_type="application/pdf")
-            except Exception:
-                requests.delete(f"{PDF_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
-                raise
-            results.append({"name": name, "ok": True, "id": rid})
-        except Exception as e:
-            results.append({"name": name, "ok": False, "error": str(e)[:300]})
-    if any(r["ok"] for r in results) and _pdf_settings().get("enabled"):
+    results = [_pdf_create_from_bytes(fs.filename, fs.read(), uploader, source) for fs in files]
+    if any(r["ok"] and not r.get("duplicate") for r in results) and _pdf_settings().get("enabled"):
         _pdf_run_async()
     return jsonify({"results": results})
+
+
+# ---- LINE 收件資料夾背景程式（tools/pdf_watcher.ps1，跑在每位 PM 的電腦上）----
+@app.route("/api/pdf-rename/watcher-config")
+def pdf_rename_watcher_config():
+    pm = (request.args.get("pm") or "").strip()
+    watchers = _pdf_settings().get("watchers") or []
+    if not pm:
+        return jsonify({"pms": [w.get("pm") for w in watchers if w.get("pm")]})
+    w = next((w for w in watchers if w.get("pm") == pm), None)
+    if not w:
+        return jsonify({"error": f"主控台還沒設定「{pm}」的 LINE 收件資料夾"}), 404
+    return jsonify({"pm": pm, "folder": w.get("folder") or "", "enabled": bool(w.get("enabled", True)),
+                    "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024)})
+
+
+@app.route("/api/pdf-rename/watcher-upload", methods=["POST"])
+def pdf_rename_watcher_upload():
+    """body: {pm, filename, path, data(base64)}"""
+    body = request.get_json(force=True) or {}
+    pm = (body.get("pm") or "").strip()
+    if not pm:
+        return jsonify({"error": "缺少 pm"}), 400
+    try:
+        data = base64.b64decode(body.get("data") or "")
+    except Exception:
+        return jsonify({"error": "檔案內容不是 base64"}), 400
+    r = _pdf_create_from_bytes(body.get("filename"), data, uploader=pm, source=f"LINE／{pm}",
+                               src_path=body.get("path") or "")
+    if r["ok"] and not r.get("duplicate") and _pdf_settings().get("enabled"):
+        _pdf_run_async()
+    return jsonify(r), (200 if r["ok"] else 400)
+
+
+@app.route("/api/pdf-rename/watcher-heartbeat", methods=["POST"])
+def pdf_rename_watcher_heartbeat():
+    body = request.get_json(force=True) or {}
+    pm = (body.get("pm") or "").strip()
+    if not pm:
+        return jsonify({"error": "缺少 pm"}), 400
+    PDF_WATCHER_STATUS[pm] = {
+        "at": _tw_now_iso(), "host": str(body.get("host") or "")[:60], "folder": str(body.get("folder") or "")[:300],
+        "folder_ok": bool(body.get("folder_ok")), "uploaded_total": int(body.get("uploaded_total") or 0),
+        "skipped": int(body.get("skipped") or 0), "last_error": str(body.get("last_error") or "")[:300],
+        "last_upload": str(body.get("last_upload") or "")[:200], "version": str(body.get("version") or "")[:20],
+    }
+    return jsonify({"ok": True})
 
 
 @app.route("/api/pdf-rename/run", methods=["POST"])
@@ -7080,6 +7141,15 @@ def pdf_rename_save_settings():
         s["template"] = t
     if "rules_csv_url" in body:
         s["rules_csv_url"] = (body.get("rules_csv_url") or "").strip()
+    if "watchers" in body:
+        ws, seen = [], set()
+        for w in body.get("watchers") or []:
+            pm = (w.get("pm") or "").strip() if isinstance(w, dict) else ""
+            if not pm or pm in seen:
+                continue
+            seen.add(pm)
+            ws.append({"pm": pm[:30], "folder": (w.get("folder") or "").strip()[:300], "enabled": bool(w.get("enabled", True))})
+        s["watchers"] = ws
     if "engine" in body:
         if body["engine"] not in ("free", "hybrid", "ai"):
             return jsonify({"error": "engine 只能是 free／hybrid／ai"}), 400
