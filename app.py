@@ -6484,7 +6484,28 @@ _PDF_ID_MAP = {
 }
 
 
-def _pdf_match_cases(ext, fulltext=None):
+def _pdf_scan_filename(name, scores_add):
+    """原檔名裡的案號（例如「工程苗栗7號-設備登記函_1151005.pdf」）或開頭的簡稱（「桃1_20250106_…」）。
+    廠商／PM 傳檔時常常已經寫了案號，比用地址推測準得多。"""
+    stem = _norm_text(os.path.splitext(os.path.basename(name or ""))[0])
+    if not stem:
+        return
+    cases = _pdf_case_ref()
+    hits = [c for c in cases if len(_norm_text(c["case_no"])) >= 4 and _norm_text(c["case_no"]) in stem]
+    # 「潤特桃園1號」也是「潤特桃園11號」的一部分嗎？不會（後面接「號」），但「桃園1號」這種較短的案號可能是長案號的一部分 → 只留最長的
+    hits = [c for c in hits if not any(c is not o and _norm_text(c["case_no"]) in _norm_text(o["case_no"]) for o in hits)]
+    for c in hits:
+        scores_add(c, 90, f"原檔名有案號 {c['case_no']}")["strong"] = True
+    if hits:
+        return
+    m = re.match(r"^([\u4e00-\u9fff]{1,3}\d+)[_\-\s]", os.path.basename(name or ""))
+    if m:
+        for c in cases:
+            if _pdf_short_name(c["case_no"]) == m.group(1):
+                scores_add(c, 85, f"原檔名開頭是簡稱 {m.group(1)}")["strong"] = True
+
+
+def _pdf_match_cases(ext, fulltext=None, filename=""):
     """回傳 (候選清單, 強比對案號集合)。強比對＝某個編號精確相同（受理編號、電號…）。
     fulltext（免費辨識用）：另外拿每個案件的編號／案號直接在全文裡找。"""
     idents = ext.get("identifiers") or {}
@@ -6499,6 +6520,8 @@ def _pdf_match_cases(ext, fulltext=None):
     cases = _pdf_case_ref()
     if fulltext:
         _pdf_scan_fulltext(fulltext, add)
+    if filename:
+        _pdf_scan_filename(filename, add)
     # 文件上有標籤的編號（同意備案編號：XXX…）跟案件欄位完全相同 → 幾乎確定
     for field, vals in (ext.get("ids") or {}).items():
         fields = ["臺電受理編號", "併聯PV編號"] if field == "臺電受理編號" else [field]
@@ -7077,9 +7100,9 @@ def _pdf_scan_fulltext(flat, scores_add):
             scores_add(c, 80, f"文件內出現案號 {c['case_no']}")["strong"] = True
 
 
-def _pdf_free_analyze(text, source, settings):
+def _pdf_free_analyze(text, source, settings, filename=""):
     ext, type_conf, date_conf = _pdf_rule_extract(text, settings)
-    ranked, strong = _pdf_match_cases(ext, fulltext=_pdf_flat(text))
+    ranked, strong = _pdf_match_cases(ext, fulltext=_pdf_flat(text), filename=filename)
     issues = []
     case_no, case_conf, case_reason = "", 0, ""
     if len(strong) == 1:
@@ -7097,7 +7120,12 @@ def _pdf_free_analyze(text, source, settings):
         case_no = top["case"]["case_no"]
         case_reason = "；".join(top["why"])
         case_conf = 75 if top["score"] >= 60 and top["score"] - second >= 30 else 40
-        issues.append("文件裡找不到案件編號，案號是用地址／名稱推測的，請確認")
+        if ext.get("ids"):
+            # 文件上有編號，只是 Airtable 這個案件還沒記錄 → 確認後會自動記下，下次同案場的文件就能直接比對
+            issues.append("文件上的編號（" + "、".join(v[0] for v in list(ext["ids"].values())[:2])
+                          + "）Airtable 還沒記錄，這次用地址／名稱比對，請確認；確認後會自動記下，下次就能直接比對")
+        else:
+            issues.append("文件裡找不到案件編號，案號是用地址／名稱推測的，請確認")
     else:
         issues.append("無法確定案號，請人工選擇")
     if ext["doc_type"] == "其他":
@@ -7221,7 +7249,7 @@ def _pdf_recognize(rec):
             _pdf_step("讀取文件文字")
             text, source = _pdf_get_text(pdf.content, settings, ext_name)
             _pdf_step("判斷類型、日期、比對案號")
-            out = _pdf_free_analyze(text, source, settings)
+            out = _pdf_free_analyze(text, source, settings, f.get(PDF_F["src_name"]) or att.get("filename") or "")
         except Exception:
             if engine != "hybrid" or not os.environ.get("ANTHROPIC_API_KEY"):
                 raise
