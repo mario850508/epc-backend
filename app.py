@@ -5905,12 +5905,14 @@ PDF_DEFAULT_DOC_TYPES = [
      "keywords": "併聯審查意見書、併聯審查結果、併聯審查、同意併聯"},
     {"name": "同意備案", "category": "06", "milestone": "同意備案", "synonyms": "同意備案函",
      "keywords": "同意備案、准予備案、第三型再生能源發電設備"},
+    # 細部協商跟審訖圖是同時出來的，使用者用「同案場審訖圖的審核訖印章日期」命名
     {"name": "細部協商", "category": "06", "milestone": "細部協商", "synonyms": "細協",
-     "keywords": "細部協商、併聯細部協商、協商結果"},
+     "keywords": "細部協商、併聯細部協商、協商結果", "date_from": "審訖圖"},
     {"name": "細協補件通知", "category": "06", "milestone": "", "synonyms": "",
      "keywords": "補件、補正、細部協商"},
+    # 日期＝圖面上「審核訖」紅色印章的日期（不是圖框的繪圖日期）
     {"name": "審訖圖", "category": "06", "milestone": "台電審訖圖", "synonyms": "審迄圖、台電審訖圖",
-     "keywords": "審訖、審迄、審定、單線圖審查"},
+     "keywords": "審訖、審迄、審定、單線圖審查", "date_mode": "stamp"},
     {"name": "結構計算書", "category": "06", "milestone": "結構計算書", "synonyms": "",
      "keywords": "結構計算書、結構計算、風力計算、風壓、構件檢核", "date_keys": "日期、中華民國"},
     {"name": "免雜", "category": "06", "milestone": "免雜", "synonyms": "免雜函、免雜更正函",
@@ -6048,6 +6050,10 @@ def _pdf_settings():
                      "正式售電函", "竣工備查", "設備登記", "台電審訖圖", "電表租約", "第一張電費單"}
         if {t.get("name") for t in data.get("doc_types") or []} == old_names:
             data["doc_types"] = PDF_DEFAULT_DOC_TYPES
+        # 存過的類型缺少新版預設才有的設定（例如審訖圖的印章日期）時補上，使用者改過的欄位不動
+        defaults = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
+        data["doc_types"] = [dict({k: v for k, v in defaults.get(t.get("name"), {}).items() if k not in t}, **t)
+                             for t in data.get("doc_types") or []]
         PDF_SETTINGS["data"] = data
     return PDF_SETTINGS["data"]
 
@@ -6576,6 +6582,33 @@ def _pdf_flat(text):
     return re.sub(r"\s+", "", t)
 
 
+def _pdf_stamp_date(flat):
+    """台電「審核訖」印章日期（民國）。OCR 常見雜訊：114.2.-6、113.1211、4113.8.22、日期跑到字前面、
+    14.3.28（掉了開頭的 1）。取離「審核訖」最近的合理日期。回傳 (YYYY-MM-DD, 原文) 或 None。"""
+    from datetime import date as _date
+    cands = []
+    for m in re.finditer(r"審[核查]?[訖迄讫]", flat):
+        a, b = max(0, m.start() - 25), min(len(flat), m.end() + 45)
+        win = flat[a:b]
+        for d in re.finditer(r"(\d{2,3})\s*[.．,、]\s*-?\s*(\d{1,2})\s*[.．,、]\s*-?\s*(\d{1,2})"
+                             r"|(1[01]\d)\s*[.．]\s*(\d{2})(\d{2})(?!\d)", win):
+            y, mo, da = (d.group(1), d.group(2), d.group(3)) if d.group(1) else (d.group(4), d.group(5), d.group(6))
+            y = int(y)
+            if y < 100:
+                y += 100
+            if not 105 <= y <= 130:
+                continue
+            try:
+                dt = _date(y + 1911, int(mo), int(da))
+            except ValueError:
+                continue
+            cands.append((abs((a + d.start()) - m.end()), dt.isoformat(), win))
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][1], cands[0][2]
+
+
 def _pdf_rule_date(flat, date_keys=""):
     """回傳 (YYYY-MM-DD, 文件原文, 信心)。date_keys＝這類文件日期前面會出現的字（規則設定），先找這些。"""
     for key in [k.strip() for k in re.split(r"[、,，;；]", date_keys or "") if k.strip()]:
@@ -6716,9 +6749,16 @@ def _pdf_rule_extract(text, settings):
     issuer = m.group(1) if m else ""
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
     rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
-    learned_keys = ((_pdf_model() or {}).get("date_keys") or {}).get(doc_type) or []
-    keys = "、".join(list(learned_keys) + [k for k in re.split(r"[、,，;；]", rule.get("date_keys") or "") if k.strip()])
-    doc_date, date_raw, date_conf = _pdf_rule_date(flat, keys)
+    if rule.get("date_mode") == "stamp":
+        # 只認「審核訖」印章日期；讀不到就留空（之後改用收件日並提醒），不拿圖框的繪圖日期
+        st = _pdf_stamp_date(flat)
+        doc_date, date_raw, date_conf = (st[0], st[1], 92) if st else ("", "", 0)
+    elif rule.get("date_from"):
+        doc_date, date_raw, date_conf = "", "", 0   # 由 _pdf_recognize 去找同案場的另一份文件
+    else:
+        learned_keys = ((_pdf_model() or {}).get("date_keys") or {}).get(doc_type) or []
+        keys = "、".join(list(learned_keys) + [k for k in re.split(r"[、,，;；]", rule.get("date_keys") or "") if k.strip()])
+        doc_date, date_raw, date_conf = _pdf_rule_date(flat, keys)
     addresses = re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿0-9\-之巷弄段路街村里鄰]{2,30}?號", flat)
     addresses += re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿]{1,8}段[0-9\-、]{1,30}地號", flat)
     ext = {
@@ -6874,6 +6914,7 @@ def _pdf_recognize(rec):
 
     engine = _pdf_engine(settings)
     threshold = int(settings.get("auto_confirm_threshold") or 92)
+    source = ""
     if engine == "ai":
         out = _pdf_ai_analyze(pdf.content, settings)
     else:
@@ -6886,6 +6927,33 @@ def _pdf_recognize(rec):
             out = None
         if engine == "hybrid" and os.environ.get("ANTHROPIC_API_KEY") and (out is None or out["confidence"] < threshold):
             out = _pdf_ai_analyze(pdf.content, settings)
+
+    rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == out["doc_type"]), {})
+
+    def set_date(d, conf, note):
+        out["doc_date"] = d
+        parts = list(out.get("conf_parts") or [out["confidence"]] * 3)
+        parts[2] = conf
+        out["conf_parts"] = parts
+        out["confidence"] = max(0, min(parts))
+        out["issues"] = [x for x in out["issues"] if x != "找不到發文日期"]
+        out["evidence"] += f"\n日期：{note}（信心 {conf}）"
+
+    # 審訖圖的「審核訖」印章常是疊在電子檔上的圖片，文字層讀不到 → 另外 OCR 一次找印章
+    if rule.get("date_mode") == "stamp" and not out["doc_date"] and source == "PDF 文字層" and settings.get("ocr_url"):
+        try:
+            st = _pdf_stamp_date(_pdf_flat(_pdf_ocr(pdf.content, settings["ocr_url"])))
+            if st:
+                set_date(st[0], 92, f"審核訖印章「{st[1][:30]}」（OCR）")
+        except Exception as e:
+            print(f"[pdf_rename] 審訖圖印章 OCR 失敗：{e}", flush=True)
+    # 細部協商：用同案場審訖圖的印章日期（兩份同時出來）
+    if rule.get("date_from") and not out["doc_date"] and out["case_no"]:
+        sib = _pdf_sibling_date(out["case_no"], rule["date_from"], rec["id"])
+        if sib:
+            set_date(sib[0], 90, f"用同案場{rule['date_from']}的日期（{sib[1]}）")
+        else:
+            out["issues"].append(f"同案場的{rule['date_from']}還沒進來，先用收件日；{rule['date_from']}辨識完會自動更新這份的日期")
 
     # 文件上沒有日期 → 用收到檔案那天（LINE 收件＝下載到資料夾的時間；手動上傳＝上傳時間）。
     # 07 設備文件常常沒有日期，屬正常；其他類型（尤其 06 函文一定有發文日期）可能是 OCR 沒讀到，降信心提醒。
@@ -6932,7 +7000,79 @@ def _pdf_recognize(rec):
     _pdf_patch(rec["id"], fields)
     if auto and settings.get("writeback"):
         _pdf_writeback(rec["id"], case, doc_type, doc_date)
+    if out.get("conf_parts") and out["conf_parts"][2] >= 80:
+        _pdf_propagate_sibling_date(case_no, doc_type, doc_date)
     return confidence
+
+
+def _pdf_sibling_date(case_no, doc_type, exclude_id=""):
+    """同案場另一種文件的日期：先找佇列裡的（已確認優先），再找 Airtable 進度管理的里程碑完成日期。
+    回傳 (YYYY-MM-DD, 來源說明) 或 None。"""
+    esc = lambda v: (v or "").replace("'", "\\'")
+    try:
+        recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc(case_no) + "',{" + PDF_F["doc_type"]
+                                + "}='" + esc(doc_type) + "',{" + PDF_F["doc_date"] + "})",
+                                [PDF_F["doc_date"], PDF_F["status"]])
+    except Exception:
+        recs = []
+    recs = [r for r in recs if r["id"] != exclude_id and r.get("fields", {}).get(PDF_F["doc_date"])]
+    rank = {PDF_ST_ARCHIVED: 0, PDF_ST_CONFIRMED: 0, PDF_ST_REVIEW: 1}
+    recs.sort(key=lambda r: rank.get(r["fields"].get(PDF_F["status"]), 2))
+    if recs:
+        return recs[0]["fields"][PDF_F["doc_date"]], f"公文更名佇列裡的{doc_type}"
+    rule = next((t for t in _pdf_settings().get("doc_types") or [] if t.get("name") == doc_type), {})
+    case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
+    if rule.get("milestone") and case and case.get("record_id"):
+        d = _pdf_milestone_date(case["record_id"], rule["milestone"])
+        if d:
+            return d, f"Airtable 進度管理「{rule['milestone']}」"
+    return None
+
+
+def _pdf_milestone_date(case_record_id, milestone):
+    try:
+        resp = requests.get(f"{CASE_API_URL}/{case_record_id}", headers=airtable_headers(),
+                            params={"returnFieldsByFieldId": "true"}, timeout=30)
+        resp.raise_for_status()
+        ms_ids = resp.json().get("fields", {}).get(FIELD_MS_LINK_ON_CASE) or []
+        for i in range(0, len(ms_ids), 50):
+            formula = "AND(OR(" + ",".join(f"RECORD_ID()='{m}'" for m in ms_ids[i:i + 50]) + \
+                      "),{" + FIELD_MS_TYPE + "}='" + milestone.replace("'", "\\'") + "')"
+            for r in airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_ACTUAL_DATE]):
+                d = r.get("fields", {}).get(FIELD_MS_ACTUAL_DATE)
+                if d:
+                    return d
+    except Exception as e:
+        print(f"[pdf_rename] 查進度管理日期失敗：{e}", flush=True)
+    return ""
+
+
+def _pdf_propagate_sibling_date(case_no, doc_type, doc_date):
+    """例如審訖圖辨識／確認後，把同案場還在「待確認」、日期要跟著審訖圖的細部協商一起更新。"""
+    if not case_no or not doc_date:
+        return
+    settings = _pdf_settings()
+    targets = [t["name"] for t in settings.get("doc_types") or [] if t.get("date_from") == doc_type]
+    if not targets:
+        return
+    esc = lambda v: (v or "").replace("'", "\\'")
+    try:
+        recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc(case_no) + "',{" + PDF_F["status"]
+                                + "}='" + PDF_ST_REVIEW + "',OR(" + ",".join("{" + PDF_F["doc_type"] + "}='" + esc(t) + "'" for t in targets)
+                                + "))", [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["suggested"], PDF_F["final_name"], PDF_F["evidence"]])
+        case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), {"case_no": case_no})
+        for r in recs:
+            g = r.get("fields", {})
+            if g.get(PDF_F["doc_date"]) == doc_date:
+                continue
+            new_name = _pdf_build_name(settings.get("template"), case, g.get(PDF_F["doc_type"]), doc_date)
+            fields = {PDF_F["doc_date"]: doc_date, PDF_F["suggested"]: new_name,
+                      PDF_F["evidence"]: (g.get(PDF_F["evidence"]) or "") + f"\n日期：已改用同案場{doc_type}的日期 {doc_date}"}
+            if not g.get(PDF_F["final_name"]) or g.get(PDF_F["final_name"]) == g.get(PDF_F["suggested"]):
+                fields[PDF_F["final_name"]] = new_name
+            _pdf_patch(r["id"], fields)
+    except Exception as e:
+        print(f"[pdf_rename] 更新同案場日期失敗：{e}", flush=True)
 
 
 def _pdf_writeback(record_id, case, doc_type, doc_date):
@@ -7272,7 +7412,8 @@ def pdf_rename_save_settings():
             return jsonify({"error": "OCR 網址應該是 https://script.google.com/ 開頭的 Apps Script 網址"}), 400
         s["ocr_url"] = u
     if "doc_types" in body:
-        types = [{k: (t.get(k) or "").strip() for k in ("name", "keywords", "milestone", "note", "category", "synonyms", "date_keys")}
+        types = [{k: (t.get(k) or "").strip() for k in ("name", "keywords", "milestone", "note", "category", "synonyms",
+                                                         "date_keys", "date_mode", "date_from")}
                  for t in body.get("doc_types") or [] if isinstance(t, dict) and (t.get("name") or "").strip()]
         if not types:
             return jsonify({"error": "至少要有一種函文類型"}), 400
@@ -7366,6 +7507,7 @@ def pdf_rename_confirm(record_id):
     wb = ""
     if _pdf_settings().get("writeback") and body.get("writeback", True):
         wb = _pdf_writeback(record_id, case, doc_type, doc_date)
+    _pdf_propagate_sibling_date(case_no, doc_type, doc_date)
     return jsonify({"ok": True, "writeback": wb, "final_name": final_name})
 
 
