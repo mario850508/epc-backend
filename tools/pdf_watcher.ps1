@@ -22,7 +22,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.1"
+$Version = "1.2"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -291,7 +291,7 @@ while ($true) {
                 }
                 try {
                     $data = [Convert]::ToBase64String([IO.File]::ReadAllBytes($f.FullName))
-                    $res = Invoke-Api "POST" "/api/pdf-rename/watcher-upload" @{ pm = $Pm; filename = $f.Name; path = $f.FullName; data = $data }
+                    $res = Invoke-Api "POST" "/api/pdf-rename/watcher-upload" @{ pm = $Pm; filename = $f.Name; path = $f.FullName; data = $data; received_at = $f.LastWriteTime.ToString("yyyy-MM-dd'T'HH:mm:sszzz") }
                     if ($res.duplicate) {
                         $seen[$key] = "duplicate"
                         Write-Log "已經在佇列裡（重複檔案）：$($f.Name)"

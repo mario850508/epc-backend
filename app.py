@@ -6731,6 +6731,7 @@ def _pdf_free_analyze(text, source, settings):
         "case": case, "case_no": case_no, "doc_type": ext["doc_type"], "doc_date": ext["doc_date"],
         "doc_number": ext["doc_number"], "issuer": ext["issuer"], "subject": ext["subject"],
         "confidence": max(0, min(case_conf, type_conf, date_conf)), "evidence": evidence, "issues": issues,
+        "conf_parts": [case_conf, type_conf, date_conf],
         "ranked": ranked,
         "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:4000]},
     }
@@ -6795,6 +6796,7 @@ def _pdf_ai_analyze(pdf_bytes, settings):
         "doc_date": doc_date, "doc_number": ext.get("doc_number") or "", "issuer": ext.get("issuer") or "",
         "subject": ext.get("subject") or "",
         "confidence": max(0, min(100, min(case_conf, type_conf, date_conf))), "evidence": evidence,
+        "conf_parts": [case_conf, type_conf, date_conf],
         "issues": issues, "ranked": ranked,
         "result": {"engine": "ai", "model": PDF_MODEL, "extract": ext, "verify": ver},
     }
@@ -6829,6 +6831,19 @@ def _pdf_recognize(rec):
         if engine == "hybrid" and os.environ.get("ANTHROPIC_API_KEY") and (out is None or out["confidence"] < threshold):
             out = _pdf_ai_analyze(pdf.content, settings)
 
+    # 文件上沒有日期 → 用收到檔案那天（LINE 收件＝下載到資料夾的時間；手動上傳＝上傳時間）。
+    # 07 設備文件常常沒有日期，屬正常；其他類型（尤其 06 函文一定有發文日期）可能是 OCR 沒讀到，降信心提醒。
+    if not out["doc_date"]:
+        received = (f.get(PDF_F["uploaded_at"]) or rec.get("createdTime") or "")[:10]
+        if _pdf_valid_date(received):
+            normal = _pdf_doc_category(out["doc_type"]) == "07"
+            out["doc_date"] = received
+            out["issues"] = [x for x in out["issues"] if x != "找不到發文日期"]
+            out["issues"].append(f"文件上沒有日期，先用收件日 {received}" + ("" if normal else "（這類文件通常有日期，可能是沒讀到，請確認）"))
+            parts = list(out.get("conf_parts") or [out["confidence"]] * 3)
+            parts[2] = 85 if normal else 45
+            out["confidence"] = max(0, min(parts))
+            out["evidence"] += f"\n日期：文件上沒有日期，用收件日 {received}（信心 {parts[2]}）"
     case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
     confidence = out["confidence"]
     suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
@@ -7027,7 +7042,7 @@ def pdf_rename_items():
     return jsonify({"items": items})
 
 
-def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", src_path=""):
+def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", src_path="", received_at=""):
     """建立一筆待辨識記錄並上傳 PDF。同一份內容（SHA1 相同）已經在佇列裡就不重複建立。"""
     import hashlib
     name = os.path.basename(name or "未命名.pdf")
@@ -7043,7 +7058,9 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
                     "status": dup[0].get("fields", {}).get(PDF_F["status"], "")}
         resp = requests.post(PDF_API_URL, headers=airtable_headers(), json={"fields": {
             PDF_F["src_name"]: name, PDF_F["status"]: PDF_ST_QUEUED, PDF_F["source"]: source[:50],
-            PDF_F["uploader"]: (uploader or "")[:50], PDF_F["uploaded_at"]: _tw_now_iso(), PDF_F["attempts"]: 0,
+            # 「上傳時間」欄位記的是收件時間：LINE 收件用檔案下載到資料夾的時間
+            PDF_F["uploader"]: (uploader or "")[:50], PDF_F["uploaded_at"]: (received_at or "")[:30] or _tw_now_iso(),
+            PDF_F["attempts"]: 0,
             PDF_F["hash"]: digest, PDF_F["src_path"]: (src_path or "")[:500],
         }}, timeout=30)
         if resp.status_code >= 400:
@@ -7105,7 +7122,7 @@ def pdf_rename_watcher_upload():
     except Exception:
         return jsonify({"error": "檔案內容不是 base64"}), 400
     r = _pdf_create_from_bytes(body.get("filename"), data, uploader=pm, source=f"LINE／{pm}",
-                               src_path=body.get("path") or "")
+                               src_path=body.get("path") or "", received_at=body.get("received_at") or "")
     if r["ok"] and not r.get("duplicate") and _pdf_settings().get("enabled"):
         _pdf_run_async()
     return jsonify(r), (200 if r["ok"] else 400)
