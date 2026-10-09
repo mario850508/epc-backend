@@ -352,6 +352,32 @@ def classify(g, kw):
     return best
 
 
+# 文件上的編號（跟後端 app.py 的 PDF_ID_RULES 同一套；後端匯入 report.json 時用來補 Airtable 空白的編號欄位）
+ID_RULES = [
+    ("同意備案編號", r"備案編號", r"([A-Z]{3}-?\d{3}-?PV-?\d{3,4})"),
+    ("設備登記編號", r"設備登記編號", r"([A-Z]{3}-?(?:[A-Z]{2,4}-?)?\d{3}-?PV-?\d{3,4})"),
+    ("臺電受理編號", r"(?:受理編號|公司編號)", r"(\d{6}PV\d{4})"),
+    ("台電契約編號", r"(?<!登記)契約編號", r"(\d{2}-?PV-?\d{3}-?\d{4})"),
+    ("電表租約編號", r"契約登記編號", r"((?:\d{2}-)?PV-\d{3}-\d{4})"),
+    ("電號", r"電號", r"(\d{2}-?\d{2}-?\d{4}-?\d{2}-?\d)(?!\d)"),
+]
+ID_FW = str.maketrans("０１２３４５６７８９－（）：ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
+                      "0123456789-():ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def extract_ids(text):
+    t = re.sub(r"\s+", "", (text or "").translate(ID_FW))
+    out = {}
+    for field, label, fmt in ID_RULES:
+        vals = []
+        for m in re.finditer(label + r"[為:：(（「\[]{0,3}" + fmt, t):
+            if m.group(1) not in vals:
+                vals.append(m.group(1))
+        if vals:
+            out[field] = vals[:5]
+    return out
+
+
 def analyze(rows, out_dir):
     pdfs = [r for r in rows if r.get("label") and r.get("ext") == ".pdf"]
     with_text = [r for r in pdfs if r.get("text") and len(flat(r["text"])) >= MIN_TEXT]
@@ -449,8 +475,18 @@ def analyze(rows, out_dir):
                          + flat(r["text"])[:300].replace("|", "｜"))
         lines.append("")
 
+    # 6. 每份文件上的編號（同意備案、設備登記、受理、台電契約、電表租約、電號）
+    case_ids = []
+    for r in with_text:
+        ids = extract_ids(r["text"])
+        if ids:
+            case_ids.append({"case_dir": r["case_dir"], "type_base": r["label"]["type_base"], "ids": ids})
+    lines += ["## 6. 文件上的編號", "", f"{len(case_ids)} 份文件讀到編號，涵蓋 {len(set(x['case_dir'] for x in case_ids))} 個案場。"
+              "到主控台匯入 report.json 會自動填進 Airtable 專案細節空白的編號欄位（已有的不覆蓋）。", ""]
+
     report = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "case_ids": case_ids,
         "type_stats": type_stats,
         "aliases": alias_map,
         "date_rules": date_rules,

@@ -2,10 +2,12 @@
 陽光主控台「PDF 公文更名」— LINE 收件資料夾背景程式
 =====================================================
 跑在每位 PM 自己的電腦上（Windows 內建 PowerShell，不用另外安裝）：
-  每分鐘到主控台讀「這位 PM 的 LINE 收件資料夾」設定，資料夾（含子資料夾）裡有新的 PDF，
+  每分鐘到主控台讀「這位 PM 的 LINE 收件資料夾」設定，資料夾（含子資料夾）裡有新的 PDF、
+  照片（JPG/PNG，主控台會轉成 PDF）、Word／Excel（.docx／.xlsx），
   就送到主控台的辨識佇列；同一份內容重複下載不會重複辨識（後端比對檔案雜湊）。
   若主控台指定這台電腦負責「自動歸檔」，也會把「已確認」的檔案用確認檔名放進
-  「案場資料夾 → 03/04/06/07」，同名檔案不覆蓋。
+  「案場資料夾 → 03/04/06/07」，同名檔案不覆蓋；資料夾裡已經有同類型的檔案（例如已有
+  桃1_20250106_併聯審查.pdf）會先停下來，到主控台選「仍要歸檔」或「不歸檔」。
   電腦關機期間下載的檔案，下次開機會自動補送。每分鐘回報一次狀態，主控台看得到。
 
 安裝（只要一次，會設定成開機自動在背景執行，不會跳視窗）：
@@ -22,7 +24,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.3"
+$Version = "1.4"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -165,6 +167,25 @@ $stats = @{ uploaded_total = 0; skipped = 0; last_error = ""; last_upload = "";
 $caseIndex = @{}          # 案號 → 案場資料夾完整路徑
 $caseIndexAt = [datetime]::MinValue
 $archiveFailedAt = @{}    # 記錄 id → 上次失敗時間（失敗的 30 分鐘後再試）
+$WatchExts = @(".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".docx", ".xlsx")
+
+function Find-CaseDir($it) {
+    # 收購的案場：Airtable 案號是「桃園千塘82號」、G 槽資料夾是「潤特桃園17號」，主控台會給所有可能的案號
+    $keys = @($it.folder_keys)
+    if ($keys.Count -eq 0) { $keys = @([string]$it.case_no) }
+    foreach ($k in $keys) { if ($k -and $script:caseIndex.ContainsKey([string]$k)) { return $script:caseIndex[[string]$k] } }
+    return $null
+}
+
+function Get-SameTypeFiles($dir, $it) {
+    # 同簡稱、同類型、但檔名不同的檔案（例如 桃1_20240105_併聯審查.pdf；類型後面接副檔名、括號或結尾才算）
+    if (-not $it.check_same -or -not $it.short) { return @() }
+    $alts = (@($it.type_names) | Where-Object { $_ } | ForEach-Object { [regex]::Escape([string]$_) }) -join "|"
+    if (-not $alts) { return @() }
+    $pat = '^' + [regex]::Escape([string]$it.short) + '_\d{8}_(' + $alts + ')(\.|\s|\(|（|_|-|$)'
+    return @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match $pat -and $_.Name -ne [string]$it.final_name } | ForEach-Object { $_.Name })
+}
 
 function Update-CaseIndex([string[]]$roots) {
     # 根目錄往下最多 4 層找「001 潤特桃園1號_…」這種案場資料夾（名稱開頭是編號＋案號）
@@ -203,13 +224,13 @@ function Invoke-Archive($arc) {
         if ($script:archiveFailedAt.ContainsKey($it.id) -and ((Get-Date) - $script:archiveFailedAt[$it.id]).TotalMinutes -lt 30) { continue }
         $fail = ""
         $target = ""
-        $caseDir = $script:caseIndex[[string]$it.case_no]
+        $caseDir = Find-CaseDir $it
         if (-not $it.case_no) { $fail = "沒有案號" }
         elseif (-not $caseDir) {
             # 可能是新案場，重新整理一次索引再找
             $script:caseIndex = Update-CaseIndex $roots; $script:caseIndexAt = Get-Date
-            $caseDir = $script:caseIndex[[string]$it.case_no]
-            if (-not $caseDir) { $fail = "在根目錄底下找不到案場資料夾「$($it.case_no)」" }
+            $caseDir = Find-CaseDir $it
+            if (-not $caseDir) { $fail = "在根目錄底下找不到案場資料夾「$((@($it.folder_keys) + @($it.case_no) | Select-Object -Unique) -join '／')」" }
         }
         if (-not $fail) {
             $cat = [string]$it.category
@@ -223,10 +244,19 @@ function Invoke-Archive($arc) {
             }
         }
         if (-not $fail) {
+            $same = @(Get-SameTypeFiles (Split-Path -Parent $target) $it)
+            if ($same.Count -gt 0) {
+                # 已經有同類型的檔案：可能是重複或新版，先不放，讓人在主控台決定
+                try { Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archived") @{ ok = $false; conflict = $true; existing = @($same) } | Out-Null } catch { }
+                Write-Log "暫停歸檔（資料夾已有同類型檔案 $($same -join '、')）：$($it.final_name)"
+                continue
+            }
+        }
+        if (-not $fail) {
             # 大家共用同一個雲端，任何開著的電腦都可能在歸檔：先領取，別台已經在處理就跳過
             try { Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archive-claim") @{ pm = $Pm } | Out-Null }
             catch { continue }
-            $tmp = Join-Path $AppDir ("dl_" + $it.id + ".pdf")
+            $tmp = Join-Path $AppDir ("dl_" + $it.id + [IO.Path]::GetExtension([string]$it.final_name))
             try {
                 Invoke-WebRequest -Uri ($Backend + "/api/pdf-rename/" + $it.id + "/file") -OutFile $tmp -TimeoutSec 300 -UseBasicParsing
                 if (Test-Path -LiteralPath $target) {
@@ -263,6 +293,8 @@ while ($true) {
         $cfg = Invoke-Api "GET" ("/api/pdf-rename/watcher-config?pm=" + [uri]::EscapeDataString($Pm))
         $folder = [string]$cfg.folder
         $maxBytes = [int64]$cfg.max_mb * 1MB
+        $imageMaxBytes = $maxBytes
+        if ($cfg.image_max_mb) { $imageMaxBytes = [int64]$cfg.image_max_mb * 1MB }
         if (-not $cfg.enabled) {
             $stats.last_error = "主控台設定為停用"
         } elseif (-not $folder -or -not (Test-Path -LiteralPath $folder)) {
@@ -270,7 +302,8 @@ while ($true) {
         } else {
             $folderOk = $true
             $files = @(Get-ChildItem -LiteralPath $folder -Recurse -File -ErrorAction SilentlyContinue |
-                       Where-Object { $_.Extension -ieq ".pdf" } | Sort-Object LastWriteTimeUtc)
+                       Where-Object { ($WatchExts -contains $_.Extension.ToLower()) -and -not $_.Name.StartsWith("~$") } |
+                       Sort-Object LastWriteTimeUtc)
             $now = (Get-Date).ToUniversalTime()
             if ($firstRun) {
                 # 第一次執行：一天以前的舊檔當作已處理，只送最近 24 小時內的（避免一次塞爆佇列）
@@ -290,9 +323,12 @@ while ($true) {
                 $key = $f.FullName + "|" + $f.Length + "|" + $f.LastWriteTimeUtc.Ticks
                 if ($seen.ContainsKey($key)) { continue }
                 if (($now - $f.LastWriteTimeUtc).TotalSeconds -lt 30) { continue }   # 可能還在下載
-                if ($f.Length -gt $maxBytes) {
+                $isImage = @(".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp") -contains $f.Extension.ToLower()
+                $limit = $maxBytes
+                if ($isImage) { $limit = $imageMaxBytes }
+                if ($f.Length -gt $limit) {
                     $seen[$key] = "too_big"; $stats.skipped++
-                    Write-Log "略過（超過 $($cfg.max_mb)MB，請到主控台手動上傳）：$($f.FullName)"
+                    Write-Log "略過（超過 $([int]($limit / 1MB))MB，請到主控台手動上傳）：$($f.FullName)"
                     Write-JsonFile $SeenPath $seen
                     continue
                 }
@@ -311,7 +347,7 @@ while ($true) {
                     Write-JsonFile $SeenPath $seen
                 } catch {
                     $msg = Get-ErrorText $_
-                    if ($msg -like "*不是 PDF*") {
+                    if ($msg -like "*不是 PDF*" -or $msg -like "*不支援*" -or $msg -like "*不是有效*" -or $msg -like "*無法轉成*") {
                         $seen[$key] = "not_pdf"; $stats.skipped++
                         Write-JsonFile $SeenPath $seen
                     } else {

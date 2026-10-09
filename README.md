@@ -95,14 +95,16 @@ Airtable PAT 需要有這個 Base 的 `data.records:read` 和 `data.records:writ
 |---|---|---|
 | GET | `/api/pdf-rename/status` | 各狀態數量、排程狀態、設定 |
 | GET | `/api/pdf-rename/items?status=` | 清單（`all`／`active`／單一狀態） |
-| POST | `/api/pdf-rename/upload` | multipart `files`（可多份，每份 ≤5MB）、`uploader`、`source` |
+| POST | `/api/pdf-rename/upload` | multipart `files`（可多份；PDF／Word .docx／Excel .xlsx ≤5MB，照片 JPG/PNG 會轉成 PDF）、`uploader`、`source` |
 | POST | `/api/pdf-rename/run` | 立即辨識一輪 |
 | POST | `/api/pdf-rename/settings` | 修改設定；`reload_csv: true` 從 Google Sheet 重新載入函文類型 |
 | POST | `/api/pdf-rename/test-ocr` | 測試 Apps Script OCR 網址 |
-| POST | `/api/pdf-rename/preview-name` | 依命名格式產生檔名 |
-| POST | `/api/pdf-rename/<id>/confirm` | 確認（`case_no, doc_type, doc_date, final_name, user`），會寫回進度管理 |
+| POST | `/api/pdf-rename/preview-name` | 依命名格式產生檔名（`ext`），並回傳同案場同類型的文件 `same_type` |
+| POST | `/api/pdf-rename/<id>/confirm` | 確認（`case_no, doc_type, doc_date, final_name, user, ids`），寫回進度管理完成日期，並把文件上的編號（`ids`：同意備案／設備登記／臺電受理／台電契約／電表租約編號、電號）填進專案細節空白欄位 |
 | POST | `/api/pdf-rename/<id>/retry` · `/reopen` | 重新辨識／改回待確認 |
 | DELETE | `/api/pdf-rename/<id>` | 刪除 |
 | GET | `/api/pdf-rename/<id>/file` | 用確認檔名下載（`?inline=1` 預覽） |
 | GET | `/api/pdf-rename/confirmed` | 本機歸檔程式用：已確認、待歸檔清單 |
-| POST | `/api/pdf-rename/<id>/archived` | 本機歸檔完成回報（`result`） |
+| POST | `/api/pdf-rename/<id>/archived` | 本機歸檔完成回報（`result`；`ok:false` 失敗；`conflict:true, existing` 資料夾已有同類型檔案，暫停歸檔） |
+| POST | `/api/pdf-rename/<id>/archive-force` | 資料夾已有同類型檔案時仍要歸檔（兩份都留） |
+| POST | `/api/pdf-rename/import-learn` | 匯入 `tools/pdf_learn.py` 的 report.json：案場簡稱對照，並用歷史文件上的編號（`case_ids`）補專案細節空白的編號欄位 |
