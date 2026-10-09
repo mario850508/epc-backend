@@ -22,7 +22,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.2"
+$Version = "1.3"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -222,20 +222,27 @@ function Invoke-Archive($arc) {
                 else { $target = Join-Path $sub.FullName ([string]$it.final_name) }
             }
         }
-        if (-not $fail -and (Test-Path -LiteralPath $target)) {
-            $fail = "資料夾裡已經有同名檔案（不覆蓋，請手動處理）：$target"
-        }
         if (-not $fail) {
+            # 大家共用同一個雲端，任何開著的電腦都可能在歸檔：先領取，別台已經在處理就跳過
+            try { Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archive-claim") @{ pm = $Pm } | Out-Null }
+            catch { continue }
             $tmp = Join-Path $AppDir ("dl_" + $it.id + ".pdf")
             try {
                 Invoke-WebRequest -Uri ($Backend + "/api/pdf-rename/" + $it.id + "/file") -OutFile $tmp -TimeoutSec 300 -UseBasicParsing
-                [IO.File]::Move($tmp, $target)   # 不用 Move-Item：檔名有 [ ] 會被當成萬用字元
+                if (Test-Path -LiteralPath $target) {
+                    $same = (Get-FileHash -LiteralPath $tmp -Algorithm SHA1).Hash -eq (Get-FileHash -LiteralPath $target -Algorithm SHA1).Hash
+                    Remove-Item -LiteralPath $tmp -Force
+                    if (-not $same) { throw "資料夾裡已經有同名但內容不同的檔案（不覆蓋，請手動處理）：$target" }
+                } else {
+                    [IO.File]::Move($tmp, $target)   # 不用 Move-Item：檔名有 [ ] 會被當成萬用字元
+                }
                 Invoke-Api "POST" ("/api/pdf-rename/" + $it.id + "/archived") @{ ok = $true; result = "已放到 $target（$env:COMPUTERNAME）" } | Out-Null
                 $stats.archived_total++
                 $stats.last_archive = $target
                 Write-Log "已歸檔：$target"
             } catch {
-                $fail = "下載或搬移失敗：" + (Get-ErrorText $_)
+                $fail = Get-ErrorText $_
+                if ($fail -notlike "*同名*") { $fail = "下載或搬移失敗：" + $fail }
                 if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
             }
         }

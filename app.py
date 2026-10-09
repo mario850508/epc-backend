@@ -7106,7 +7106,8 @@ def pdf_rename_watcher_config():
     arc = _pdf_settings().get("archive") or {}
     return jsonify({"pm": pm, "folder": w.get("folder") or "", "enabled": bool(w.get("enabled", True)),
                     "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024),
-                    "archive": {"enabled": bool(arc.get("enabled")) and arc.get("pm") == pm,
+                    # pm 留空＝任何開著的電腦都可以歸檔（大家都存同一個公司雲端），用 archive-claim 避免兩台搶同一份
+                    "archive": {"enabled": bool(arc.get("enabled")) and (not arc.get("pm") or arc.get("pm") == pm),
                                 "roots": [x.strip() for x in (arc.get("roots") or "").splitlines() if x.strip()]}})
 
 
@@ -7126,6 +7127,25 @@ def pdf_rename_watcher_upload():
     if r["ok"] and not r.get("duplicate") and _pdf_settings().get("enabled"):
         _pdf_run_async()
     return jsonify(r), (200 if r["ok"] else 400)
+
+
+PDF_ARCHIVE_CLAIMS = {}   # {record_id: (pm, 領取時間)}；gunicorn 單一 worker，記憶體鎖即可
+
+
+@app.route("/api/pdf-rename/<record_id>/archive-claim", methods=["POST"])
+def pdf_rename_archive_claim(record_id):
+    """背景程式歸檔前先領取，10 分鐘內同一份只給一台電腦處理。"""
+    pm = ((request.get_json(force=True) or {}).get("pm") or "").strip()
+    now = time.time()
+    with PDF_LOCK_CLAIM:
+        holder = PDF_ARCHIVE_CLAIMS.get(record_id)
+        if holder and holder[0] != pm and now - holder[1] < 600:
+            return jsonify({"ok": False, "holder": holder[0]}), 409
+        PDF_ARCHIVE_CLAIMS[record_id] = (pm, now)
+    return jsonify({"ok": True})
+
+
+PDF_LOCK_CLAIM = threading.Lock()
 
 
 @app.route("/api/pdf-rename/watcher-heartbeat", methods=["POST"])
