@@ -230,7 +230,147 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
-CORS(app)
+
+# ===================================================================
+# 登入保護（2026-10-09）
+# 之前整個後端沒有任何驗證：知道網址就能讀到預約（含屋主姓名電話）、也能呼叫刪除。
+# 設計（先部署、不影響任何人，Render 設定了 DASHBOARD_PASSWORD 才會啟用）：
+#   1. 主控台登入：POST /api/login {password} → 簽名 token（30 天），之後每個 API 帶
+#      Authorization: Bearer <token>（下載連結用 ?access_token=）。改密碼＝所有 token 失效。
+#   2. 公開端點（本來就是「知道連結才能用」的 token 連結，或自帶金鑰）不需要登入：
+#      屋主頁／業務填單頁／廠商分享頁用到的 API、試算表推送、手動觸發排程。
+#   3. 機器呼叫（本機背景程式、Claude 排程）帶 X-Service-Key（SERVICE_KEY 或 BIZ_SHEET_SYNC_KEY）。
+#   4. 本機 PDF 背景程式 pdf_watcher.ps1 / pdf_learn.py 目前還沒帶金鑰：這幾支「過渡期」先放行
+#      並記錄是誰在呼叫（GET /api/auth/machine-hits），等程式更新帶金鑰後，Render 設
+#      AUTH_ENFORCE_MACHINE=1 就一起鎖上。
+#   5. CORS 只允許主控台網址（可用 CORS_ORIGINS 覆蓋，逗號分隔）。
+# ===================================================================
+import hmac
+import hashlib
+import base64
+import re as _re
+
+DASHBOARD_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS", "https://epc-dashboard-ee5f.onrender.com").split(",") if o.strip()]
+CORS(app, origins=DASHBOARD_ORIGINS + [_re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")])
+
+AUTH_TOKEN_DAYS = 30
+AUTH_PUBLIC_PREFIXES = ("/api/owner-booking/", "/api/vendor-slots/public-task/", "/api/vendor-share/")
+AUTH_PUBLIC_EXACT = {
+    "/api/login", "/api/auth/status",
+    "/api/line/liff-config", "/api/line/bind-rep", "/api/line/bind-scheduler",   # LIFF 綁定頁
+    "/api/site-survey-cancelled-sync", "/api/line/run-job",                      # 自己驗證金鑰
+}
+AUTH_MACHINE_EXACT = {
+    "/api/pdf-rename/watcher-config", "/api/pdf-rename/watcher-upload", "/api/pdf-rename/watcher-heartbeat",
+    "/api/pdf-rename/confirmed", "/api/pdf-rename/status",
+}
+AUTH_MACHINE_RE = _re.compile(r"^/api/pdf-rename/[^/]+/(archive-claim|archived|file)$")
+MACHINE_HITS = {}
+_LOGIN_FAILS = {}
+
+
+def _auth_password():
+    return os.environ.get("DASHBOARD_PASSWORD", "").strip()
+
+
+def _auth_secret():
+    base = os.environ.get("AUTH_SECRET") or (_auth_password() + "|" + (os.environ.get("BIZ_SHEET_SYNC_KEY") or ""))
+    return (base + "|epc-auth-v1").encode("utf-8")
+
+
+def _b64(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _auth_make_token():
+    payload = _b64(json.dumps({"exp": int(time.time()) + AUTH_TOKEN_DAYS * 86400}).encode())
+    return payload + "." + _b64(hmac.new(_auth_secret(), payload.encode(), hashlib.sha256).digest())
+
+
+def _auth_token_valid(token):
+    try:
+        payload, sig = (token or "").split(".", 1)
+        good = _b64(hmac.new(_auth_secret(), payload.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, good):
+            return False
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return int(data.get("exp", 0)) > time.time()
+    except Exception:
+        return False
+
+
+def _auth_service_key_ok():
+    key = request.headers.get("X-Service-Key", "")
+    if not key:
+        return False
+    for good in (os.environ.get("SERVICE_KEY", ""), os.environ.get("BIZ_SHEET_SYNC_KEY", "")):
+        if good and hmac.compare_digest(key, good):
+            return True
+    return False
+
+
+def _auth_request_token():
+    h = request.headers.get("Authorization", "")
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    if request.method == "GET":
+        return (request.args.get("access_token") or "").strip()
+    return ""
+
+
+@app.before_request
+def _auth_gate():
+    if not _auth_password():
+        return None                      # 還沒設定 DASHBOARD_PASSWORD：不啟用（跟以前一樣）
+    path = request.path
+    if request.method == "OPTIONS" or not path.startswith("/api/"):
+        return None
+    if path in AUTH_PUBLIC_EXACT or path.startswith(AUTH_PUBLIC_PREFIXES):
+        return None
+    if _auth_token_valid(_auth_request_token()) or _auth_service_key_ok():
+        return None
+    if path in AUTH_MACHINE_EXACT or AUTH_MACHINE_RE.match(path):
+        if os.environ.get("AUTH_ENFORCE_MACHINE", "").strip() != "1":
+            pattern = _re.sub(r"/(rec|pdf)[A-Za-z0-9]+/", "/<id>/", path)
+            key = (request.method, pattern, (request.headers.get("User-Agent") or "")[:70])
+            hit = MACHINE_HITS.setdefault(key, {"count": 0, "last": ""})
+            hit["count"] += 1
+            hit["last"] = datetime.now().isoformat(timespec="seconds")
+            return None
+    return jsonify({"error": "請先登入", "login_required": True}), 401
+
+
+@app.route("/api/auth/status")
+def auth_status():
+    return jsonify({"required": bool(_auth_password()), "valid": (not _auth_password()) or _auth_token_valid(_auth_request_token())})
+
+
+@app.route("/api/login", methods=["POST"])
+def auth_login():
+    if not _auth_password():
+        return jsonify({"ok": True, "token": "", "required": False})
+    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()) or (request.remote_addr or "")
+    now = time.time()
+    fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < 600]
+    if len(fails) >= 8:
+        return jsonify({"error": "嘗試次數太多，請 10 分鐘後再試"}), 429
+    body = request.get_json(silent=True) or {}
+    if not hmac.compare_digest(str(body.get("password") or ""), _auth_password()):
+        fails.append(now)
+        _LOGIN_FAILS[ip] = fails
+        return jsonify({"error": "密碼不對"}), 401
+    _LOGIN_FAILS.pop(ip, None)
+    return jsonify({"ok": True, "token": _auth_make_token(), "required": True})
+
+
+@app.route("/api/auth/machine-hits")
+def auth_machine_hits():
+    """過渡期：本機背景程式還沒帶金鑰的呼叫紀錄（要登入或 X-Service-Key 才看得到）。"""
+    rows = [{"method": k[0], "path": k[1], "user_agent": k[2], **v} for k, v in MACHINE_HITS.items()]
+    rows.sort(key=lambda r: r["last"], reverse=True)
+    return jsonify({"enforce_machine": os.environ.get("AUTH_ENFORCE_MACHINE", "").strip() == "1", "hits": rows})
+
 
 # ===================================================================
 # CONFIG
