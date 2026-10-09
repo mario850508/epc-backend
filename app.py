@@ -6266,6 +6266,7 @@ def _pdf_record_to_dict(r):
         "ids": result.get("ids") or {},
         "ids_writable": _pdf_writable_ids(result.get("ids") or {}, g("doc_type") or ""),
         "same_type": result.get("same_type") or [],
+        "conf_parts": result.get("conf_parts") or [],   # [案號, 類型, 日期] 各自的信心，主控台標出要特別看的欄位
         "file_ext": _pdf_ext(att.get("filename") or g("src_name") or ""),
         "attempts": g("attempts") or 0,
         "error": g("error") or "",
@@ -7251,6 +7252,7 @@ def _pdf_recognize(rec):
             out["issues"].append(f"文件上沒有日期，先用收件日 {received}" + ("" if normal else "（這類文件通常有日期，可能是沒讀到，請確認）"))
             parts = list(out.get("conf_parts") or [out["confidence"]] * 3)
             parts[2] = 85 if normal else 45
+            out["conf_parts"] = parts
             out["confidence"] = max(0, min(parts))
             out["evidence"] += f"\n日期：文件上沒有日期，用收件日 {received}（信心 {parts[2]}）"
     case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
@@ -7268,7 +7270,7 @@ def _pdf_recognize(rec):
     suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date,
                                 ext_name if ext_name in PDF_OFFICE_EXTS else ".pdf")
     # pred＝系統一開始的判斷；使用者確認（可能有修改）後拿來算真實準確度，也是自動重新學習的依據
-    result = dict(out["result"], issues=out["issues"], ids=ids, same_type=same,
+    result = dict(out["result"], issues=out["issues"], ids=ids, same_type=same, conf_parts=out.get("conf_parts") or [],
                   pred={"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date, "name": suggested}, candidates=[
         {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
          "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
