@@ -5874,6 +5874,7 @@ PDF_F = {
     "uploaded_at": "fldFYljqhbJy70LH3",    # 上傳時間
     "hash": "fldMrCmFdyyt5WQWJ",           # 檔案雜湊（SHA1，擋重複上傳）
     "src_path": "fldzoWNBfEWLtfflB",       # 來源路徑（LINE 收件資料夾裡的原始路徑）
+    "no_archive": "fldkHTxXMKSYLsjWL",     # 不歸檔（確認時選「只改名下載」，背景程式不放進 G 槽）
 }
 PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
 PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
@@ -6188,6 +6189,7 @@ def _pdf_record_to_dict(r):
         "uploaded_at": g("uploaded_at") or r.get("createdTime", ""),
         "src_path": g("src_path") or "",
         "category": _pdf_doc_category(g("doc_type") or ""),
+        "no_archive": bool(g("no_archive")),
         "case_no": g("case_no") or "",
         "alias": g("alias") or "",
         "doc_type": g("doc_type") or "",
@@ -7302,6 +7304,7 @@ def pdf_rename_confirm(record_id):
             PDF_F["case_no"]: case_no, PDF_F["alias"]: (case or {}).get("alias", ""),
             PDF_F["doc_type"]: doc_type, PDF_F["doc_date"]: doc_date or None,
             PDF_F["final_name"]: final_name, PDF_F["status"]: PDF_ST_CONFIRMED,
+            PDF_F["no_archive"]: not body.get("archive", True),
             PDF_F["confirmed_at"]: _tw_now_iso(), PDF_F["confirmed_by"]: (body.get("user") or "主控台").strip()[:50],
         })
     except Exception as e:
@@ -7361,8 +7364,9 @@ def pdf_rename_file(record_id):
 @app.route("/api/pdf-rename/confirmed")
 def pdf_rename_confirmed():
     try:
-        recs = airtable_get_all(PDF_API_URL, "{" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "'",
-                                list(PDF_F.values()))
+        # 確認時選「只改名下載、不歸檔」的不給背景程式
+        recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',NOT({"
+                                + PDF_F["no_archive"] + "}))", list(PDF_F.values()))
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"items": [_pdf_record_to_dict(r) for r in recs]})
