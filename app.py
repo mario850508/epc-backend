@@ -6029,7 +6029,17 @@ PDF_SETTINGS = {"data": None}
 # 存在「系統狀態」pdf_rename_aliases：{"map": {案號: 簡稱}, "rules": {案號前綴: 簡稱前綴}}。
 PDF_ALIAS_KEY = "pdf_rename_aliases"
 PDF_ALIASES = {"data": None}
-PDF_RUN = {"running": False, "last_run_at": None, "last_finished_at": None, "last_error": None, "last_count": 0}
+PDF_RUN = {"running": False, "last_run_at": None, "last_finished_at": None, "last_error": None, "last_count": 0,
+           # 主控台進度條用：這一輪共幾份、完成幾份、正在處理哪一份、做到哪一步；durations＝最近每份花的秒數（估剩餘時間）
+           "progress": None, "durations": []}
+
+
+def _pdf_step(step):
+    """記下目前這份做到哪一步（主控台進度條顯示）。"""
+    pr = PDF_RUN.get("progress")
+    if pr:
+        pr["step"] = step
+        pr["step_at"] = time.time()
 PDF_LOCK = threading.Lock()
 PDF_CASE_REF = {"cases": [], "at": 0}
 _ANTHROPIC_CLIENT = {"c": None}
@@ -6839,6 +6849,7 @@ def _pdf_get_text(pdf_bytes, settings, ext=".pdf"):
     url = (settings.get("ocr_url") or "").strip()
     if not url:
         raise Exception("這份是掃描檔（PDF 裡沒有文字），需要先在「⚙ 命名格式與函文規則」設定 Google OCR 網址")
+    _pdf_step("掃描檔，Google OCR 讀字中（約 10～40 秒）")
     return _pdf_ocr(pdf_bytes, url), "Google OCR"
 
 
@@ -7192,6 +7203,7 @@ def _pdf_recognize(rec):
     att = (f.get(PDF_F["file"]) or [{}])[0]
     if not att.get("url"):
         raise Exception("記錄裡沒有 PDF 檔案")
+    _pdf_step("下載檔案")
     pdf = requests.get(att["url"], timeout=120)
     pdf.raise_for_status()
 
@@ -7202,10 +7214,13 @@ def _pdf_recognize(rec):
     threshold = int(settings.get("auto_confirm_threshold") or 92)
     source = ""
     if engine == "ai":
+        _pdf_step("AI 判讀中")
         out = _pdf_ai_analyze(pdf.content, settings)
     else:
         try:
+            _pdf_step("讀取文件文字")
             text, source = _pdf_get_text(pdf.content, settings, ext_name)
+            _pdf_step("判斷類型、日期、比對案號")
             out = _pdf_free_analyze(text, source, settings)
         except Exception:
             if engine != "hybrid" or not os.environ.get("ANTHROPIC_API_KEY"):
@@ -7256,6 +7271,7 @@ def _pdf_recognize(rec):
             out["confidence"] = max(0, min(parts))
             out["evidence"] += f"\n日期：文件上沒有日期，用收件日 {received}（信心 {parts[2]}）"
     case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
+    _pdf_step("檢查同案場文件、產生檔名")
     # 同案場已經有同類型的文件（佇列裡的）：可能是重複收件或新版，一律留給人確認
     same = _pdf_same_type(case_no, doc_type, rec["id"])
     if same:
@@ -7486,13 +7502,20 @@ def pdf_rename_run(force=False):
         queued = airtable_get_all(PDF_API_URL, "{" + PDF_F["status"] + "}='" + PDF_ST_QUEUED + "'",
                                   list(PDF_F.values()))
         queued.sort(key=lambda r: r.get("createdTime", ""))
-        for rec in queued[:max(1, int(settings.get("batch_size") or 5))]:
+        batch = queued[:max(1, int(settings.get("batch_size") or 5))]
+        PDF_RUN["progress"] = {"total": len(batch), "done": 0, "failed": 0, "queued_total": len(queued),
+                               "started_at": time.time(), "current_id": "", "current_name": "", "step": "", "step_at": time.time()}
+        for rec in batch:
+            PDF_RUN["progress"].update(current_id=rec["id"], current_name=rec.get("fields", {}).get(PDF_F["src_name"]) or "",
+                                       item_started_at=time.time())
+            _pdf_step("準備中")
             attempts = int(rec.get("fields", {}).get(PDF_F["attempts"]) or 0) + 1
             _pdf_patch(rec["id"], {PDF_F["status"]: PDF_ST_RUNNING, PDF_F["attempts"]: attempts,
                                    PDF_F["recognized_at"]: _tw_now_iso()})
             try:
                 conf = _pdf_recognize(rec)
                 PDF_RUN["last_count"] += 1
+                PDF_RUN["durations"] = (PDF_RUN["durations"] + [time.time() - PDF_RUN["progress"]["item_started_at"]])[-20:]
                 print(f"[pdf_rename] {rec['id']} 辨識完成，信心 {conf}", flush=True)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"[:2000]
@@ -7500,13 +7523,16 @@ def pdf_rename_run(force=False):
                 _pdf_patch(rec["id"], {PDF_F["error"]: err,
                                        PDF_F["status"]: PDF_ST_FAILED if attempts >= PDF_MAX_ATTEMPTS else PDF_ST_QUEUED})
                 PDF_RUN["last_error"] = err
+                PDF_RUN["progress"]["failed"] += 1
                 if "ANTHROPIC_API_KEY" in err or "Google OCR 網址" in err:
                     break
+            finally:
+                PDF_RUN["progress"]["done"] += 1
     except Exception as e:
         PDF_RUN["last_error"] = f"{type(e).__name__}: {e}"[:2000]
         print(f"[pdf_rename] 執行失敗：{PDF_RUN['last_error']}", flush=True)
     finally:
-        PDF_RUN.update(running=False, last_finished_at=_tw_now_iso())
+        PDF_RUN.update(running=False, last_finished_at=_tw_now_iso(), progress=None)
         PDF_LOCK.release()
 
 
@@ -7614,6 +7640,32 @@ scheduler.add_job(pdf_rename_run, CronTrigger(minute="*"), id="pdf_rename", repl
 
 # ---------------- API ----------------
 
+def _pdf_progress_view(settings):
+    """進度條資料：辨識中＝這一輪的進度；沒在跑但佇列有檔案＝下一輪什麼時候開始。"""
+    durs = PDF_RUN.get("durations") or []
+    avg = round(sum(durs) / len(durs)) if durs else None
+    pr = PDF_RUN.get("progress")
+    out = {"avg_sec": avg}
+    if PDF_RUN["running"] and pr:
+        now = time.time()
+        out.update({k: pr.get(k) for k in ("total", "done", "failed", "queued_total", "current_id", "current_name", "step")},
+                   running=True, step_sec=round(now - (pr.get("step_at") or now)),
+                   item_sec=round(now - (pr.get("item_started_at") or now)), elapsed_sec=round(now - pr["started_at"]))
+    else:
+        out["running"] = False
+        last = PDF_RUN.get("last_run_at")
+        if settings.get("enabled") and last:
+            nxt = last + max(1, int(settings.get("interval_min") or 5)) * 60
+            out["next_run_at"] = datetime.fromtimestamp(max(nxt, time.time() + 60), TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    return out
+
+
+@app.route("/api/pdf-rename/progress")
+def pdf_rename_progress():
+    """辨識進度（只讀記憶體、不查 Airtable），主控台辨識中每幾秒問一次。"""
+    return jsonify(_pdf_progress_view(_pdf_settings()))
+
+
 @app.route("/api/pdf-rename/status")
 def pdf_rename_status():
     try:
@@ -7629,6 +7681,7 @@ def pdf_rename_status():
         "last_finished_at": PDF_RUN["last_finished_at"],
         "last_error": PDF_RUN["last_error"],
         "last_count": PDF_RUN["last_count"],
+        "progress": _pdf_progress_view(s),
         "api_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "alias_count": len(_pdf_aliases()["map"]),
         "watchers_status": PDF_WATCHER_STATUS,
