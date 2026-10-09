@@ -2103,8 +2103,8 @@ def _get_booking(record_id):
     return resp.json() if resp.status_code < 400 else None
 
 
-def _vendor_notice_card(rec):
-    from urllib.parse import quote
+def _booking_context(rec):
+    """預約的地址、座標（業務自治區優先）、負責業務名字。"""
     f = rec.get("fields", {})
     case_no = f.get(FIELD_SLOT_CASE_NO, "")
     address = ""
@@ -2128,17 +2128,48 @@ def _vendor_notice_card(rec):
         except Exception as e:
             print(f"[_vendor_notice_card] 查業務自治區座標失敗：{e}", flush=True)
     rep_name = f.get(FIELD_SLOT_REGISTRANT, "")
+    if rep_name.startswith("屋主"):   # 屋主自己約的：登記人不是業務，只能靠任務的指派對象
+        rep_name = ""
     try:
         trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + rec["id"] + "'", [FIELD_TASK_ASSIGNEE])
         if trs and trs[0]["fields"].get(FIELD_TASK_ASSIGNEE):
             rep_name = trs[0]["fields"][FIELD_TASK_ASSIGNEE]
     except Exception:
         pass
+    return address, coords, rep_name
+
+
+def _booking_time_text(f):
     date = f.get(FIELD_SLOT_DATE, "")
+    return _owner_time_text({"type": f.get(FIELD_SLOT_TYPE) or []}, date, f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, ""))
+
+
+def _rep_notice_card(rec):
+    """2026-10-10：窗口手動「通知業務」用的卡片（業務沒綁 LINE 或離職、由別人代處理時，轉傳給代辦同事）。"""
+    f = rec.get("fields", {})
+    address, coords, rep_name = _booking_context(rec)
+    case_no = f.get(FIELD_SLOT_CASE_NO, "")
+    return _card(
+        "📋 施工排程通知｜給業務", "#16A34A", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
+        subtitle=f"負責業務：{rep_name}" if rep_name else "",
+        rows=[("廠商", f.get(FIELD_SLOT_VENDOR, "")), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])),
+              ("時間", _booking_time_text(f)),
+              ("地址", address), ("座標", coords or ""),
+              ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
+              ("備註", (f.get(FIELD_SLOT_NOTE) or "").strip())],
+        note="請記得在行程前一天跟屋主提醒、確認時間",
+        buttons=_vendor_card_buttons(f, address, coords),
+    )
+
+
+def _vendor_notice_card(rec):
+    f = rec.get("fields", {})
+    case_no = f.get(FIELD_SLOT_CASE_NO, "")
+    address, coords, rep_name = _booking_context(rec)
     return _card(
         "📋 施工排程通知｜給廠商", "#2563EB", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
         rows=[("廠商", f.get(FIELD_SLOT_VENDOR, "")), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])),
-              ("時間", f"{_wd_label(date)} {f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}"),
+              ("時間", _booking_time_text(f)),
               ("地址", address), ("座標", coords or ""),
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
@@ -2218,6 +2249,42 @@ def vendor_slot_vendor_notice(record_id):
     })
 
 
+@app.route("/api/vendor-slots/<record_id>/rep-notice", methods=["POST"])
+def vendor_slot_rep_notice(record_id):
+    """2026-10-10：窗口按「通知業務」。業務有綁 LINE → 機器人直接推卡片；
+    沒綁定（沒加 LINE／離職）或推播失敗 → 回傳 LIFF 分享連結＋文字版，讓窗口用自己的 LINE 轉傳給代辦同事。
+    body: {share: true}（強制走分享，即使業務有綁定）"""
+    body = request.get_json(force=True) or {}
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    f = rec.get("fields", {})
+    if f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "這筆已經不是有效的預約（可能已經取消）"}), 409
+    _, _, rep_name = _booking_context(rec)
+    bound = False
+    if rep_name:
+        try:
+            bound = bool(_get_line_binding(rep_name))
+        except Exception as e:
+            print(f"[rep-notice] 查綁定失敗：{e}", flush=True)
+    if bound and not body.get("share"):
+        if _push_to_name(rep_name, _rep_notice_card(rec)):
+            return jsonify({"ok": True, "sent": True, "rep_name": rep_name})
+    token = f.get(FIELD_SLOT_VENDOR_TOKEN) or secrets.token_urlsafe(16)
+    if not f.get(FIELD_SLOT_VENDOR_TOKEN):
+        resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(),
+                              json={"fields": {FIELD_SLOT_VENDOR_TOKEN: token}}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    return jsonify({
+        "ok": True, "sent": False, "rep_name": rep_name, "bound": bound,
+        "liff_url": f"https://liff.line.me/{liff_id}?vshare={token}~rep" if liff_id else "",
+        "plain_text": _card_plain_text(_rep_notice_card(rec)),
+    })
+
+
 def _find_booking_by_vendor_token(token):
     token = (token or "").strip()
     if len(token) < 10:
@@ -2227,21 +2294,33 @@ def _find_booking_by_vendor_token(token):
     return _get_booking(recs[0]["id"]) if recs else None
 
 
+def _split_share_token(token):
+    """token 後面接 ~rep 代表是「通知業務」的卡片（同一個預約、同一組 token）。"""
+    token = (token or "").strip()
+    if token.endswith("~rep"):
+        return token[:-4], "rep"
+    return token, "vendor"
+
+
 @app.route("/api/vendor-share/<token>")
 def vendor_share_get(token):
+    token, kind = _split_share_token(token)
     try:
         rec = _find_booking_by_vendor_token(token)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     if not rec:
-        return jsonify({"error": "找不到這則廠商通知，可能已失效，請回主控台重新產生"}), 404
-    card = _vendor_notice_card(rec)
-    return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card),
-                    "sent_at": rec.get("fields", {}).get(FIELD_SLOT_VENDOR_NOTIFIED, "")})
+        return jsonify({"error": "找不到這則通知，可能已失效，請回主控台重新產生"}), 404
+    card = _rep_notice_card(rec) if kind == "rep" else _vendor_notice_card(rec)
+    return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": kind,
+                    "sent_at": "" if kind == "rep" else rec.get("fields", {}).get(FIELD_SLOT_VENDOR_NOTIFIED, "")})
 
 
 @app.route("/api/vendor-share/<token>/sent", methods=["POST"])
 def vendor_share_sent(token):
+    token, kind = _split_share_token(token)
+    if kind == "rep":   # 通知業務不記錄「已通知廠商」
+        return jsonify({"ok": True})
     try:
         rec = _find_booking_by_vendor_token(token)
     except Exception as e:
