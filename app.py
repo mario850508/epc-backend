@@ -7896,6 +7896,7 @@ def pdf_rename_watcher_heartbeat():
         "last_upload": str(body.get("last_upload") or "")[:200], "version": str(body.get("version") or "")[:20],
         "archived_total": int(body.get("archived_total") or 0), "last_archive": str(body.get("last_archive") or "")[:300],
         "archive_error": str(body.get("archive_error") or "")[:300], "case_folders": int(body.get("case_folders") or 0),
+        "archive_only": bool(body.get("archive_only")),
     }
     return jsonify({"ok": True})
 
