@@ -170,13 +170,37 @@ def collect(args, out_dir):
             log(f"  已找到 {n_folders} 個分類資料夾、{len(files)} 個檔案…")
     log(f"找到 {len(files)} 個檔案（含非 PDF）")
 
+    if args.only:
+        files = [f for f in files if f[0].startswith(args.only.zfill(2))]
+        log(f"只處理 {args.only}：{len(files)} 個檔案")
+    # 06 政府函文最重要（也幾乎都是掃描檔），先處理 06 → 04 → 07 → 03
+    order = {"06": 0, "04": 1, "07": 2, "03": 3}
+    files.sort(key=lambda f: order.get(f[0][:2], 9))
+
     ocr_url = args.ocr_url
     if args.ocr and not ocr_url:
-        try:
-            import requests
-            ocr_url = requests.get(BACKEND + "/api/pdf-rename/status", timeout=90).json()["settings"].get("ocr_url", "")
-        except Exception as e:
-            log("讀不到主控台的 OCR 設定，掃描檔不會 OCR：", e)
+        for attempt in range(3):   # Render 免費方案剛醒來可能要 1 分鐘
+            try:
+                import requests
+                ocr_url = requests.get(BACKEND + "/api/pdf-rename/status", timeout=120).json()["settings"].get("ocr_url", "")
+                break
+            except Exception as e:
+                log(f"讀取主控台 OCR 設定失敗（第 {attempt + 1} 次）：{e}")
+    if args.ocr:
+        if not ocr_url:
+            log("⚠ 沒有 OCR 網址，掃描檔不會 OCR（主控台「⚙ 命名格式與函文規則」設定，或加 --ocr-url）")
+        else:
+            try:
+                import requests
+                info = requests.get(ocr_url, timeout=60).json()
+                log(f"OCR 連線測試：{info.get('message') or info}")
+                if "v2" not in str(info.get("message", "")):
+                    log("⚠ Apps Script 不是最新版（v2），OCR 可能會失敗（Invalid Value）。"
+                        "請到主控台設定畫面複製新程式碼，並用「管理部署作業 → 新版本」重新部署")
+            except Exception as e:
+                log(f"⚠ OCR 連線測試失敗，掃描檔不會 OCR：{e}")
+                ocr_url = ""
+    ocr_errors = collections.Counter()
     per_type = collections.Counter()
     ocr_used = 0
     out = open(cache_path, "a", encoding="utf-8")
@@ -196,7 +220,7 @@ def collect(args, out_dir):
             continue
         key = f"{row['rel']}|{st.st_size}|{int(st.st_mtime)}"
         if key in cache and not (args.ocr and ocr_url and cache[key].get("scan") and not cache[key].get("ocr")
-                                 and ocr_used < args.ocr_limit):
+                                 and ocr_used < args.ocr_limit) and not cache[key].get("error"):
             rows.append(cache[key])
             per_type[tkey] += 1
             continue
@@ -209,9 +233,19 @@ def collect(args, out_dir):
             if len(re.sub(r"\s", "", text)) < MIN_TEXT:
                 row["scan"] = True
                 if args.ocr and ocr_url and ocr_used < args.ocr_limit:
-                    text = ocr(first_pages_pdf(reader), ocr_url)
-                    row["ocr"] = True
                     ocr_used += 1
+                    try:
+                        text = ocr(first_pages_pdf(reader), ocr_url)
+                        row["ocr"] = True
+                    except Exception as e:
+                        msg = f"{type(e).__name__}: {e}"[:160]
+                        ocr_errors[msg] += 1
+                        row["ocr_error"] = msg
+                        if ocr_errors[msg] <= 2:
+                            log(f"  ⚠ OCR 失敗（{fn}）：{msg}")
+                        if sum(ocr_errors.values()) >= 10 and not any(r.get("ocr") for r in rows[-30:]):
+                            log("  ⚠ OCR 連續失敗，這次先停止 OCR，請把上面的錯誤訊息截圖給 Claude")
+                            ocr_url = ""
             row["text"] = text[:MAX_TEXT]
         except Exception as e:
             row["error"] = f"{type(e).__name__}: {e}"[:200]
@@ -223,6 +257,11 @@ def collect(args, out_dir):
         if (i + 1) % 25 == 0:
             log(f"  {i + 1}/{len(files)}… (OCR {ocr_used} 份)")
     out.close()
+    if ocr_errors:
+        log("OCR 錯誤統計：")
+        for msg, n in ocr_errors.most_common(5):
+            log(f"  {n} 次：{msg}")
+    log(f"這次 OCR 了 {ocr_used} 份")
     return rows
 
 
@@ -411,6 +450,8 @@ def analyze(rows, out_dir):
         "holdout_accuracy": [correct, total],
         "confusion": [[a, b, c] for (a, b), c in confusion.most_common(30)],
         "scans_without_text": sum(1 for r in pdfs if r.get("scan") and not r.get("ocr")),
+        "ocr_done": sum(1 for r in pdfs if r.get("ocr")),
+        "ocr_errors": collections.Counter(r["ocr_error"] for r in pdfs if r.get("ocr_error") and not r.get("ocr")).most_common(5),
     }
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
@@ -426,7 +467,8 @@ def main():
     ap.add_argument("--max-mb", type=int, default=25, help="超過幾 MB 的檔案略過，預設 25")
     ap.add_argument("--ocr", action="store_true", help="掃描檔用主控台設定的 Google OCR 轉文字")
     ap.add_argument("--ocr-url", default="", help="指定 OCR 網址（預設讀主控台設定）")
-    ap.add_argument("--ocr-limit", type=int, default=150, help="這次最多 OCR 幾份，預設 150")
+    ap.add_argument("--ocr-limit", type=int, default=400, help="這次最多 OCR 幾份，預設 400")
+    ap.add_argument("--only", default="", help="只處理某個分類，例如 --only 06")
     ap.add_argument("--out", default="", help="輸出資料夾，預設是這支程式旁邊的 pdf_learn_data")
     args = ap.parse_args()
     if not os.path.isdir(args.root):
@@ -439,7 +481,7 @@ def main():
     acc = report["holdout_accuracy"]
     log("")
     log(f"完成！類型 {len(report['type_stats'])} 種、案場 {len(report['aliases'])} 個、"
-        f"關鍵字驗證正確率 {acc[0]}/{acc[1]}、還沒 OCR 的掃描檔 {report['scans_without_text']} 份")
+        f"關鍵字驗證正確率 {acc[0]}/{acc[1]}、已 OCR {report['ocr_done']} 份、還沒 OCR 的掃描檔 {report['scans_without_text']} 份")
     log("請把這兩個檔案傳給 Claude：")
     log("  ", os.path.join(out_dir, "report.md"))
     log("  ", os.path.join(out_dir, "report.json"))

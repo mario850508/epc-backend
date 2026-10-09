@@ -5892,21 +5892,107 @@ FIELD_CASE_TP_CONTRACT_NO = "fldgZkOWhJWi54wUD"  # 台電契約編號
 FIELD_CASE_PV_NO = "fldBU6s0FgcDojilc"         # 併聯PV編號
 FIELD_CASE_AGREE_NO = "fldOYJoRZy0Uoym41"      # 同意備案編號
 
-# 預設函文類型。milestone＝確認後要寫回「進度管理」哪一種里程碑的完成日期（空字串＝不寫回）。
+# 2026-10-09：依使用者 G 槽 7,453 份已改名歷史檔案（tools/pdf_learn.py 報告）整理。
+# name＝使用者實際檔名用的類型（出現最多的寫法）；synonyms＝檔名裡的其他寫法（學習工具歸併用）；
+# category＝放哪個資料夾；milestone＝確認後寫回「進度管理」的里程碑；
+# date_keys＝這類文件的日期前面會出現的字（依序找，找不到再用一般「發文日期／中華民國」規則）。
 PDF_DEFAULT_DOC_TYPES = [
-    {"name": "併聯審查", "keywords": "併聯審查意見書、併聯審查結果、同意併聯", "milestone": "併聯審查", "note": "台電區處回覆併聯審查結果"},
-    {"name": "同意備案", "keywords": "同意備案、再生能源發電設備同意備案", "milestone": "同意備案", "note": "縣市政府或能源署核發"},
-    {"name": "細部協商", "keywords": "細部協商、併聯細部協商", "milestone": "細部協商", "note": ""},
-    {"name": "免雜", "keywords": "免請領雜項執照、免雜項執照、免雜", "milestone": "免雜", "note": "建管單位核發"},
-    {"name": "購售契約函文", "keywords": "檢送購售電契約、檢送再生能源購售電契約", "milestone": "購售契約函文", "note": "台電寄送契約的函文（主旨是「檢送」）"},
-    {"name": "台電購售契約", "keywords": "購售電契約書、立契約書人", "milestone": "台電購售契約", "note": "契約書本體"},
-    {"name": "併聯試運轉", "keywords": "併聯試運轉", "milestone": "併聯試運轉", "note": ""},
-    {"name": "正式售電函", "keywords": "正式購售電、正式售電、躉購費率", "milestone": "正式售電函", "note": ""},
-    {"name": "竣工備查", "keywords": "竣工、竣工備查", "milestone": "竣工備查", "note": ""},
-    {"name": "設備登記", "keywords": "設備登記、再生能源發電設備登記", "milestone": "設備登記", "note": ""},
-    {"name": "台電審訖圖", "keywords": "審訖、單線圖審訖", "milestone": "台電審訖圖", "note": ""},
-    {"name": "電表租約", "keywords": "電表租約、電表租用", "milestone": "電表租約", "note": ""},
-    {"name": "第一張電費單", "keywords": "電費通知單、購電費用", "milestone": "第一張電費單", "note": ""},
+    # ---- 06 政府函文及相關文件 ----
+    {"name": "併聯審查", "category": "06", "milestone": "併聯審查", "synonyms": "併聯審查函、併聯審查意見書",
+     "keywords": "併聯審查意見書、併聯審查結果、併聯審查、同意併聯"},
+    {"name": "同意備案", "category": "06", "milestone": "同意備案", "synonyms": "同意備案函",
+     "keywords": "同意備案、准予備案、第三型再生能源發電設備"},
+    {"name": "細部協商", "category": "06", "milestone": "細部協商", "synonyms": "細協",
+     "keywords": "細部協商、併聯細部協商、協商結果"},
+    {"name": "細協補件通知", "category": "06", "milestone": "", "synonyms": "",
+     "keywords": "補件、補正、細部協商"},
+    {"name": "審訖圖", "category": "06", "milestone": "台電審訖圖", "synonyms": "審迄圖、台電審訖圖",
+     "keywords": "審訖、審迄、審定、單線圖審查"},
+    {"name": "結構計算書", "category": "06", "milestone": "結構計算書", "synonyms": "",
+     "keywords": "結構計算書、結構計算、風力計算、風壓、構件檢核", "date_keys": "日期、中華民國"},
+    {"name": "免雜", "category": "06", "milestone": "免雜", "synonyms": "免雜函、免雜更正函",
+     "keywords": "免請領雜項執照、免申請雜項執照、雜項執照、免雜"},
+    {"name": "免雜附件", "category": "06", "milestone": "", "synonyms": "免雜附件一、免雜附件二、免雜附件三、免雜附件一、二、三、附件二免雜簽證表、附件四完竣證明書",
+     "keywords": "簽證表、結構安全證明書、完竣證明書、免雜附件"},
+    {"name": "台電契約", "category": "06", "milestone": "台電購售契約", "synonyms": "台電購售契約",
+     "keywords": "再生能源發電設備購售電契約、購售電契約書、立契約書人、契約條款", "date_keys": "簽訂日期、簽約日期、中華民國"},
+    {"name": "台電契約函", "category": "06", "milestone": "購售契約函文", "synonyms": "台電契約函文、購售契約函文",
+     "keywords": "檢送、購售電契約、契約乙份"},
+    {"name": "台電契約移轉", "category": "06", "milestone": "移轉契約", "synonyms": "",
+     "keywords": "契約移轉、移轉、承受、過戶、轉讓"},
+    {"name": "設備登記", "category": "06", "milestone": "設備登記", "synonyms": "設備登記函",
+     "keywords": "設備登記、再生能源發電設備登記、准予登記"},
+    {"name": "設備登記移轉", "category": "06", "milestone": "移轉設備", "synonyms": "",
+     "keywords": "設備登記、移轉、變更登記、讓與"},
+    {"name": "電表租約", "category": "06", "milestone": "電表租約", "synonyms": "電表租約(屋主)、電表租約函",
+     "keywords": "電表租約、租用電表、電表租用、表租"},
+    {"name": "正式售電函", "category": "06", "milestone": "正式售電函", "synonyms": "正式售電",
+     "keywords": "正式購售電、正式售電、躉購費率、正式併聯"},
+    {"name": "併聯試運轉函", "category": "06", "milestone": "併聯試運轉", "synonyms": "併聯試運轉",
+     "keywords": "併聯試運轉、試運轉"},
+    {"name": "竣工備查", "category": "06", "milestone": "竣工備查", "synonyms": "竣工備查函",
+     "keywords": "竣工備查、竣工、准予備查"},
+    {"name": "竣工試驗報告", "category": "06", "milestone": "", "synonyms": "",
+     "keywords": "竣工試驗報告、試驗報告、功率追蹤、獨立型"},
+    {"name": "補助同意函", "category": "06", "milestone": "", "synonyms": "補助同意通知函",
+     "keywords": "補助、同意補助、補助款"},
+    {"name": "臺電契約匯款帳戶", "category": "06", "milestone": "", "synonyms": "",
+     "keywords": "虛擬帳號、專屬帳號、核銷作業、匯款帳戶"},
+    {"name": "申請案件告知單", "category": "06", "milestone": "", "synonyms": "",
+     "keywords": "告知單、申請案件"},
+    # ---- 04 電廠設計圖 ----
+    {"name": "支架拆圖", "category": "04", "milestone": "支架拆圖", "synonyms": "支架拆圖(用印版)、支架拆圖(用印)",
+     "keywords": "支架拆圖、傾斜角度、模組傾斜、立柱、檁條", "date_keys": "日期"},
+    {"name": "串併圖", "category": "04", "milestone": "串並圖", "synonyms": "串並圖、串並圖(工務版)、串接圖、串並、模組串併圖、串併圖(工務版)、串並圖(EPC版)",
+     "keywords": "串接圖、串併圖、串並圖、串列", "date_keys": "日期"},
+    {"name": "系統送審圖", "category": "04", "milestone": "系統送審圖", "synonyms": "系統送審、送審圖、台電送審圖",
+     "keywords": "昇位圖、監造者、用電裝置、竣工圖、系統送審", "date_keys": "日期"},
+    {"name": "單線圖", "category": "04", "milestone": "單線圖", "synonyms": "",
+     "keywords": "單線圖", "date_keys": "日期"},
+    # ---- 07 設備保固及出廠證明 ----
+    {"name": "模組序號", "category": "07", "milestone": "", "synonyms": "模組序號表、模組設備序號表",
+     "keywords": "序號、Serial、S/N、模組序號"},
+    {"name": "變流器出廠暨保固證明書", "category": "07", "milestone": "", "synonyms": "變流器出廠證明",
+     "keywords": "碩天科技、原廠出廠、變流器、逆變器、保固期間", "date_keys": "保固期間民國、保固期間為民國、保固期間"},
+    {"name": "模組出廠證明書", "category": "07", "milestone": "", "synonyms": "模組出廠證明、高效能模組出廠證明",
+     "keywords": "出廠證明書、友達光電、模組", "date_keys": "中華民國"},
+    {"name": "模組出廠暨保固證明書", "category": "07", "milestone": "", "synonyms": "模組產品出廠暨保固證明書、產品出廠暨保固證明書、模組出廠保固證明",
+     "keywords": "出廠暨保固證明書、模組、保固", "date_keys": "中華民國"},
+    {"name": "模組發票", "category": "07", "milestone": "設備發票", "synonyms": "",
+     "keywords": "電子發票證明聯、統一發票、營業稅、模組", "date_keys": "電子發票證明聯、發票日期"},
+    {"name": "變流器發票", "category": "07", "milestone": "設備發票", "synonyms": "",
+     "keywords": "電子發票證明聯、統一發票、營業稅、變流器、逆變器", "date_keys": "電子發票證明聯、發票日期"},
+    {"name": "設備發票", "category": "07", "milestone": "設備發票", "synonyms": "",
+     "keywords": "電子發票證明聯、統一發票、營業稅", "date_keys": "電子發票證明聯、發票日期"},
+    {"name": "支架出廠證明", "category": "07", "milestone": "", "synonyms": "支架出場證明、支架出廠證明書",
+     "keywords": "出貨日期、鋼鐵股份、支架、出廠證明", "date_keys": "出貨日期、中華民國"},
+    {"name": "支架保固文件", "category": "07", "milestone": "支架保固文件", "synonyms": "支架保固文件(H鋼)、支架保固文件(C鋼)",
+     "keywords": "支架、保固書、保固期限"},
+    {"name": "支架材質證明", "category": "07", "milestone": "", "synonyms": "材質證明、材質證明-H",
+     "keywords": "材質證明、化學成分、機械性質"},
+    {"name": "熱浸鍍鋅證明", "category": "07", "milestone": "", "synonyms": "鍍鋅證明、熱浸鍍鋅檢驗報告、熱浸鍍鋅報告",
+     "keywords": "熱浸鍍鋅、鍍鋅、附著量"},
+    {"name": "太陽能系統保固書", "category": "07", "milestone": "", "synonyms": "太陽能保固書",
+     "keywords": "系統保固、保固書、保固範圍"},
+    {"name": "模組保固書", "category": "07", "milestone": "", "synonyms": "模組保固文件",
+     "keywords": "模組、保固書、功率保固"},
+    # ---- 03 契約 ----
+    {"name": "公證書", "category": "03", "milestone": "公證日", "synonyms": "公證書(潤特)",
+     "keywords": "公證書、公證人、認證", "date_keys": "中華民國"},
+    {"name": "工程合約", "category": "03", "milestone": "工程合約簽約", "synonyms": "工程合約(潤特)、工程合約(EPC)、工程合約_EPC、工程契約、工程合約_尚展、工程合約_三創",
+     "keywords": "工程合約、工程契約、太陽光電發電系統工程、甲方、乙方", "date_keys": "中華民國"},
+    {"name": "協議書", "category": "03", "milestone": "", "synonyms": "協議書(潤特)、工程協議書、工程協議書(EPC)",
+     "keywords": "協議書、立協議書人"},
+    {"name": "採購委託書", "category": "03", "milestone": "", "synonyms": "",
+     "keywords": "採購委託書、委託採購"},
+    {"name": "終止契約", "category": "03", "milestone": "", "synonyms": "終止合約、工程終止協議書、工程終止協議書V",
+     "keywords": "終止、解除契約、終止協議"},
+    {"name": "同意書", "category": "03", "milestone": "", "synonyms": "建築改良物使用同意書、公證同意書",
+     "keywords": "同意書、使用同意、立同意書人"},
+    {"name": "屋頂租賃合約書", "category": "03", "milestone": "", "synonyms": "太陽光電發電系統屋頂租賃合約書",
+     "keywords": "租賃、屋頂租賃、租金"},
+    {"name": "增補協議書", "category": "03", "milestone": "", "synonyms": "(帳戶異動)第一次增補協議書、(房屋易主)第一次增補協議書",
+     "keywords": "增補協議書、增補"},
 ]
 PDF_DEFAULT_SETTINGS = {
     "enabled": True,                # 背景自動辨識
@@ -5915,13 +6001,17 @@ PDF_DEFAULT_SETTINGS = {
     "auto_confirm": False,          # 高信心直接確認（不用人工按）
     "auto_confirm_threshold": 92,   # 自動確認門檻
     "writeback": True,              # 確認後把發文日期寫回進度管理（只填空白）
-    "template": "{案號}_{函文類型}_{日期}",
+    "template": "{簡稱}_{日期}_{函文類型}",   # 使用者實際命名：桃1_20250106_併聯審查
     "doc_types": PDF_DEFAULT_DOC_TYPES,
     "rules_csv_url": "",            # 選填：Google Sheet「發布為 CSV」網址，欄位 函文類型/關鍵字/對應里程碑/說明
     "engine": "free",               # free＝完全免費（文字層＋Google OCR＋規則）／hybrid＝沒把握的才用 AI／ai＝全部用 AI
     "ocr_url": "",                  # 掃描檔用：使用者部署的 Apps Script 網址（Google 雲端硬碟 OCR）
 }
 PDF_SETTINGS = {"data": None}
+# 案號 → 簡稱（例如 潤特桃園1號 → 桃1、舊案保留原本的 千82／風29），從使用者 G 槽資料夾＋檔名學來，
+# 存在「系統狀態」pdf_rename_aliases：{"map": {案號: 簡稱}, "rules": {案號前綴: 簡稱前綴}}。
+PDF_ALIAS_KEY = "pdf_rename_aliases"
+PDF_ALIASES = {"data": None}
 PDF_RUN = {"running": False, "last_run_at": None, "last_finished_at": None, "last_error": None, "last_count": 0}
 PDF_LOCK = threading.Lock()
 PDF_CASE_REF = {"cases": [], "at": 0}
@@ -5943,6 +6033,62 @@ def _pdf_settings():
             print(f"[pdf_rename] 讀取設定失敗，用預設值：{e}", flush=True)
         PDF_SETTINGS["data"] = data
     return PDF_SETTINGS["data"]
+
+
+def _pdf_aliases():
+    if PDF_ALIASES["data"] is None:
+        data = {"map": {}, "rules": {}}
+        try:
+            raw = _state_get_long(PDF_ALIAS_KEY)
+            if raw:
+                data.update(json.loads(raw))
+        except Exception as e:
+            print(f"[pdf_rename] 讀取簡稱對照失敗：{e}", flush=True)
+        PDF_ALIASES["data"] = data
+    return PDF_ALIASES["data"]
+
+
+def _pdf_short_name(case_no):
+    """案號 → 簡稱；對照表沒有的，用前綴規則推（潤特桃園95號 → 桃95）。"""
+    if not case_no:
+        return ""
+    al = _pdf_aliases()
+    if case_no in al["map"]:
+        return al["map"][case_no]
+    m = re.match(r"^(.+?)(\d+)號$", case_no)
+    if m and m.group(1) in al["rules"]:
+        return al["rules"][m.group(1)] + m.group(2)
+    return ""
+
+
+def _pdf_aliases_from_report(report):
+    """pdf_learn.py 的 report.json → 簡稱對照。案場資料夾「003 潤特桃園3號_中壢…」取出案號，
+    簡稱用檔名最常見的前綴；前綴怪怪的（人名、地址）就用同區規則補。"""
+    good = re.compile(r"^[\u4e00-\u9fff]{1,3}\d+$")
+    amap, others = {}, {}
+    for a in report.get("aliases") or []:
+        m = re.match(r"^\s*\d+\s*[-_.、 ]?\s*([^\s_（(]+?號)", a.get("case_dir") or "")
+        if m and a.get("prefix"):
+            amap.setdefault(m.group(1), a["prefix"])
+            others[m.group(1)] = a.get("others") or []
+    counter = {}
+    for k, v in amap.items():
+        a, b = re.match(r"^(.+?)(\d+)號$", k), re.match(r"^([\u4e00-\u9fff]{1,3})(\d+)$", v)
+        if a and b and a.group(2) == b.group(2):
+            counter.setdefault(a.group(1), {}).setdefault(b.group(1), 0)
+            counter[a.group(1)][b.group(1)] += 1
+    rules = {k: max(c, key=c.get) for k, c in counter.items()}
+    for k, v in list(amap.items()):
+        if good.match(v):
+            continue
+        alt = next((o for o in others.get(k, []) if good.match(o)), None)
+        a = re.match(r"^(.+?)(\d+)號$", k)
+        new = alt or (rules[a.group(1)] + a.group(2) if a and a.group(1) in rules else None)
+        if new:
+            amap[k] = new
+        else:
+            del amap[k]
+    return {"map": amap, "rules": rules}
 
 
 def _pdf_save_settings(data):
@@ -6149,8 +6295,15 @@ def _pdf_match_cases(ext, fulltext=None):
                 add(c, 15, f"地址相近 {int(ratio * 100)}%（{raw}）")
     texts = [_norm_text(x) for x in (idents.get("names") or []) + [ext.get("subject") or "", ext.get("recipient") or ""]]
     texts = [t for t in texts if t]
+    # 送件名稱很多案件共用（例如「潤特綠能股份有限公司」），共用 3 件以上的不拿來比
+    name_count = {}
+    for c in cases:
+        if c["submit_name"]:
+            name_count[c["submit_name"]] = name_count.get(c["submit_name"], 0) + 1
     for c in cases:
         for label, val, pts in (("送件名稱", c["submit_name"], 40), ("別名", c["alias"], 30)):
+            if label == "送件名稱" and name_count.get(val, 0) >= 3:
+                continue
             v = _norm_text(val)
             if len(v) >= 3 and any(v in t for t in texts):
                 add(c, pts, f"{label}「{val}」出現在文件")
@@ -6313,8 +6466,10 @@ def _pdf_valid_date(s):
 
 def _pdf_build_name(template, case, doc_type, doc_date):
     d = _pdf_valid_date(doc_date) if doc_date else None
+    case_no = case.get("case_no", "") if case else ""
     vals = {
-        "案號": case.get("case_no", "") if case else "",
+        "案號": case_no,
+        "簡稱": _pdf_short_name(case_no) or case_no,
         "別名": case.get("alias", "") if case else "",
         "函文類型": doc_type or "",
         "日期": d.strftime("%Y%m%d") if d else "",
@@ -6386,13 +6541,23 @@ def _pdf_flat(text):
     return re.sub(r"\s+", "", t)
 
 
-def _pdf_rule_date(flat):
-    """回傳 (YYYY-MM-DD, 文件原文, 信心)。"""
+def _pdf_rule_date(flat, date_keys=""):
+    """回傳 (YYYY-MM-DD, 文件原文, 信心)。date_keys＝這類文件日期前面會出現的字（規則設定），先找這些。"""
+    for key in [k.strip() for k in re.split(r"[、,，;；]", date_keys or "") if k.strip()]:
+        pat = re.escape(_pdf_flat(key)) + r"[^0-9]{0,6}?(?:中華民國|民國)?(\d{2,4})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})"
+        for m in re.finditer(pat, flat):
+            y, mo, d = (int(x) for x in m.groups())
+            if y < 1000:
+                y += 1911
+            iso = f"{y:04d}-{mo:02d}-{d:02d}"
+            if _pdf_valid_date(iso):
+                return iso, m.group(0), 90
     pats = [
         (r"發文日期:?(?:中華民國)?(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 95),
         (r"發文日期:?(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})", True, 90),
         (r"中華民國(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 65),
         (r"(20\d{2})年(\d{1,2})月(\d{1,2})日", False, 55),
+        (r"(?<!\d)(20\d{2})[/.-](\d{1,2})[/.-](\d{1,2})(?!\d)", False, 50),   # 設計圖圖框常見 2023/12/01
         (r"(?<!\d)(\d{3})年(\d{1,2})月(\d{1,2})日", True, 55),
     ]
     for pat, roc, conf in pats:
@@ -6417,6 +6582,12 @@ def _pdf_rule_doc_type(flat, subject, settings):
         kws = {k.strip() for k in re.split(r"[、,，;；/\s]+", raw) if len(k.strip()) >= 2}
         kws.add(name)
         score, hits = 0, []
+        # 文件標題就是類型名稱（或檔名常用的其他寫法）時，直接加重分：例如「串接圖」「產品出廠暨保固證明書」
+        titles = {name} | {re.sub(r"[（(][^）)]*[）)]", "", x).strip() for x in re.split(r"[、,，]", t.get("synonyms") or "")}
+        title_hit = next((x for x in sorted(titles, key=len, reverse=True) if len(x) >= 3 and _pdf_flat(x) in flat), None)
+        if title_hit:
+            score += 4
+            hits.append(f"文件標題有「{title_hit}」")
         for k in kws:
             kf = _pdf_flat(k)
             if kf and kf in subject:
@@ -6432,7 +6603,7 @@ def _pdf_rule_doc_type(flat, subject, settings):
     results.sort(key=lambda x: -x[0])
     best = results[0]
     second = results[1][0] if len(results) > 1 else 0
-    in_subject = any(h.startswith("主旨") for h in best[2])
+    in_subject = any(h.startswith("主旨") or h.startswith("文件標題") for h in best[2])
     if in_subject and best[0] - second >= 2:
         conf = 92
     elif in_subject and best[0] > second:
@@ -6456,8 +6627,9 @@ def _pdf_rule_extract(text, settings):
     m = re.search(r"(臺灣電力股份有限公司[一-鿿]{0,12}?(?:區營業處|處|分處|公司)|台灣電力股份有限公司[一-鿿]{0,12}?(?:區營業處|處|分處|公司)"
                   r"|經濟部能源署|經濟部[一-鿿]{0,6}局|[一-鿿]{2,3}[縣市]政府(?:[一-鿿]{1,6}?(?:局|處))?)", flat)
     issuer = m.group(1) if m else ""
-    doc_date, date_raw, date_conf = _pdf_rule_date(flat)
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
+    rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
+    doc_date, date_raw, date_conf = _pdf_rule_date(flat, rule.get("date_keys") or "")
     addresses = re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿0-9\-之巷弄段路街村里鄰]{2,30}?號", flat)
     addresses += re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿]{1,8}段[0-9\-、]{1,30}地號", flat)
     ext = {
@@ -6798,6 +6970,7 @@ def pdf_rename_status():
         "last_error": PDF_RUN["last_error"],
         "last_count": PDF_RUN["last_count"],
         "api_key_configured": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "alias_count": len(_pdf_aliases()["map"]),
         "model": PDF_MODEL,
         "settings": s,
     })
@@ -6901,12 +7074,13 @@ def pdf_rename_save_settings():
             return jsonify({"error": "OCR 網址應該是 https://script.google.com/ 開頭的 Apps Script 網址"}), 400
         s["ocr_url"] = u
     if "doc_types" in body:
-        types = [{"name": (t.get("name") or "").strip(), "keywords": (t.get("keywords") or "").strip(),
-                  "milestone": (t.get("milestone") or "").strip(), "note": (t.get("note") or "").strip()}
+        types = [{k: (t.get(k) or "").strip() for k in ("name", "keywords", "milestone", "note", "category", "synonyms", "date_keys")}
                  for t in body.get("doc_types") or [] if isinstance(t, dict) and (t.get("name") or "").strip()]
         if not types:
             return jsonify({"error": "至少要有一種函文類型"}), 400
         s["doc_types"] = types
+    if body.get("reset_doc_types"):
+        s["doc_types"] = PDF_DEFAULT_DOC_TYPES
     if body.get("reload_csv"):
         if not s.get("rules_csv_url"):
             return jsonify({"error": "還沒填 Google Sheet CSV 網址"}), 400
@@ -6919,6 +7093,21 @@ def pdf_rename_save_settings():
     except Exception as e:
         return jsonify({"error": f"儲存設定失敗：{e}"}), 502
     return jsonify({"ok": True, "settings": s})
+
+
+@app.route("/api/pdf-rename/import-learn", methods=["POST"])
+def pdf_rename_import_learn():
+    """匯入 tools/pdf_learn.py 產生的 report.json：目前用來建立案號 → 簡稱對照（檔名 {簡稱}）。"""
+    report = request.get_json(force=True) or {}
+    al = _pdf_aliases_from_report(report)
+    if not al["map"]:
+        return jsonify({"error": "report.json 裡沒有可用的案場簡稱"}), 400
+    try:
+        _state_set_long(PDF_ALIAS_KEY, json.dumps(al, ensure_ascii=False))
+    except Exception as e:
+        return jsonify({"error": f"儲存失敗：{e}"}), 502
+    PDF_ALIASES["data"] = al
+    return jsonify({"ok": True, "count": len(al["map"]), "rules": al["rules"]})
 
 
 @app.route("/api/pdf-rename/test-ocr", methods=["POST"])
