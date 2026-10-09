@@ -13,6 +13,7 @@ PDF 公文更名：文件類型分類模型的核心計算（app.py 自動重新
 """
 import collections
 import math
+import random
 import re
 
 HEAD = 1500
@@ -151,3 +152,96 @@ def date_keys_from_ctx(date_ctx, min_count=3, top=4):
         if picked:
             keys[lab] = picked
     return keys
+
+
+# ---------------- 用歷史檔案建立「基礎統計」（tools/pdf_train.py、使用者電腦上的 pdf_learn.py --auto 共用）----------------
+
+def canon_from_doc_types(doc_types):
+    """主控台的文件類型設定 → {檔名裡的各種寫法: 正式類型}。"""
+    canon = {}
+    for t in doc_types or []:
+        name = (t.get("name") or "").strip()
+        if not name:
+            continue
+        canon[name] = name
+        for x in re.split(r"[、,，]", t.get("synonyms") or ""):
+            if x.strip():
+                canon[x.strip()] = name
+    return canon
+
+
+def norm_label(type_base, canon):
+    tb = (type_base or "").split("_")[-1]
+    if tb in canon:
+        return canon[tb]
+    for k in sorted(canon, key=len, reverse=True):
+        if len(k) >= 2 and k in tb:
+            return canon[k]
+    return None
+
+
+def build_base(rows, canon, log=print, folds=5):
+    """samples.jsonl 的列 → (分類模型, 基礎統計)。
+    依案場分 folds 折交叉驗證（測試的案場完全沒學過）估準確度，並用分數差做信心校正。"""
+    docs, seen = [], set()
+    for r in rows:
+        if not r.get("label") or not r.get("text") or len(flat(r["text"])) < 40:
+            continue
+        # 同一份檔案可能因為不同次掃描的根目錄不同而重複出現
+        k = (r.get("case_dir"), r.get("file"), r.get("size"))
+        if k in seen:
+            continue
+        seen.add(k)
+        lab = norm_label(r["label"].get("type_base"), canon)
+        if lab:
+            docs.append((lab, r["case_dir"], grams(r["text"]), r))
+    log(f"可用樣本 {len(docs)} 份、{len(set(d[0] for d in docs))} 類、{len(set(d[1] for d in docs))} 個案場")
+    cases = sorted(set(d[1] for d in docs))
+    random.Random(42).shuffle(cases)
+    fold_of = {c: i % folds for i, c in enumerate(cases)}
+    ok = tot = 0
+    by_cat, by_cat_ok, conf = collections.Counter(), collections.Counter(), collections.Counter()
+    margins = []
+    for k in range(folds):
+        m = model_from_stats(stats_from_docs([(l, c, g) for l, c, g, _ in docs if fold_of[c] != k]))
+        for l, c, g, r in docs:
+            if fold_of[c] != k or l not in m:
+                continue
+            ranked = classify(m, g)
+            pred = ranked[0][1]
+            margins.append((ranked[0][0] - ranked[1][0], pred == l))
+            cat = (r.get("category") or "")[:2]
+            tot += 1
+            by_cat[cat] += 1
+            if pred == l:
+                ok += 1
+                by_cat_ok[cat] += 1
+            else:
+                conf[(l, pred)] += 1
+    acc = round(ok / max(1, tot), 3)
+    log(f"交叉驗證（沒看過的案場）類型正確率：{ok}/{tot} = {ok * 100 // max(1, tot)}%")
+    for cat in sorted(by_cat):
+        log(f"  {cat}：{by_cat_ok[cat]}/{by_cat[cat]} = {by_cat_ok[cat] * 100 // by_cat[cat]}%")
+    log("最常搞混：", conf.most_common(8))
+    # 信心校正：依分數差排序切 8 段，每段的實際正確率＝信心
+    calib = []
+    ms = sorted(margins)
+    step = max(1, len(ms) // 8)
+    for i in range(0, len(ms), step):
+        seg = ms[i:i + step]
+        if len(seg) < step // 2 and calib:
+            continue
+        calib.append([round(seg[0][0], 2), round(sum(o for _, o in seg) / len(seg), 3)])
+    st = stats_from_docs([(l, c, g) for l, c, g, _ in docs])
+    date_ctx = collections.defaultdict(collections.Counter)
+    for l, c, g, r in docs:
+        if r["label"].get("date"):
+            for k in date_context(r["text"], r["label"]["date"]):
+                date_ctx[l][k] += 1
+    st["date_ctx"] = {l: dict(c) for l, c in date_ctx.items()}
+    model = {"version": 2, "trained_on": len(docs), "base_docs": len(docs), "confirmed_docs": 0,
+             "head": HEAD, "classes": model_from_stats(st), "date_keys": date_keys_from_ctx(st["date_ctx"]),
+             "calib": calib, "cv_accuracy": acc}
+    base = dict(prune_stats(st), calib=calib, cv_accuracy=acc,
+                cv_by_cat={c: round(by_cat_ok[c] / by_cat[c], 3) for c in by_cat}, cases_n=len(cases))
+    return model, base

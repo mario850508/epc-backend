@@ -7956,6 +7956,22 @@ def _pdf_run_async():
 # 存到「系統狀態」pdf_model 的附件（Render 重啟也不會遺失）；也從確認的檔名學新的案場簡稱，
 # 並統計「系統一開始的判斷」跟「最後確認的結果」的差異，當作真實準確度給主控台看。
 PDF_RETRAIN = {"running": False, "last_error": None}
+PDF_BASE_STATE_KEY = "pdf_base_stats"   # 使用者電腦 pdf_learn.py --auto 上傳的最新歷史統計（比 repo 內建的新）
+
+
+def _pdf_load_base():
+    """歷史資料的用字統計：優先用使用者電腦上傳到「系統狀態」的最新版，沒有才用 repo 內建的 pdf_base_stats.json.gz。"""
+    try:
+        rec = _state_record(PDF_BASE_STATE_KEY)
+        att = ((rec or {}).get("fields", {}).get(STATE_FIELD_FILE) or [{}])[0]
+        if att.get("url"):
+            r = requests.get(att["url"], timeout=120)
+            r.raise_for_status()
+            return json.loads(gzip.decompress(r.content).decode("utf-8")), "上傳版"
+    except Exception as e:
+        print(f"[pdf_rename] 讀取上傳的歷史統計失敗，改用內建版：{e}", flush=True)
+    with gzip.open(os.path.join(_HERE, "pdf_base_stats.json.gz"), "rt", encoding="utf-8") as f:
+        return json.load(f), "內建版"
 PDF_CONFIRMED_WEIGHT = 2   # 確認過的檔案比歷史樣本更新、更準，權重加倍
 
 
@@ -7965,8 +7981,7 @@ def pdf_retrain():
         return None
     PDF_RETRAIN.update(running=True, last_error=None)
     try:
-        with gzip.open(os.path.join(_HERE, "pdf_base_stats.json.gz"), "rt", encoding="utf-8") as f:
-            base = json.load(f)
+        base, base_src = _pdf_load_base()
         settings = _pdf_settings()
         allowed = {t.get("name") for t in settings.get("doc_types") or []}
         recs = airtable_get_all(PDF_API_URL, "OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',{" + PDF_F["status"]
@@ -8004,7 +8019,8 @@ def pdf_retrain():
         model = {"version": 2, "trained_at": _tw_now_iso(), "base_docs": base.get("N", 0),
                  "confirmed_docs": len(docs), "head": LC.HEAD, "classes": LC.model_from_stats(st),
                  "date_keys": LC.date_keys_from_ctx(st.get("date_ctx")), "calib": base.get("calib") or [],
-                 "cv_accuracy": base.get("cv_accuracy"), "live": dict(acc, n=len(recent))}
+                 "cv_accuracy": base.get("cv_accuracy"), "cv_by_cat": base.get("cv_by_cat"), "base_cases": base.get("cases_n"),
+                 "base_source": base_src, "base_uploaded_at": base.get("uploaded_at"), "live": dict(acc, n=len(recent))}
         # 存到系統狀態：長值放摘要、附件放完整模型
         meta = {k: v for k, v in model.items() if k not in ("classes", "date_keys", "calib")}
         _state_set_long(PDF_MODEL_STATE_KEY, json.dumps(meta, ensure_ascii=False))
@@ -8034,6 +8050,39 @@ def pdf_retrain():
 
 scheduler.add_job(pdf_retrain, CronTrigger(hour=2, minute=30, timezone="Asia/Taipei"), id="pdf_retrain", replace_existing=True,
                   max_instances=1, coalesce=True)
+
+
+@app.route("/api/pdf-rename/base-stats", methods=["POST"])
+def pdf_rename_upload_base_stats():
+    """使用者電腦上的 pdf_learn.py --auto：把 G 槽歷史檔案算好的用字統計（gzip＋base64）上傳，
+    存到「系統狀態」附件後立刻重新學習。body: {data, summary}"""
+    body = request.get_json(force=True) or {}
+    try:
+        raw = base64.b64decode(body.get("data") or "")
+        if len(raw) > PDF_MAX_BYTES:
+            return jsonify({"error": f"統計檔太大（{len(raw) // 1024} KB，上限 5MB）"}), 400
+        base = json.loads(gzip.decompress(raw).decode("utf-8"))
+        if not all(k in base for k in ("N", "n_by", "df", "cases")) or int(base["N"]) < 100:
+            return jsonify({"error": "統計檔格式不對或樣本太少"}), 400
+    except Exception as e:
+        return jsonify({"error": f"統計檔讀不出來：{e}"}), 400
+    try:
+        base["uploaded_at"] = _tw_now_iso()
+        raw = gzip.compress(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        summary = {"uploaded_at": base["uploaded_at"], "N": base["N"], "cases": base.get("cases_n"),
+                   "cv_accuracy": base.get("cv_accuracy"), "cv_by_cat": base.get("cv_by_cat"),
+                   "host": str((body.get("summary") or {}).get("host") or "")[:60]}
+        _state_set_long(PDF_BASE_STATE_KEY, json.dumps(summary, ensure_ascii=False))
+        rec = _state_record(PDF_BASE_STATE_KEY)
+        requests.patch(f"{STATE_API_URL}/{rec['id']}", headers=airtable_headers(),
+                       json={"fields": {STATE_FIELD_FILE: []}}, timeout=30).raise_for_status()
+        upload_attachment_to_ops_record(rec["id"], STATE_FIELD_FILE, base64.b64encode(raw).decode(),
+                                        "pdf_base_stats.json.gz", content_type="application/gzip")
+    except Exception as e:
+        return jsonify({"error": f"儲存失敗：{str(e)[:300]}"}), 502
+    if not PDF_RETRAIN["running"]:
+        threading.Thread(target=pdf_retrain, daemon=True).start()
+    return jsonify({"ok": True, "summary": summary})
 
 
 @app.route("/api/pdf-rename/retrain", methods=["POST"])
