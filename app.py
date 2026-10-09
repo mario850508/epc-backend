@@ -6606,8 +6606,60 @@ def _pdf_rule_date(flat, date_keys=""):
     return "", "", 0
 
 
+# 從使用者 G 槽已改名歷史檔案學來的分類模型（tools/pdf_train.py 產生 pdf_model.json）
+PDF_MODEL_CACHE = {"data": None, "loaded": False}
+
+
+def _pdf_model():
+    if not PDF_MODEL_CACHE["loaded"]:
+        PDF_MODEL_CACHE["loaded"] = True
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_model.json"), encoding="utf-8") as f:
+                PDF_MODEL_CACHE["data"] = json.load(f)
+        except Exception as e:
+            print(f"[pdf_rename] 沒有分類模型，改用關鍵字規則：{e}", flush=True)
+    return PDF_MODEL_CACHE["data"]
+
+
+def _pdf_model_doc_type(flat, settings):
+    """用學習模型判斷類型。回傳 (類型, 信心, 理由) 或 None（沒有模型／沒有任何特徵命中）。"""
+    model = _pdf_model()
+    if not model:
+        return None
+    allowed = {t.get("name") for t in settings.get("doc_types") or []}
+    head = flat[: int(model.get("head") or 1500)]
+    grams = set()
+    for seg in re.findall(r"[\u4e00-\u9fff]+", head):
+        for n in (2, 3, 4):
+            for i in range(len(seg) - n + 1):
+                grams.add(seg[i:i + n])
+    scored = []
+    for name, m in (model.get("classes") or {}).items():
+        if name not in allowed:
+            continue
+        hits = [(w, x) for x, w in m["w"].items() if x in grams]
+        scored.append((sum(w for w, _ in hits) + 0.3 * m["prior"], name, hits))
+    scored.sort(key=lambda x: -x[0])
+    if not scored or not scored[0][2]:
+        return None
+    margin = scored[0][0] - (scored[1][0] if len(scored) > 1 else 0)
+    conf = 50
+    for lo, acc in model.get("calib") or []:
+        if margin >= lo:
+            conf = int(acc * 100)
+    conf = min(conf, 97)
+    top = "、".join(f"「{x}」" for _, x in sorted(scored[0][2], reverse=True)[:4])
+    reason = f"依歷史檔案學到的用字判斷（命中 {len(scored[0][2])} 個特徵，例如 {top}）"
+    if len(scored) > 1 and conf < 80:
+        reason += f"；也可能是：{scored[1][1]}"
+    return scored[0][1], conf, reason
+
+
 def _pdf_rule_doc_type(flat, subject, settings):
-    """依函文規則的關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。"""
+    """先用學習模型；沒有模型或判斷不出來時，用關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。"""
+    learned = _pdf_model_doc_type(flat, settings)
+    if learned:
+        return learned
     results = []
     for t in settings.get("doc_types") or []:
         name = (t.get("name") or "").strip()
@@ -6664,7 +6716,9 @@ def _pdf_rule_extract(text, settings):
     issuer = m.group(1) if m else ""
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
     rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
-    doc_date, date_raw, date_conf = _pdf_rule_date(flat, rule.get("date_keys") or "")
+    learned_keys = ((_pdf_model() or {}).get("date_keys") or {}).get(doc_type) or []
+    keys = "、".join(list(learned_keys) + [k for k in re.split(r"[、,，;；]", rule.get("date_keys") or "") if k.strip()])
+    doc_date, date_raw, date_conf = _pdf_rule_date(flat, keys)
     addresses = re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿0-9\-之巷弄段路街村里鄰]{2,30}?號", flat)
     addresses += re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿]{1,8}段[0-9\-、]{1,30}地號", flat)
     ext = {
