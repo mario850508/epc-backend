@@ -6031,6 +6031,13 @@ def _pdf_settings():
                 data.update(json.loads(raw))
         except Exception as e:
             print(f"[pdf_rename] 讀取設定失敗，用預設值：{e}", flush=True)
+        # 2026-10-09 升級：還在用第一版預設值的設定，自動換成依歷史檔案整理的新版（使用者改過的不動）
+        if data.get("template") == "{案號}_{函文類型}_{日期}":
+            data["template"] = PDF_DEFAULT_SETTINGS["template"]
+        old_names = {"併聯審查", "同意備案", "細部協商", "免雜", "購售契約函文", "台電購售契約", "併聯試運轉",
+                     "正式售電函", "竣工備查", "設備登記", "台電審訖圖", "電表租約", "第一張電費單"}
+        if {t.get("name") for t in data.get("doc_types") or []} == old_names:
+            data["doc_types"] = PDF_DEFAULT_DOC_TYPES
         PDF_SETTINGS["data"] = data
     return PDF_SETTINGS["data"]
 
@@ -6038,10 +6045,19 @@ def _pdf_settings():
 def _pdf_aliases():
     if PDF_ALIASES["data"] is None:
         data = {"map": {}, "rules": {}}
+        # 預設值：repo 裡的 pdf_aliases.json（2026-10-09 由使用者 G 槽 546 個案場整理）；
+        # 之後在主控台匯入新的學習報告會存到「系統狀態」並覆蓋這份
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_aliases.json"), encoding="utf-8") as f:
+                data.update(json.load(f))
+        except Exception as e:
+            print(f"[pdf_rename] 讀取內建簡稱對照失敗：{e}", flush=True)
         try:
             raw = _state_get_long(PDF_ALIAS_KEY)
             if raw:
-                data.update(json.loads(raw))
+                saved = json.loads(raw)
+                data["map"].update(saved.get("map") or {})
+                data["rules"].update(saved.get("rules") or {})
         except Exception as e:
             print(f"[pdf_rename] 讀取簡稱對照失敗：{e}", flush=True)
         PDF_ALIASES["data"] = data
