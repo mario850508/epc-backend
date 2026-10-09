@@ -41,6 +41,8 @@ except ImportError:
     sys.exit(1)
 
 BACKEND = "https://epc-backend-4aj2.onrender.com"
+if os.environ.get("SUNNY_BACKEND"):   # 測試用
+    BACKEND = os.environ["SUNNY_BACKEND"]
 CATEGORY_RE = re.compile(r"^0?([3467])\s*[\.、_ -]?\s*(契約|電廠設計圖|政府函文|設備保固)")
 CATEGORY_NAMES = {"3": "03 契約", "4": "04 電廠設計圖", "6": "06 政府函文及相關文件", "7": "07 設備保固及出廠證明"}
 DATE_TOKEN_RE = re.compile(r"^(20\d{2})(\d{2})(\d{2})$|^(1\d{2})(\d{2})(\d{2})$")
@@ -159,15 +161,17 @@ def collect(args, out_dir):
                     pass
     log(f"已快取 {len(cache)} 份，開始掃描資料夾（雲端硬碟第一次讀取會比較慢）…")
 
-    files = []
-    n_folders = 0
-    for cat, case_dir, region, folder in find_targets(args.root):
-        n_folders += 1
-        for dirpath, _, fnames in os.walk(folder):
-            for fn in fnames:
-                files.append((cat, case_dir, region, os.path.join(dirpath, fn), fn))
-        if n_folders % 20 == 0:
-            log(f"  已找到 {n_folders} 個分類資料夾、{len(files)} 個檔案…")
+    files = list(getattr(args, "_files", None) or [])   # --auto 第二輪起沿用第一輪的檔案清單，不用再掃一次雲端硬碟
+    if not files:
+        n_folders = 0
+        for cat, case_dir, region, folder in find_targets(args.root):
+            n_folders += 1
+            for dirpath, _, fnames in os.walk(folder):
+                for fn in fnames:
+                    files.append((cat, case_dir, region, os.path.join(dirpath, fn), fn))
+            if n_folders % 20 == 0:
+                log(f"  已找到 {n_folders} 個分類資料夾、{len(files)} 個檔案…")
+        args._files = list(files)
     log(f"找到 {len(files)} 個檔案（含非 PDF）")
 
     if args.only:
@@ -261,6 +265,7 @@ def collect(args, out_dir):
                         if sum(ocr_errors.values()) >= 10 and not any(r.get("ocr") for r in rows[-30:]):
                             log("  ⚠ OCR 連續失敗，這次先停止 OCR，請把上面的錯誤訊息截圖給 Claude")
                             ocr_url = ""
+                            args._ocr_stopped = True
             row["text"] = text[:MAX_TEXT]
         except Exception as e:
             row["error"] = f"{type(e).__name__}: {e}"[:200]
@@ -276,6 +281,7 @@ def collect(args, out_dir):
         for msg, n in ocr_errors.most_common(5):
             log(f"  {n} 次：{msg}")
     log(f"這次 OCR 了 {ocr_used} 份")
+    args._ocr_used = ocr_used
     return rows
 
 
@@ -510,6 +516,71 @@ def analyze(rows, out_dir):
     return report
 
 
+def load_core():
+    """pdf_learncore.py（分類模型的核心計算，跟後端同一份）：每次從 GitHub 下載最新版放在這支程式旁邊。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "pdf_learncore.py")
+    try:
+        import requests
+        r = requests.get("https://raw.githubusercontent.com/mario850508/epc-backend/main/pdf_learncore.py", timeout=60)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+    except Exception as e:
+        if not os.path.exists(path):
+            raise Exception(f"下載 pdf_learncore.py 失敗：{e}")
+        log(f"  ⚠ 下載最新 pdf_learncore.py 失敗，用電腦上現有的：{e}")
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import importlib
+    import pdf_learncore
+    return importlib.reload(pdf_learncore)
+
+
+def upload_learning(out_dir, report):
+    """自動把這一輪的結果交給主控台：匯入 report.json（簡稱、Airtable 編號），
+    再用全部讀過的文件算好用字統計上傳，後端收到會立刻重新學習。"""
+    import gzip
+    import platform
+    import requests
+    log("── 上傳到主控台 ──")
+    for attempt in range(3):
+        try:
+            r = requests.post(BACKEND + "/api/pdf-rename/import-learn", json=report, timeout=600)
+            d = r.json()
+            if r.status_code >= 400:
+                raise Exception(d.get("error") or r.text[:200])
+            ids = d.get("ids") or {}
+            log(f"  ✓ 已匯入 {d.get('count')} 個案場簡稱" + (f"；補了 {ids.get('filled_cases', 0)} 個案場、{ids.get('filled', 0)} 個編號到 Airtable"
+                                                       if ids.get("cases") else ""))
+            break
+        except Exception as e:
+            log(f"  ⚠ 匯入 report.json 失敗（第 {attempt + 1} 次）：{e}")
+            time.sleep(30)
+    try:
+        C = load_core()
+        settings = requests.get(BACKEND + "/api/pdf-rename/status", timeout=180).json().get("settings") or {}
+        canon = C.canon_from_doc_types(settings.get("doc_types"))
+        rows = []
+        with open(os.path.join(out_dir, "samples.jsonl"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+        log("  重新計算分類模型（含交叉驗證，約 1～3 分鐘）…")
+        _, base = C.build_base(rows, canon, log=lambda *a: log("  ", *a))
+        raw = gzip.compress(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        r = requests.post(BACKEND + "/api/pdf-rename/base-stats", timeout=600,
+                          json={"data": base64.b64encode(raw).decode(), "summary": {"host": platform.node()}})
+        d = r.json()
+        if r.status_code >= 400:
+            raise Exception(d.get("error") or r.text[:200])
+        log(f"  ✓ 已上傳學習資料（{len(raw) // 1024} KB），主控台正在重新學習，約 1 分鐘後生效")
+    except Exception as e:
+        log(f"  ⚠ 上傳學習資料失敗：{e}（下一輪會再試；也可以把 samples.jsonl 傳給 Claude）")
+
+
 def main():
     ap = argparse.ArgumentParser(description="從已改名的歷史檔案學習公文辨識規則")
     ap.add_argument("root", help="已上架電廠資料夾，例如 G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠")
@@ -520,21 +591,45 @@ def main():
     ap.add_argument("--ocr-limit", type=int, default=400, help="這次最多 OCR 幾份，預設 400")
     ap.add_argument("--only", default="", help="只處理某個分類，例如 --only 06")
     ap.add_argument("--out", default="", help="輸出資料夾，預設是這支程式旁邊的 pdf_learn_data")
+    ap.add_argument("--auto", action="store_true",
+                    help="全自動：每輪做完自動匯入主控台、上傳學習資料，接著下一輪繼續 OCR，直到做完或 Google 額度用完")
+    ap.add_argument("--upload", action="store_true", help="跑完自動匯入主控台並上傳學習資料（只跑一輪）")
+    ap.add_argument("--max-rounds", type=int, default=30, help="--auto 最多跑幾輪，預設 30")
     args = ap.parse_args()
+    if args.auto:
+        args.ocr = True
     if not os.path.isdir(args.root):
         log("找不到資料夾：", args.root)
         sys.exit(1)
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_learn_data")
     os.makedirs(out_dir, exist_ok=True)
-    rows = collect(args, out_dir)
-    report = analyze(rows, out_dir)
-    acc = report["holdout_accuracy"]
+    rounds = max(1, args.max_rounds) if args.auto else 1
+    for rnd in range(1, rounds + 1):
+        if args.auto:
+            log("")
+            log(f"══════ 第 {rnd} 輪（{time.strftime('%m/%d %H:%M')}）══════")
+        args._ocr_used, args._ocr_stopped = 0, False
+        rows = collect(args, out_dir)
+        report = analyze(rows, out_dir)
+        log("")
+        log(f"這一輪完成：案場 {len(report['aliases'])} 個、已 OCR {report['ocr_done']} 份、"
+            f"還沒 OCR 的掃描檔 {report['scans_without_text']} 份")
+        if args.auto or args.upload:
+            upload_learning(out_dir, report)
+        if not args.auto:
+            if not args.upload:
+                log("請把這兩個檔案傳給 Claude：")
+                log("  ", os.path.join(out_dir, "report.md"))
+                log("  ", os.path.join(out_dir, "report.json"))
+            break
+        if args._ocr_stopped:
+            log("Google OCR 今天的額度可能用完了，先停在這裡。明天再執行同一個指令就會接著做。")
+            break
+        if args._ocr_used == 0:
+            log(f"在目前的抽樣範圍內（--per-type {args.per_type}）掃描檔都 OCR 完了。想學更多可以加大 --per-type 再跑。")
+            break
     log("")
-    log(f"完成！類型 {len(report['type_stats'])} 種、案場 {len(report['aliases'])} 個、"
-        f"關鍵字驗證正確率 {acc[0]}/{acc[1]}、已 OCR {report['ocr_done']} 份、還沒 OCR 的掃描檔 {report['scans_without_text']} 份")
-    log("請把這兩個檔案傳給 Claude：")
-    log("  ", os.path.join(out_dir, "report.md"))
-    log("  ", os.path.join(out_dir, "report.json"))
+    log("全部結束！" + ("學習資料已經自動上傳，主控台會用新的模型。" if (args.auto or args.upload) else ""))
 
 
 if __name__ == "__main__":
