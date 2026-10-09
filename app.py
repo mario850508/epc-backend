@@ -6270,6 +6270,7 @@ def _pdf_record_to_dict(r):
         "confidence": g("confidence"),
         "evidence": g("evidence") or "",
         "issues": result.get("issues") or [],
+        "notes": result.get("notes") or [],
         "candidates": result.get("candidates") or [],
         "engine": result.get("engine") or "",
         "text_excerpt": result.get("text_excerpt") or "",
@@ -7104,6 +7105,7 @@ def _pdf_free_analyze(text, source, settings, filename=""):
     ext, type_conf, date_conf = _pdf_rule_extract(text, settings)
     ranked, strong = _pdf_match_cases(ext, fulltext=_pdf_flat(text), filename=filename)
     issues = []
+    notes = []   # 不是問題，只是說明怎麼判斷的（主控台用一般顏色顯示）
     case_no, case_conf, case_reason = "", 0, ""
     if len(strong) == 1:
         case_no = next(iter(strong))
@@ -7119,13 +7121,22 @@ def _pdf_free_analyze(text, source, settings, filename=""):
         second = ranked[1]["score"] if len(ranked) > 1 else 0
         case_no = top["case"]["case_no"]
         case_reason = "；".join(top["why"])
-        case_conf = 75 if top["score"] >= 60 and top["score"] - second >= 30 else 40
-        if ext.get("ids"):
-            # 文件上有編號，只是 Airtable 這個案件還沒記錄 → 確認後會自動記下，下次同案場的文件就能直接比對
-            issues.append("文件上的編號（" + "、".join(v[0] for v in list(ext["ids"].values())[:2])
-                          + "）Airtable 還沒記錄，這次用地址／名稱比對，請確認；確認後會自動記下，下次就能直接比對")
+        exact_addr = [s for s in ranked if any(w.startswith("地址相符") for w in s["why"])]
+        if top["score"] >= 60 and top["score"] - second >= 30 and len(exact_addr) == 1 and exact_addr[0] is top:
+            # 2026-10-09 用 G 槽 1,800 份歷史文件驗證：地址完全相符、而且只有這一個案件是這個地址 → 661 份裡 97% 正確，
+            # 跟編號比對一樣可靠，所以不算警告，只在「辨識依據」說明是怎麼判斷的
+            case_conf = 95
+            addr = next(w for w in top["why"] if w.startswith("地址相符"))
+            notes.append(f"📍 案號依文件上的地址判斷：{addr[5:].strip('（）')}（只有這個案件是這個地址）")
+            if ext.get("ids"):
+                notes.append("🔢 文件上的編號 Airtable 還沒記錄，確認後會自動記下，下次直接用編號比對")
         else:
-            issues.append("文件裡找不到案件編號，案號是用地址／名稱推測的，請確認")
+            case_conf = 40
+            if len(exact_addr) > 1:
+                issues.append("有好幾個案件是同一個地址（例如一期／二期），請確認是哪一個：" +
+                              "、".join(s["case"]["case_no"] for s in exact_addr[:4]))
+            else:
+                issues.append("文件上找不到編號，地址也不完全相同，案號是用相近地址／名稱推測的，請確認")
     else:
         issues.append("無法確定案號，請人工選擇")
     if ext["doc_type"] == "其他":
@@ -7148,7 +7159,7 @@ def _pdf_free_analyze(text, source, settings, filename=""):
         "case": case, "case_no": case_no, "doc_type": ext["doc_type"], "doc_date": ext["doc_date"],
         "doc_number": ext["doc_number"], "issuer": ext["issuer"], "subject": ext["subject"],
         "confidence": max(0, min(case_conf, type_conf, date_conf)), "evidence": evidence, "issues": issues,
-        "conf_parts": [case_conf, type_conf, date_conf],
+        "conf_parts": [case_conf, type_conf, date_conf], "notes": notes,
         "ranked": ranked, "ids": ext["ids"],
         "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:4000]},
     }
@@ -7314,7 +7325,8 @@ def _pdf_recognize(rec):
     suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date,
                                 ext_name if ext_name in PDF_OFFICE_EXTS else ".pdf")
     # pred＝系統一開始的判斷；使用者確認（可能有修改）後拿來算真實準確度，也是自動重新學習的依據
-    result = dict(out["result"], issues=out["issues"], ids=ids, same_type=same, conf_parts=out.get("conf_parts") or [],
+    result = dict(out["result"], issues=out["issues"], notes=out.get("notes") or [], ids=ids, same_type=same,
+                  conf_parts=out.get("conf_parts") or [],
                   pred={"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date, "name": suggested}, candidates=[
         {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
          "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
