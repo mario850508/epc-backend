@@ -7733,6 +7733,17 @@ def pdf_rename_items():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     items = [_pdf_record_to_dict(r) for r in recs]
+    # 待確認、檔名沒被手動改過的：用目前的命名規則重新產生（例如後來新增「工程苗栗 → 工苗」的簡稱規則）
+    try:
+        tpl = _pdf_settings().get("template")
+        by_no = {c["case_no"]: c for c in _pdf_case_ref()}
+        for x in items:
+            if x["status"] == PDF_ST_REVIEW and x["case_no"] and x["final_name"] == x["suggested_name"]:
+                name = _pdf_build_name(tpl, by_no.get(x["case_no"]) or {"case_no": x["case_no"]}, x["doc_type"],
+                                       x["doc_date"], x["file_ext"] if x["file_ext"] in PDF_OFFICE_EXTS else ".pdf")
+                x["suggested_name"] = x["final_name"] = name
+    except Exception as e:
+        print(f"[pdf_rename] 重新產生檔名失敗：{e}", flush=True)
     items.sort(key=lambda x: x["uploaded_at"] or "", reverse=True)
     return jsonify({"items": items})
 
