@@ -5403,6 +5403,15 @@ def line_status():
         "target_kind": {"C": "group", "R": "room", "U": "user"}.get(target[:1], "unknown") if target else None,
         "day_before_last_run": DAY_BEFORE_STATE,
         "digest_last_run": DIGEST_STATE,
+        "biz_cache": {
+            "certified_cases": len(CERTIFIED_CASE_CACHE.get("cases") or []), "certified_updated": CERTIFIED_CASE_CACHE.get("updated_at"),
+            "cancelled_cases": len(CANCELLED_CASE_CACHE.get("case_nos") or []), "cancelled_updated": CANCELLED_CASE_CACHE.get("updated_at"),
+            "plant_coords": len(BIZ_COORDS_CACHE), "owner_contacts": len(OWNER_CONTACT_CACHE),
+        },
+        "scheduler_jobs": [
+            {"job": getattr(j.func, "__name__", str(j.func)), "next_run": str(getattr(j, "next_run_time", None))}
+            for j in (scheduler.get_jobs() if scheduler.running else [])
+        ],
     })
 
 
