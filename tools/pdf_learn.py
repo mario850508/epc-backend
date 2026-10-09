@@ -214,7 +214,12 @@ def collect(args, out_dir):
     # errors="replace"：少數 PDF 抽出來的文字有壞掉的字元（例如單獨的 surrogate），寫不進 UTF-8 檔會整個中斷，改成問號
     out = open(cache_path, "a", encoding="utf-8", errors="replace")
     rows = []
+    last_log, n_cached, n_new = time.time(), 0, 0
     for i, (cat, case_dir, region, path, fn) in enumerate(files):
+        # 每 30 秒回報一次進度（讀過的檔案會直接跳過、OCR 一份要 10～40 秒，不回報看起來像停住）
+        if time.time() - last_log > 30:
+            log(f"  {i}/{len(files)}…（沿用上次讀過的 {n_cached} 份、這次新讀 {n_new} 份、OCR {ocr_used} 份）目前：{fn[:40]}")
+            last_log = time.time()
         stem, ext = os.path.splitext(fn)
         label = parse_filename(stem)
         row = {"category": cat, "case_dir": case_dir, "region": region, "file": fn,
@@ -232,6 +237,7 @@ def collect(args, out_dir):
                                  and ocr_used < args.ocr_limit) and not cache[key].get("error"):
             rows.append(cache[key])
             per_type[tkey] += 1
+            n_cached += 1
             continue
         if per_type[tkey] >= args.per_type or st.st_size > args.max_mb * 1024 * 1024:
             rows.append(row)
@@ -263,8 +269,7 @@ def collect(args, out_dir):
         out.flush()
         rows.append(row)
         per_type[tkey] += 1
-        if (i + 1) % 25 == 0:
-            log(f"  {i + 1}/{len(files)}… (OCR {ocr_used} 份)")
+        n_new += 1
     out.close()
     if ocr_errors:
         log("OCR 錯誤統計：")
