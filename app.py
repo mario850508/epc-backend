@@ -742,6 +742,8 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     case_no = (case_no or "").strip()
     slot_type = _normalize_type_list(slot_type)
     registrant = (registrant or "").strip()
+    if registrant and not registrant.startswith("屋主"):
+        registrant = _canon_rep(registrant)
     if not all([vendor, date, start_time, end_time, case_no, registrant]) or not slot_type:
         return None, ({"error": "缺少必填欄位（廠商/日期/開始時間/結束時間/案號/項目類型/登記人）"}, 400)
     try:
@@ -1199,7 +1201,7 @@ def create_vendor_slot_task():
             FIELD_TASK_ALIAS: (body.get("alias") or "").strip(),
             FIELD_TASK_TYPE: slot_type,
             FIELD_TASK_CANDIDATE_DATES: ",".join(candidate_dates),
-            FIELD_TASK_ASSIGNEE: (body.get("assignee") or "").strip(),
+            FIELD_TASK_ASSIGNEE: _canon_rep((body.get("assignee") or "").strip()),
             FIELD_TASK_STATUS: TASK_STATUS_PENDING,
             FIELD_TASK_TOKEN: token,
             FIELD_TASK_CREATOR: (body.get("creator") or "").strip(),
@@ -1252,11 +1254,61 @@ def _find_line_binding_record(name):
     return recs[0] if recs else None
 
 
+# 2026-10-09：業務名單（Airtable「業務名單」表）。同一個人常有多種寫法（JACK／Jack Wu、
+# Mika／林嘉偉(Mika)），讓 LINE 綁定、篩選、提醒對不上。所有「業務姓名」寫入前先換成名單上的
+# 統一名字；名單上沒有的名字維持原樣（不擋，只是不會被合併）。
+REP_TABLE_ID = "tblgkXhVa3lgPLFP7"
+REP_FIELD_NAME = "fld0TRIAT9bjn7ixM"
+REP_FIELD_ALIASES = "fldt3mvRaTiPD225G"
+REP_FIELD_ACTIVE = "fldXpZn07aEANpOaf"
+REP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{REP_TABLE_ID}"
+_REP_CACHE = {"at": 0.0, "reps": [], "map": {}}
+
+
+def _load_reps(force=False):
+    if not force and time.time() - _REP_CACHE["at"] < 300 and _REP_CACHE["reps"]:
+        return _REP_CACHE
+    try:
+        recs = airtable_get_all(REP_API_URL, "TRUE()", [REP_FIELD_NAME, REP_FIELD_ALIASES, REP_FIELD_ACTIVE])
+        reps, mapping = [], {}
+        for r in recs:
+            f = r["fields"]
+            name = (f.get(REP_FIELD_NAME) or "").strip()
+            if not name or not f.get(REP_FIELD_ACTIVE):
+                continue
+            aliases = [a.strip() for a in (f.get(REP_FIELD_ALIASES) or "").replace("，", "\n").replace(",", "\n").splitlines() if a.strip()]
+            reps.append({"name": name, "aliases": aliases})
+            for key in [name] + aliases:
+                mapping[key.lower()] = name
+        _REP_CACHE.update({"at": time.time(), "reps": reps, "map": mapping})
+    except Exception as e:
+        print(f"[_load_reps] 讀取業務名單失敗（沿用舊快取）：{e}", flush=True)
+        _REP_CACHE["at"] = time.time() - 240   # 1 分鐘後再試
+    return _REP_CACHE
+
+
+def _canon_rep(name):
+    """換成業務名單上的統一名字。「林嘉偉(Mika)」這種寫法也會試括號內、括號外各一次。"""
+    name = (name or "").strip()
+    if not name:
+        return name
+    mapping = _load_reps()["map"]
+    m = _re.match(r"^(.*?)[(（]\s*(.+?)\s*[)）]\s*$", name)
+    cands = [name] + ([m.group(2).strip(), m.group(1).strip()] if m else [])
+    for c in cands:
+        if c and c.lower() in mapping:
+            return mapping[c.lower()]
+    return name
+
+
 def _binding_name_candidates(name):
     """「林嘉偉(Mika)」這種寫法也要對得上只綁「Mika」或「林嘉偉」的人：依序試完整名字、括號內、括號外。"""
     import re
     name = (name or "").strip()
-    out = [name] if name else []
+    canon = _canon_rep(name)
+    out = [canon] if canon else []
+    if name and name not in out:
+        out.append(name)
     m = re.match(r"^(.*?)[(（]\s*(.+?)\s*[)）]\s*$", name)
     if m:
         for part in (m.group(2).strip(), m.group(1).strip()):
@@ -1369,7 +1421,7 @@ def bind_line_for_task(token):
         return jsonify({"error": str(e)}), 502
     if not r:
         return jsonify({"error": "找不到這個連結對應的任務"}), 404
-    name = (r["fields"].get(FIELD_TASK_ASSIGNEE) or "").strip()
+    name = _canon_rep((r["fields"].get(FIELD_TASK_ASSIGNEE) or "").strip())
     if not name:
         return jsonify({"error": "這個任務沒有指派業務姓名，無法綁定，請聯絡窗口"}), 400
     try:
@@ -2271,30 +2323,77 @@ def _state_set_long(key, text):
         raise Exception(resp.text)
 
 
-def _persist_biz_snapshots():
+_SNAPSHOT_CHUNK = 60000
+_SNAPSHOT_HASH = {}
+
+
+def _state_put_chunked(key, text):
+    """長資料分段存（鍵 key#0、key#1…，筆數記在 key#n 的「值」）。"""
+    chunks = [text[i:i + _SNAPSHOT_CHUNK] for i in range(0, len(text), _SNAPSHOT_CHUNK)] or [""]
+    for i, ch in enumerate(chunks):
+        _state_set_long(f"{key}#{i}", ch)
+    _state_set(f"{key}#n", str(len(chunks)))
+
+
+def _state_get_chunked(key):
     try:
-        if BIZ_COORDS_CACHE:
-            _state_set_long("biz_plant_coords", json.dumps(BIZ_COORDS_CACHE, ensure_ascii=False))
-        if OWNER_CONTACT_CACHE:
-            _state_set_long("biz_owner_contacts", json.dumps(OWNER_CONTACT_CACHE, ensure_ascii=False))
-    except Exception as e:
-        print(f"[_persist_biz_snapshots] 存快照失敗：{e}", flush=True)
+        n = int(_state_get(f"{key}#n") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0:
+        return _state_get_long(key)          # 舊格式（沒分段）的快照
+    return "".join(_state_get_long(f"{key}#{i}") for i in range(n))
+
+
+def _persist_biz_snapshots():
+    """把業務自治區推來的資料（座標、公證書屋主資料、已公證案件、取消案號）存一份到 Airtable
+    「系統狀態」表，後端重啟後從這裡還原，不用等下一次試算表推送。內容沒變就不重寫。"""
+    import hashlib as _hl
+    items = {
+        "biz_plant_coords": dict(BIZ_COORDS_CACHE),
+        "biz_owner_contacts": dict(OWNER_CONTACT_CACHE),
+        "biz_certified_cases": list(CERTIFIED_CASE_CACHE.get("cases") or []),
+        "biz_cancelled_cases": sorted(CANCELLED_CASE_CACHE.get("case_nos") or []),
+    }
+    for key, data in items.items():
+        if not data:
+            continue
+        try:
+            text = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            h = _hl.md5(text.encode("utf-8")).hexdigest()
+            if _SNAPSHOT_HASH.get(key) == h:
+                continue
+            _state_put_chunked(key, text)
+            _SNAPSHOT_HASH[key] = h
+        except Exception as e:
+            print(f"[_persist_biz_snapshots] 存 {key} 快照失敗：{e}", flush=True)
 
 
 def _ensure_biz_snapshots_loaded():
-    """快取是空的（剛重啟、Apps Script 還沒推送）時，從 Airtable 快照還原一次。"""
+    """快取是空的（剛重啟、Apps Script 還沒推送）時，從 Airtable 快照還原一次。
+    給案號搜尋、場勘安排、隔天總覽用——這些原本只放記憶體，後端一重啟就整個清空。"""
     if _BIZ_SNAPSHOT_LOADED["done"]:
         return
     _BIZ_SNAPSHOT_LOADED["done"] = True
     try:
         if not BIZ_COORDS_CACHE:
-            raw = _state_get_long("biz_plant_coords")
+            raw = _state_get_chunked("biz_plant_coords")
             if raw:
                 BIZ_COORDS_CACHE.update(json.loads(raw))
         if not OWNER_CONTACT_CACHE:
-            raw = _state_get_long("biz_owner_contacts")
+            raw = _state_get_chunked("biz_owner_contacts")
             if raw:
                 OWNER_CONTACT_CACHE.update(json.loads(raw))
+        if not CERTIFIED_CASE_CACHE.get("cases"):
+            raw = _state_get_chunked("biz_certified_cases")
+            if raw:
+                CERTIFIED_CASE_CACHE["cases"] = json.loads(raw)
+                CERTIFIED_CASE_CACHE["updated_at"] = "restored-from-snapshot"
+        if not CANCELLED_CASE_CACHE.get("case_nos"):
+            raw = _state_get_chunked("biz_cancelled_cases")
+            if raw:
+                CANCELLED_CASE_CACHE["case_nos"] = set(json.loads(raw))
+                CANCELLED_CASE_CACHE["updated_at"] = "restored-from-snapshot"
     except Exception as e:
         _BIZ_SNAPSHOT_LOADED["done"] = False
         print(f"[_ensure_biz_snapshots_loaded] 還原快照失敗：{e}", flush=True)
@@ -3611,8 +3710,9 @@ def refresh_model_options_cache():
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
-scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0))
-scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5))
+# 2026-10-09：CronTrigger 物件預設吃伺服器時區（Render＝UTC），不是 scheduler 的時區，一律明確指定台北時間
+scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0, timezone="Asia/Taipei"))
+scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5, timezone="Asia/Taipei"))
 # 注意（2026-08-30 修改十三）：這裡刻意不呼叫 scheduler.start()。
 # 實際啟動移到 gunicorn.conf.py 的 post_fork() hook 裡呼叫，確保排程是在
 # 真正處理請求的 worker process 裡執行，而不是 gunicorn 的 master process
@@ -4150,6 +4250,7 @@ def case_search():
                 "address": f.get(FIELD_ADDRESS, ""),
             })
         if include_certified:
+            _ensure_biz_snapshots_loaded()
             seen_cases = {r["case"] for r in results}
             q_lower = q.lower()
             for c in CERTIFIED_CASE_CACHE.get("cases", []):
@@ -4363,6 +4464,7 @@ def _compute_survey_cases():
 
     # 不用現查，直接讀 Apps Script 推過來的快取（還沒收到過推送時就是空集合，
     # 等同「這輪不排除任何撤案案件」，不會讓這支函式整個失敗）。
+    _ensure_biz_snapshots_loaded()
     cancelled_case_nos = CANCELLED_CASE_CACHE["case_nos"]
 
     cases = []
@@ -4546,11 +4648,11 @@ def auto_fill_survey_actual_dates():
 # add_job() 只是把工作登記進 scheduler 的 job store，呼叫的時間點不影響
 # 排程本身何時真正執行（實際啟動是 gunicorn.conf.py 的 post_fork 裡呼叫
 # scheduler.start()，那時候這裡一定已經執行完畢、job 已經登記好了）。
-scheduler.add_job(auto_fill_survey_actual_dates, CronTrigger(hour=7, minute=30))
+scheduler.add_job(auto_fill_survey_actual_dates, CronTrigger(hour=7, minute=30, timezone="Asia/Taipei"))
 # 「場勘安排」快取每 20 分鐘重新整理一次（0,20,40 分），比出貨/進場那份快取
 # （每 6 小時）頻繁，因為這份資料使用者會常態性打開查看、填寫預計場勘日；
 # 但也不像出貨/進場那份有 6 秒一次的前端背景同步，避免兩個 base 一起查太頻繁。
-scheduler.add_job(refresh_survey_cache, CronTrigger(minute="0,20,40"))
+scheduler.add_job(refresh_survey_cache, CronTrigger(minute="0,20,40"), misfire_grace_time=600, coalesce=True)
 
 
 # ===================================================================
@@ -5200,6 +5302,13 @@ def _rep_bind_url(name):
     return f"https://liff.line.me/{liff_id}?bind=rep&name={quote(name.strip())}"
 
 
+@app.route("/api/reps")
+def list_reps():
+    """業務名單（姓名＋別名）。主控台指派視窗的下拉、篩選合併同一人都用這份。?refresh=1 強制重讀。"""
+    data = _load_reps(force=request.args.get("refresh") == "1")
+    return jsonify({"reps": data["reps"]})
+
+
 @app.route("/api/line/bound-names")
 def line_bound_names():
     """已綁定 LINE 的所有名字（業務＋安排人員），主控台用來顯示「業務有沒有綁定」。不回 userId。"""
@@ -5223,7 +5332,7 @@ def line_bind_rep():
     跟安排人員綁定一樣用 access token 向 LINE 驗證 userId；不會動到「安排人員」勾選。body: {access_token, name}"""
     body = request.get_json(force=True) or {}
     access_token = (body.get("access_token") or "").strip()
-    name = (body.get("name") or "").strip()
+    name = _canon_rep((body.get("name") or "").strip())
     if not access_token or not name:
         return jsonify({"error": "缺少名字或 LINE 登入資訊"}), 400
     try:
@@ -6469,6 +6578,7 @@ def _pdf_case_ref(force=False):
         })
     # 已公證但還沒建進 Airtable 的案件（業務自治區推送），只有案號／別名可比
     known = {c["case_no"] for c in cases}
+    _ensure_biz_snapshots_loaded()
     for c in CERTIFIED_CASE_CACHE.get("cases") or []:
         if c["case"] not in known:
             cases.append({"record_id": "", "case_no": c["case"], "alias": c.get("alias", ""), "address": "",
@@ -7802,7 +7912,7 @@ def pdf_retrain():
         PDF_RETRAIN["running"] = False
 
 
-scheduler.add_job(pdf_retrain, CronTrigger(hour=2, minute=30), id="pdf_retrain", replace_existing=True,
+scheduler.add_job(pdf_retrain, CronTrigger(hour=2, minute=30, timezone="Asia/Taipei"), id="pdf_retrain", replace_existing=True,
                   max_instances=1, coalesce=True)
 
 
