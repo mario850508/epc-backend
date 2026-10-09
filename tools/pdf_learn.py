@@ -150,7 +150,7 @@ def collect(args, out_dir):
     cache_path = os.path.join(out_dir, "samples.jsonl")
     cache = {}
     if os.path.exists(cache_path):
-        with open(cache_path, encoding="utf-8") as f:
+        with open(cache_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     r = json.loads(line)
@@ -211,7 +211,8 @@ def collect(args, out_dir):
     ocr_errors = collections.Counter()
     per_type = collections.Counter()
     ocr_used = 0
-    out = open(cache_path, "a", encoding="utf-8")
+    # errors="replace"：少數 PDF 抽出來的文字有壞掉的字元（例如單獨的 surrogate），寫不進 UTF-8 檔會整個中斷，改成問號
+    out = open(cache_path, "a", encoding="utf-8", errors="replace")
     rows = []
     for i, (cat, case_dir, region, path, fn) in enumerate(files):
         stem, ext = os.path.splitext(fn)
@@ -497,9 +498,9 @@ def analyze(rows, out_dir):
         "ocr_done": sum(1 for r in pdfs if r.get("ocr")),
         "ocr_errors": collections.Counter(r["ocr_error"] for r in pdfs if r.get("ocr_error") and not r.get("ocr")).most_common(5),
     }
-    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8", errors="replace") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
-    with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8", errors="replace") as f:
         f.write("\n".join(lines))
     return report
 
