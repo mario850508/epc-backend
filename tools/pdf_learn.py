@@ -11,7 +11,7 @@ PDF 公文更名：從「已經改好檔名」的歷史檔案學習辨識規則�
   4. 分析每種文件：靠哪些關鍵字可以分辨、日期在文件上是怎麼寫的（發文日期／中華民國／
      簽約日…）、目前的規則能猜對幾成，產生 report.md（給人看）跟 report.json（給後端
      匯入規則用）。
-每個類型最多抽樣 --per-type 份（預設 60），已讀過的檔案會快取，中斷後重跑會接著做。
+每個類型「在每個區域」最多抽樣 --per-type 份（預設 10，各區平均學到），已讀過的檔案會快取，中斷後重跑會接著做。
 
 用法（Windows 命令提示字元／PowerShell）：
   pip install pypdf requests
@@ -175,7 +175,15 @@ def collect(args, out_dir):
         log(f"只處理 {args.only}：{len(files)} 個檔案")
     # 06 政府函文最重要（也幾乎都是掃描檔），先處理 06 → 04 → 07 → 03
     order = {"06": 0, "04": 1, "07": 2, "03": 3}
-    files.sort(key=lambda f: order.get(f[0][:2], 9))
+    # 同一分類裡各區域輪流排（桃園一份、新竹一份、臺中一份…），OCR 額度才不會都用在前面幾區
+    groups = collections.defaultdict(list)
+    for f in files:
+        groups[(order.get(f[0][:2], 9), f[2])].append(f)
+    files = []
+    for cat_order in sorted({k[0] for k in groups}):
+        regs = [groups[k] for k in sorted(groups) if k[0] == cat_order]
+        for i in range(max(len(g) for g in regs)):
+            files.extend(g[i] for g in regs if i < len(g))
 
     ocr_url = args.ocr_url
     if args.ocr and not ocr_url:
@@ -213,7 +221,7 @@ def collect(args, out_dir):
         if ext.lower() != ".pdf" or not label:
             rows.append(row)
             continue
-        tkey = (cat, label["type_base"])
+        tkey = (cat, label["type_base"], region)
         try:
             st = os.stat(path)
         except OSError:
@@ -463,7 +471,7 @@ def analyze(rows, out_dir):
 def main():
     ap = argparse.ArgumentParser(description="從已改名的歷史檔案學習公文辨識規則")
     ap.add_argument("root", help="已上架電廠資料夾，例如 G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠")
-    ap.add_argument("--per-type", type=int, default=60, help="每個（分類, 類型）最多讀幾份，預設 60")
+    ap.add_argument("--per-type", type=int, default=10, help="每個（分類, 類型, 區域）最多讀幾份，預設 10")
     ap.add_argument("--max-mb", type=int, default=25, help="超過幾 MB 的檔案略過，預設 25")
     ap.add_argument("--ocr", action="store_true", help="掃描檔用主控台設定的 Google OCR 轉文字")
     ap.add_argument("--ocr-url", default="", help="指定 OCR 網址（預設讀主控台設定）")
