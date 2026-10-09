@@ -6011,6 +6011,9 @@ PDF_DEFAULT_SETTINGS = {
     # LINE 收件資料夾（每位 PM 一個）：PM 電腦上的 tools/pdf_watcher.ps1 每分鐘讀這裡的設定，
     # 資料夾有新的 PDF 就送進佇列。[{pm, folder, enabled}]
     "watchers": [],
+    # 自動歸檔到 G 槽：由 pm 那台電腦的背景程式，把「已確認」的檔案用確認檔名放進
+    # 「根目錄底下的案場資料夾 → 03/04/06/07 分類資料夾」。roots 可多個（一行一個）。
+    "archive": {"enabled": False, "pm": "", "roots": ""},
 }
 PDF_WATCHER_STATUS = {}   # {pm: 最後一次回報}，記憶體即可（背景程式每分鐘回報一次）
 PDF_SETTINGS = {"data": None}
@@ -6162,6 +6165,12 @@ def _pdf_patch(record_id, fields):
     return resp.json()
 
 
+def _pdf_doc_category(doc_type):
+    """文件類型 → 要放的分類資料夾編號（03/04/06/07），沒設定就空白。"""
+    rule = next((t for t in _pdf_settings().get("doc_types") or [] if t.get("name") == doc_type), None)
+    return ((rule or {}).get("category") or "").strip()
+
+
 def _pdf_record_to_dict(r):
     f = r.get("fields", {})
     g = lambda k: f.get(PDF_F[k])
@@ -6178,6 +6187,7 @@ def _pdf_record_to_dict(r):
         "uploader": g("uploader") or "",
         "uploaded_at": g("uploaded_at") or r.get("createdTime", ""),
         "src_path": g("src_path") or "",
+        "category": _pdf_doc_category(g("doc_type") or ""),
         "case_no": g("case_no") or "",
         "alias": g("alias") or "",
         "doc_type": g("doc_type") or "",
@@ -7076,8 +7086,11 @@ def pdf_rename_watcher_config():
     w = next((w for w in watchers if w.get("pm") == pm), None)
     if not w:
         return jsonify({"error": f"主控台還沒設定「{pm}」的 LINE 收件資料夾"}), 404
+    arc = _pdf_settings().get("archive") or {}
     return jsonify({"pm": pm, "folder": w.get("folder") or "", "enabled": bool(w.get("enabled", True)),
-                    "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024)})
+                    "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024),
+                    "archive": {"enabled": bool(arc.get("enabled")) and arc.get("pm") == pm,
+                                "roots": [x.strip() for x in (arc.get("roots") or "").splitlines() if x.strip()]}})
 
 
 @app.route("/api/pdf-rename/watcher-upload", methods=["POST"])
@@ -7109,6 +7122,8 @@ def pdf_rename_watcher_heartbeat():
         "folder_ok": bool(body.get("folder_ok")), "uploaded_total": int(body.get("uploaded_total") or 0),
         "skipped": int(body.get("skipped") or 0), "last_error": str(body.get("last_error") or "")[:300],
         "last_upload": str(body.get("last_upload") or "")[:200], "version": str(body.get("version") or "")[:20],
+        "archived_total": int(body.get("archived_total") or 0), "last_archive": str(body.get("last_archive") or "")[:300],
+        "archive_error": str(body.get("archive_error") or "")[:300], "case_folders": int(body.get("case_folders") or 0),
     }
     return jsonify({"ok": True})
 
@@ -7150,6 +7165,10 @@ def pdf_rename_save_settings():
             seen.add(pm)
             ws.append({"pm": pm[:30], "folder": (w.get("folder") or "").strip()[:300], "enabled": bool(w.get("enabled", True))})
         s["watchers"] = ws
+    if isinstance(body.get("archive"), dict):
+        a = body["archive"]
+        s["archive"] = {"enabled": bool(a.get("enabled")), "pm": (a.get("pm") or "").strip()[:30],
+                        "roots": (a.get("roots") or "").strip()[:2000]}
     if "engine" in body:
         if body["engine"] not in ("free", "hybrid", "ai"):
             return jsonify({"error": "engine 只能是 free／hybrid／ai"}), 400
@@ -7316,6 +7335,15 @@ def pdf_rename_confirmed():
 def pdf_rename_archived(record_id):
     body = request.get_json(force=True) or {}
     note = (body.get("result") or "").strip()
+    if body.get("ok") is False:
+        # 歸檔失敗：狀態留在「已確認」，原因記在寫回結果，主控台看得到
+        try:
+            old = _pdf_get_record(record_id).get("fields", {}).get(PDF_F["writeback"]) or ""
+            old = "\n".join(x for x in old.splitlines() if not x.startswith("⚠ 歸檔失敗"))
+            _pdf_patch(record_id, {PDF_F["writeback"]: (old + "\n" if old else "") + f"⚠ 歸檔失敗：{note}"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        return jsonify({"ok": True})
     fields = {PDF_F["status"]: PDF_ST_ARCHIVED}
     if note:
         try:
