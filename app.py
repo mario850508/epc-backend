@@ -5877,6 +5877,7 @@ PDF_F = {
     "hash": "fldMrCmFdyyt5WQWJ",           # 檔案雜湊（SHA1，擋重複上傳）
     "src_path": "fldzoWNBfEWLtfflB",       # 來源路徑（LINE 收件資料夾裡的原始路徑）
     "no_archive": "fldkHTxXMKSYLsjWL",     # 不歸檔（確認時選「只改名下載」，背景程式不放進 G 槽）
+    "archive_force": "fldJZsmmJ64TV8MFs",  # 同類型仍歸檔（資料夾已有同類型檔案時，使用者選擇兩份都留）
 }
 PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
 PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
@@ -5896,6 +5897,8 @@ FIELD_CASE_ELEC_NO = "fldsevnrPtGTG7aIo"       # 電號
 FIELD_CASE_TP_CONTRACT_NO = "fldgZkOWhJWi54wUD"  # 台電契約編號
 FIELD_CASE_PV_NO = "fldBU6s0FgcDojilc"         # 併聯PV編號
 FIELD_CASE_AGREE_NO = "fldOYJoRZy0Uoym41"      # 同意備案編號
+FIELD_CASE_EQUIP_REG_NO = "fldpVP9nczFLgR7yS"  # 設備登記編號（2026-10-09 新增，公文確認後自動填）
+FIELD_CASE_METER_LEASE_NO = "fldhoVmx7AzuxFcPw"  # 電表租約編號（契約登記編號，同上）
 
 # 2026-10-09：依使用者 G 槽 7,453 份已改名歷史檔案（tools/pdf_learn.py 報告）整理。
 # name＝使用者實際檔名用的類型（出現最多的寫法）；synonyms＝檔名裡的其他寫法（學習工具歸併用）；
@@ -6092,7 +6095,53 @@ def _pdf_short_name(case_no):
     m = re.match(r"^(.+?)(\d+)號$", case_no)
     if m and m.group(1) in al["rules"]:
         return al["rules"][m.group(1)] + m.group(2)
+    if m:
+        rule = _pdf_derived_alias_rules().get(m.group(1))
+        if rule:
+            return rule + m.group(2)
     return ""
+
+
+def _pdf_derived_alias_rules():
+    """收購／移轉的案場：G 槽資料夾是「潤特桃園17號」、檔名簡稱是「千82」，但 Airtable 的案號是原本的
+    「桃園千塘82號」。從對照表反推「桃園千塘 → 千」這種規則：簡稱的字不在資料夾案號裡、
+    而 Airtable 有同號碼且含這個字的案號。案件清單更新時重算。"""
+    try:
+        cases = _pdf_case_ref()
+    except Exception as e:
+        print(f"[pdf_rename] 讀取案件清單失敗：{e}", flush=True)
+        cases = PDF_CASE_REF.get("cases") or []
+    stamp = (PDF_CASE_REF.get("at"), len(_pdf_aliases()["map"]))
+    if PDF_ALIASES.get("derived_at") == stamp and "derived" in PDF_ALIASES:
+        return PDF_ALIASES["derived"]
+    by_num = {}
+    for c in cases:
+        m = re.match(r"^(.+?)(\d+)號$", c["case_no"])
+        if m:
+            by_num.setdefault(m.group(2), []).append(m.group(1))
+    counter = {}
+    for k, v in _pdf_aliases()["map"].items():
+        b = re.fullmatch(r"([\u4e00-\u9fff]{1,3})(\d+)", v or "")
+        if not b or b.group(1) in k:
+            continue
+        for base in by_num.get(b.group(2), []):
+            if b.group(1) in base and not base.startswith("潤特"):
+                counter.setdefault(base, {}).setdefault(b.group(1), 0)
+                counter[base][b.group(1)] += 1
+    rules = {base: max(c, key=c.get) for base, c in counter.items() if max(c.values()) >= 2}
+    PDF_ALIASES["derived"], PDF_ALIASES["derived_at"] = rules, stamp
+    return rules
+
+
+def _pdf_folder_keys(case_no):
+    """背景程式找案場資料夾用的案號：本身＋簡稱相同的資料夾案號（桃園千塘82號 → 潤特桃園17號）。"""
+    if not case_no:
+        return []
+    short = _pdf_short_name(case_no)
+    keys = [case_no]
+    if short:
+        keys += [k for k, v in _pdf_aliases()["map"].items() if v == short and k != case_no]
+    return keys
 
 
 def _pdf_aliases_from_report(report):
@@ -6198,6 +6247,7 @@ def _pdf_record_to_dict(r):
         "src_path": g("src_path") or "",
         "category": _pdf_doc_category(g("doc_type") or ""),
         "no_archive": bool(g("no_archive")),
+        "archive_force": bool(g("archive_force")),
         "case_no": g("case_no") or "",
         "alias": g("alias") or "",
         "doc_type": g("doc_type") or "",
@@ -6213,6 +6263,10 @@ def _pdf_record_to_dict(r):
         "candidates": result.get("candidates") or [],
         "engine": result.get("engine") or "",
         "text_excerpt": result.get("text_excerpt") or "",
+        "ids": result.get("ids") or {},
+        "ids_writable": _pdf_writable_ids(result.get("ids") or {}, g("doc_type") or ""),
+        "same_type": result.get("same_type") or [],
+        "file_ext": _pdf_ext(att.get("filename") or g("src_name") or ""),
         "attempts": g("attempts") or 0,
         "error": g("error") or "",
         "recognized_at": g("recognized_at") or "",
@@ -6232,7 +6286,8 @@ def _pdf_case_ref(force=False):
         return PDF_CASE_REF["cases"]
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_VENDOR, FIELD_CLOSE_STATUS,
               FIELD_CASE_SUBMIT_NAME, FIELD_CASE_EPC_PARTY, FIELD_CASE_CONTRACT_NO, FIELD_CASE_TP_ACCEPT_NO,
-              FIELD_CASE_ELEC_NO, FIELD_CASE_TP_CONTRACT_NO, FIELD_CASE_PV_NO, FIELD_CASE_AGREE_NO]
+              FIELD_CASE_ELEC_NO, FIELD_CASE_TP_CONTRACT_NO, FIELD_CASE_PV_NO, FIELD_CASE_AGREE_NO,
+              FIELD_CASE_EQUIP_REG_NO, FIELD_CASE_METER_LEASE_NO]
     records = airtable_get_all(CASE_API_URL, None, fields)
     cases = []
     for r in records:
@@ -6256,6 +6311,8 @@ def _pdf_case_ref(force=False):
                 "台電契約編號": f.get(FIELD_CASE_TP_CONTRACT_NO) or "",
                 "併聯PV編號": f.get(FIELD_CASE_PV_NO) or "",
                 "同意備案編號": f.get(FIELD_CASE_AGREE_NO) or "",
+                "設備登記編號": f.get(FIELD_CASE_EQUIP_REG_NO) or "",
+                "電表租約編號": f.get(FIELD_CASE_METER_LEASE_NO) or "",
             },
         })
     # 已公證但還沒建進 Airtable 的案件（業務自治區推送），只有案號／別名可比
@@ -6279,6 +6336,131 @@ def _norm_id(s):
 def _norm_text(s):
     s = (s or "").translate(_FULLWIDTH).replace("台", "臺")
     return re.sub(r"[\s,，、.。:：;；()（）\-]", "", s)
+
+
+# ---------------- 文件上的編號（同意備案、設備登記、受理、台電契約、電表租約、電號）----------------
+# 2026-10-09 用使用者 G 槽 1,800 份有文字的歷史文件整理：編號前面一定有固定的標籤，格式也固定。
+# (Airtable 欄位, 標籤, 格式, 這個編號「屬於這份文件本身」的文件類型)
+# 最後一欄用來決定能不能自動寫回 Airtable：例如併聯審查裡的「電號」是屋主原本的用電電號、
+# 補助同意函會列出別的案場的設備登記編號，這些只拿來比對案件，不寫回。
+PDF_ID_RULES = [
+    ("同意備案編號", r"備案編號", r"([A-Z]{3}-?\d{3}-?PV-?\d{3,4})",
+     {"同意備案", "設備登記", "免雜", "竣工備查", "正式售電函", "設備登記移轉"}),
+    ("設備登記編號", r"設備登記編號", r"([A-Z]{3}-?(?:[A-Z]{2,4}-?)?\d{3}-?PV-?\d{3,4})",
+     {"設備登記", "正式售電函", "設備登記移轉"}),
+    ("臺電受理編號", r"(?:受理編號|公司編號)", r"(\d{6}PV\d{4})",
+     {"併聯審查", "細部協商", "細協補件通知"}),
+    ("台電契約編號", r"(?<!登記)契約編號", r"(\d{2}-?PV-?\d{3}-?\d{4})",
+     {"台電契約", "台電契約函", "台電契約移轉", "併聯試運轉函", "正式售電函"}),
+    ("電表租約編號", r"契約登記編號", r"((?:\d{2}-)?PV-\d{3}-\d{4})",
+     {"電表租約"}),
+    ("電號", r"電號", r"(\d{2}-?\d{2}-?\d{4}-?\d{2}-?\d)(?!\d)",
+     {"台電契約", "台電契約移轉", "電表租約", "併聯試運轉函", "正式售電函", "設備登記"}),
+]
+PDF_ID_FIELDS = {
+    "同意備案編號": FIELD_CASE_AGREE_NO, "設備登記編號": FIELD_CASE_EQUIP_REG_NO,
+    "臺電受理編號": FIELD_CASE_TP_ACCEPT_NO, "台電契約編號": FIELD_CASE_TP_CONTRACT_NO,
+    "電表租約編號": FIELD_CASE_METER_LEASE_NO, "電號": FIELD_CASE_ELEC_NO,
+}
+_ID_FW = str.maketrans("０１２３４５６７８９－（）：ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ",
+                       "0123456789-():ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _pdf_norm_case_id(field, v):
+    """統一成 Airtable 既有資料的寫法；格式不對回傳空字串。"""
+    v = (v or "").upper().translate(_ID_FW).strip()
+    if field == "電號":
+        d = re.sub(r"\D", "", v)
+        return f"{d[:2]}-{d[2:4]}-{d[4:8]}-{d[8:10]}-{d[10:]}" if len(d) == 11 else ""
+    if field == "台電契約編號":
+        d = re.sub(r"\D", "", v)
+        return f"{d[:2]}-PV-{d[2:5]}-{d[5:]}" if len(d) == 9 else ""
+    if field == "同意備案編號":
+        m = re.fullmatch(r"([A-Z]{3})-?(\d{3})-?PV-?(\d{3,4})", v)
+        return f"{m.group(1)}-{m.group(2)}PV{m.group(3)}" if m else ""
+    if field == "設備登記編號":
+        m = re.fullmatch(r"([A-Z]{3})-?(?:([A-Z]{2,4})-?)?(\d{3})-?PV-?(\d{3,4})", v)
+        if not m:
+            return ""
+        return (f"{m.group(1)}-{m.group(2)}{m.group(3)}-PV{m.group(4)}" if m.group(2)
+                else f"{m.group(1)}-{m.group(3)}PV{m.group(4)}")
+    if field == "臺電受理編號":
+        return v if re.fullmatch(r"\d{6}PV\d{4}", v) else ""
+    if field == "電表租約編號":
+        return v if re.fullmatch(r"(?:\d{2}-)?PV-\d{3}-\d{4}", v) else ""
+    return v
+
+
+def _pdf_extract_ids(text):
+    """文件全文 → {欄位: [編號…]}（同一欄位可能有好幾個，例如合併案件）。"""
+    flat = re.sub(r"\s+", "", (text or "").translate(_ID_FW))
+    out = {}
+    for field, label, fmt, _ in PDF_ID_RULES:
+        vals = []
+        for m in re.finditer(label + r"[為:：(（「\[]{0,3}" + fmt, flat):
+            v = _pdf_norm_case_id(field, m.group(1))
+            if v and v not in vals:
+                vals.append(v)
+        if vals:
+            out[field] = vals[:5]
+    return out
+
+
+def _pdf_ids_from_ai(idents):
+    """AI 辨識的 identifiers → 同樣的 {欄位: [編號…]}。"""
+    out = {}
+    for key, field in (("agree_record_no", "同意備案編號"), ("taipower_accept_no", "臺電受理編號"),
+                       ("contract_no", "台電契約編號"), ("electricity_no", "電號")):
+        vals = [v for v in (_pdf_norm_case_id(field, x) for x in (idents or {}).get(key) or []) if v]
+        if vals:
+            out[field] = list(dict.fromkeys(vals))[:5]
+    return out
+
+
+def _pdf_writable_ids(ids, doc_type):
+    """可以寫回 Airtable 的編號：這類文件本身的編號，而且文件裡只有一個（有兩個以上可能是合併案件，不寫）。"""
+    own = {r[0]: r[3] for r in PDF_ID_RULES}
+    return {f: v[0] for f, v in (ids or {}).items() if len(v) == 1 and doc_type in own.get(f, ())}
+
+
+def _pdf_fill_case_ids(case, doc_type, ids, trusted=False):
+    """把文件上的編號填進「專案細節」空白欄位。已有不同的值不覆蓋，列出來給人看。回傳訊息行。
+    trusted＝使用者在主控台確認過的編號（每個欄位一個值），不再限制文件類型。"""
+    if trusted:
+        w = {f: v[0] for f, v in (ids or {}).items() if f in PDF_ID_FIELDS and len(v) == 1 and v[0]}
+    else:
+        w = _pdf_writable_ids(ids, doc_type)
+    if not w:
+        return []
+    if not case or not case.get("record_id"):
+        return [f"⚠ 案件不在 Airtable 專案細節，編號沒有寫入（{'、'.join(f'{k} {v}' for k, v in w.items())}）"]
+    try:
+        resp = requests.get(f"{CASE_API_URL}/{case['record_id']}", headers=airtable_headers(),
+                            params={"returnFieldsByFieldId": "true"}, timeout=30)
+        resp.raise_for_status()
+        cur = resp.json().get("fields", {})
+    except Exception as e:
+        return [f"✗ 讀取案件編號失敗：{str(e)[:200]}"]
+    patch, msgs = {}, []
+    for field, val in w.items():
+        old = (cur.get(PDF_ID_FIELDS[field]) or "").strip()
+        if not old:
+            patch[PDF_ID_FIELDS[field]] = val
+            msgs.append(f"✓ 已填入{field} {val}")
+        elif _norm_id(old) != _norm_id(val):
+            msgs.append(f"⚠ 專案細節的{field}是 {old}，文件上是 {val}，未覆蓋，請確認")
+    if patch:
+        try:
+            r = requests.patch(f"{CASE_API_URL}/{case['record_id']}", headers=airtable_headers(),
+                               json={"fields": patch}, timeout=30)
+            if r.status_code >= 400:
+                raise Exception(r.text)
+            for c in PDF_CASE_REF.get("cases") or []:   # 下一份文件馬上就能用新編號比對
+                if c.get("record_id") == case["record_id"]:
+                    c["ids"].update(w)
+        except Exception as e:
+            return [f"✗ 編號寫入失敗：{str(e)[:200]}"]
+    return msgs
 
 
 # 抽出的識別資料 → 案件欄位
@@ -6306,6 +6488,16 @@ def _pdf_match_cases(ext, fulltext=None):
     cases = _pdf_case_ref()
     if fulltext:
         _pdf_scan_fulltext(fulltext, add)
+    # 文件上有標籤的編號（同意備案編號：XXX…）跟案件欄位完全相同 → 幾乎確定
+    for field, vals in (ext.get("ids") or {}).items():
+        fields = ["臺電受理編號", "併聯PV編號"] if field == "臺電受理編號" else [field]
+        for v in vals:
+            nv = _norm_id(v)
+            for c in cases:
+                if any(_norm_id(c["ids"].get(cf)) == nv for cf in fields if c["ids"].get(cf)):
+                    s = scores.get(c["case_no"])
+                    if not s or not any(v in w for w in s["why"]):
+                        add(c, 100, f"{field} {v} 相同")["strong"] = True
     for key, case_fields in _PDF_ID_MAP.items():
         for raw in idents.get(key) or []:
             v = _norm_id(raw)
@@ -6507,7 +6699,7 @@ def _pdf_valid_date(s):
     return d
 
 
-def _pdf_build_name(template, case, doc_type, doc_date):
+def _pdf_build_name(template, case, doc_type, doc_date, ext=".pdf"):
     d = _pdf_valid_date(doc_date) if doc_date else None
     case_no = case.get("case_no", "") if case else ""
     vals = {
@@ -6522,7 +6714,7 @@ def _pdf_build_name(template, case, doc_type, doc_date):
     name = re.sub(r"\{(\S+?)\}", lambda m: vals.get(m.group(1), m.group(0)), template or PDF_DEFAULT_SETTINGS["template"])
     name = re.sub(r'[\\/:*?"<>|\r\n]', "", name)
     name = re.sub(r"_+", "_", name).strip("_ ")
-    return (name or "未命名") + ".pdf"
+    return (name or "未命名") + (ext or ".pdf")
 
 
 # ---------------- 免費辨識（2026-10-08 改為預設）----------------
@@ -6531,6 +6723,34 @@ def _pdf_build_name(template, case, doc_type, doc_date):
 # 並拿 Airtable 每個案件的受理編號、電號、同意備案編號、案號直接在全文裡找，對到就幾乎確定。
 # 設定 engine：free（預設，完全免費）／hybrid（免費辨識沒把握的才交給 AI）／ai（全部用 AI）。
 PDF_MIN_TEXT_CHARS = 40
+# LINE 收到的不只 PDF：照片（拍公文）轉成 PDF 再辨識、歸檔；Word／Excel 直接讀檔案裡的文字，保留原格式歸檔
+PDF_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+PDF_OFFICE_EXTS = {".docx", ".xlsx"}
+PDF_OFFICE_MIME = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                   ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+
+
+def _pdf_ext(name):
+    return os.path.splitext(name or "")[1].lower()
+
+
+def _pdf_image_to_pdf(data):
+    """照片 → 單頁 PDF。手機照片常常很大：長邊縮到 2400 像素、JPEG 品質 85，控制在 Airtable 5MB 以內；
+    依 EXIF 轉正（手機直拍的照片不轉會躺著，OCR 會讀不到）。"""
+    from PIL import Image, ImageOps
+    img = Image.open(io.BytesIO(data))
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    for side, quality in ((2400, 85), (2000, 75), (1600, 70)):
+        im = img.copy()
+        im.thumbnail((side, side))
+        buf = io.BytesIO()
+        im.save(buf, format="PDF", resolution=200.0, quality=quality)
+        if buf.tell() <= PDF_MAX_BYTES:
+            break
+    return buf.getvalue()
+
 
 
 def _pdf_text_layer(pdf_bytes):
@@ -6568,7 +6788,50 @@ def _pdf_ocr(pdf_bytes, url):
     return data.get("text") or ""
 
 
-def _pdf_get_text(pdf_bytes, settings):
+def _pdf_office_text(data, ext):
+    """Word（.docx）／Excel（.xlsx）檔案裡的文字。兩種都是 zip 裡的 XML，不用另外裝套件。"""
+    import zipfile
+    from xml.etree import ElementTree as ET
+    try:
+        z = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise Exception("檔案打不開（不是有效的 Word／Excel 檔）")
+    parts = []
+    if ext == ".docx":
+        names = ["word/document.xml"] + sorted(n for n in z.namelist() if re.match(r"word/(header|footer)\d*\.xml$", n))
+        for n in names:
+            if n not in z.namelist():
+                continue
+            root = ET.fromstring(z.read(n))
+            for para in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p"):
+                t = "".join(x.text or "" for x in para.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"))
+                if t.strip():
+                    parts.append(t)
+    else:
+        ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(ns + "si"):
+                shared.append("".join(x.text or "" for x in si.iter(ns + "t")))
+        for n in sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))[:5]:
+            for row in ET.fromstring(z.read(n)).iter(ns + "row"):
+                cells = []
+                for c in row.iter(ns + "c"):
+                    v = c.find(ns + "v")
+                    if c.get("t") == "s" and v is not None and (v.text or "").isdigit() and int(v.text) < len(shared):
+                        cells.append(shared[int(v.text)])
+                    elif c.get("t") == "inlineStr":
+                        cells.append("".join(x.text or "" for x in c.iter(ns + "t")))
+                    elif v is not None and v.text:
+                        cells.append(v.text)
+                if cells:
+                    parts.append(" ".join(cells))
+    return "\n".join(parts)
+
+
+def _pdf_get_text(pdf_bytes, settings, ext=".pdf"):
+    if ext in PDF_OFFICE_EXTS:
+        return _pdf_office_text(pdf_bytes, ext), ("Word 檔文字" if ext == ".docx" else "Excel 檔文字")
     text = _pdf_text_layer(pdf_bytes)
     if len(re.sub(r"\s", "", text)) >= PDF_MIN_TEXT_CHARS:
         return text, "PDF 文字層"
@@ -6780,6 +7043,7 @@ def _pdf_rule_extract(text, settings):
         "doc_type": doc_type, "doc_type_reason": type_reason, "doc_date": doc_date, "doc_date_raw": date_raw,
         "doc_number": doc_number, "issuer": issuer, "recipient": "", "subject": subject,
         "identifiers": {"addresses": list(dict.fromkeys(addresses))[:10], "names": [flat]},
+        "ids": _pdf_extract_ids(text),
         "notes": "",
     }
     return ext, type_conf, date_conf
@@ -6792,6 +7056,8 @@ def _pdf_scan_fulltext(flat, scores_add):
     for c in _pdf_case_ref():
         for label, val in c["ids"].items():
             v = _norm_id(val)
+            if label == "電表租約編號":
+                continue
             if len(v) >= 8 and v in digits:
                 scores_add(c, 100, f"{label} {val} 出現在文件")["strong"] = True
         cn = _norm_text(c["case_no"])
@@ -6843,7 +7109,7 @@ def _pdf_free_analyze(text, source, settings):
         "doc_number": ext["doc_number"], "issuer": ext["issuer"], "subject": ext["subject"],
         "confidence": max(0, min(case_conf, type_conf, date_conf)), "evidence": evidence, "issues": issues,
         "conf_parts": [case_conf, type_conf, date_conf],
-        "ranked": ranked,
+        "ranked": ranked, "ids": ext["ids"],
         "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:4000]},
     }
 
@@ -6852,6 +7118,7 @@ def _pdf_ai_analyze(pdf_bytes, settings):
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
     system = _pdf_system_prompt(settings)
     ext = _pdf_extract(settings, system, pdf_b64)
+    ext["ids"] = _pdf_ids_from_ai(ext.get("identifiers"))
     ranked, strong = _pdf_match_cases(ext)
     ver = _pdf_verify(settings, system, pdf_b64, ext, ranked)
 
@@ -6908,7 +7175,7 @@ def _pdf_ai_analyze(pdf_bytes, settings):
         "subject": ext.get("subject") or "",
         "confidence": max(0, min(100, min(case_conf, type_conf, date_conf))), "evidence": evidence,
         "conf_parts": [case_conf, type_conf, date_conf],
-        "issues": issues, "ranked": ranked,
+        "issues": issues, "ranked": ranked, "ids": ext["ids"],
         "result": {"engine": "ai", "model": PDF_MODEL, "extract": ext, "verify": ver},
     }
 
@@ -6928,13 +7195,16 @@ def _pdf_recognize(rec):
     pdf.raise_for_status()
 
     engine = _pdf_engine(settings)
+    ext_name = _pdf_ext(att.get("filename") or f.get(PDF_F["src_name"]) or "")
+    if ext_name in PDF_OFFICE_EXTS:
+        engine = "free"   # Word／Excel 直接讀檔案裡的文字（AI 只吃 PDF）
     threshold = int(settings.get("auto_confirm_threshold") or 92)
     source = ""
     if engine == "ai":
         out = _pdf_ai_analyze(pdf.content, settings)
     else:
         try:
-            text, source = _pdf_get_text(pdf.content, settings)
+            text, source = _pdf_get_text(pdf.content, settings, ext_name)
             out = _pdf_free_analyze(text, source, settings)
         except Exception:
             if engine != "hybrid" or not os.environ.get("ANTHROPIC_API_KEY"):
@@ -6984,10 +7254,21 @@ def _pdf_recognize(rec):
             out["confidence"] = max(0, min(parts))
             out["evidence"] += f"\n日期：文件上沒有日期，用收件日 {received}（信心 {parts[2]}）"
     case, case_no, doc_type, doc_date = out["case"], out["case_no"], out["doc_type"], out["doc_date"]
+    # 同案場已經有同類型的文件（佇列裡的）：可能是重複收件或新版，一律留給人確認
+    same = _pdf_same_type(case_no, doc_type, rec["id"])
+    if same:
+        out["issues"].append(f"同案場已經有「{doc_type}」：" + "、".join(
+            f"{x['name'] or '（未命名）'}（{x['status']}）" for x in same[:3]) + "。可能是重複或新版，請確認")
+        if _pdf_doc_category(doc_type) != "07":   # 07 設備文件本來就常有好幾份（不同批模組）
+            out["confidence"] = min(out["confidence"], 80)
+    ids = out.get("ids") or {}
+    if ids:
+        out["evidence"] += "\n文件上的編號：" + "；".join(f"{k} {'、'.join(v)}" for k, v in ids.items())
     confidence = out["confidence"]
-    suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date)
+    suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date,
+                                ext_name if ext_name in PDF_OFFICE_EXTS else ".pdf")
     # pred＝系統一開始的判斷；使用者確認（可能有修改）後拿來算真實準確度，也是自動重新學習的依據
-    result = dict(out["result"], issues=out["issues"],
+    result = dict(out["result"], issues=out["issues"], ids=ids, same_type=same,
                   pred={"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date, "name": suggested}, candidates=[
         {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
          "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
@@ -7016,7 +7297,7 @@ def _pdf_recognize(rec):
         fields[PDF_F["confirmed_by"]] = f"自動確認（信心 {confidence}）"
     _pdf_patch(rec["id"], fields)
     if auto and settings.get("writeback"):
-        _pdf_writeback(rec["id"], case, doc_type, doc_date)
+        _pdf_writeback(rec["id"], case, doc_type, doc_date, ids)
     if out.get("conf_parts") and out["conf_parts"][2] >= 80:
         _pdf_propagate_sibling_date(case_no, doc_type, doc_date)
     return confidence
@@ -7092,9 +7373,31 @@ def _pdf_propagate_sibling_date(case_no, doc_type, doc_date):
         print(f"[pdf_rename] 更新同案場日期失敗：{e}", flush=True)
 
 
-def _pdf_writeback(record_id, case, doc_type, doc_date):
-    """把發文日期寫回「進度管理」對應里程碑的完成日期。只填空白；已有不同日期就不動、記下來給人看。"""
-    msg = _pdf_writeback_msg(case, doc_type, doc_date)
+def _pdf_same_type(case_no, doc_type, exclude_id=""):
+    """佇列裡同案場、同類型的其他文件（不含辨識失敗的）。"""
+    if not case_no or not doc_type or doc_type == "其他":
+        return []
+    esc = lambda v: (v or "").replace("'", "\\'")
+    try:
+        recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc(case_no) + "',{" + PDF_F["doc_type"]
+                                + "}='" + esc(doc_type) + "')", [PDF_F["final_name"], PDF_F["doc_date"], PDF_F["status"]])
+    except Exception as e:
+        print(f"[pdf_rename] 查同類型文件失敗：{e}", flush=True)
+        return []
+    out = []
+    for r in recs:
+        g = r.get("fields", {})
+        if r["id"] == exclude_id or g.get(PDF_F["status"]) in (PDF_ST_FAILED, PDF_ST_QUEUED, PDF_ST_RUNNING):
+            continue
+        out.append({"id": r["id"], "name": g.get(PDF_F["final_name"]) or "", "date": g.get(PDF_F["doc_date"]) or "",
+                    "status": g.get(PDF_F["status"]) or ""})
+    return out
+
+
+def _pdf_writeback(record_id, case, doc_type, doc_date, ids=None, ids_trusted=False):
+    """把發文日期寫回「進度管理」對應里程碑的完成日期，文件上的編號填進「專案細節」。
+    都只填空白；已有不同的值就不動、記下來給人看。"""
+    msg = "\n".join([_pdf_writeback_msg(case, doc_type, doc_date)] + _pdf_fill_case_ids(case, doc_type, ids, ids_trusted))
     try:
         _pdf_patch(record_id, {PDF_F["writeback"]: msg})
     except Exception as e:
@@ -7352,14 +7655,30 @@ def pdf_rename_items():
 
 
 def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", src_path="", received_at=""):
-    """建立一筆待辨識記錄並上傳 PDF。同一份內容（SHA1 相同）已經在佇列裡就不重複建立。"""
+    """建立一筆待辨識記錄並上傳檔案。同一份內容（SHA1 相同）已經在佇列裡就不重複建立。
+    PDF 原樣；照片轉成 PDF；Word／Excel（.docx／.xlsx）原樣保存。"""
     import hashlib
-    name = os.path.basename(name or "未命名.pdf")
-    if not data.startswith(b"%PDF"):
-        return {"name": name, "ok": False, "error": "不是 PDF 檔"}
+    name = os.path.basename((name or "未命名.pdf").replace("\\", "/"))
+    ext = _pdf_ext(name)
+    digest = hashlib.sha1(data).hexdigest()   # 用原始內容算：同一張照片再下載一次也認得出來
+    content_type = "application/pdf"
+    if data.startswith(b"%PDF"):
+        if ext != ".pdf":
+            name += ".pdf"
+    elif ext in PDF_IMAGE_EXTS:
+        try:
+            data = _pdf_image_to_pdf(data)
+        except Exception as e:
+            return {"name": name, "ok": False, "error": f"照片無法轉成 PDF：{str(e)[:200]}"}
+        name = os.path.splitext(name)[0] + ".pdf"
+    elif ext in PDF_OFFICE_EXTS:
+        if not data.startswith(b"PK"):
+            return {"name": name, "ok": False, "error": "不是有效的 Word／Excel 檔"}
+        content_type = PDF_OFFICE_MIME[ext]
+    else:
+        return {"name": name, "ok": False, "error": "不支援的檔案格式（支援 PDF、照片 JPG/PNG、Word .docx、Excel .xlsx）"}
     if len(data) > PDF_MAX_BYTES:
         return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"}
-    digest = hashlib.sha1(data).hexdigest()
     try:
         dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'", [PDF_F["status"], PDF_F["src_name"]])
         if dup:
@@ -7377,7 +7696,7 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
         rid = resp.json()["id"]
         try:
             upload_attachment_to_ops_record(rid, PDF_F["file"], base64.b64encode(data).decode(), name,
-                                            content_type="application/pdf")
+                                            content_type=content_type)
         except Exception:
             requests.delete(f"{PDF_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
             raise
@@ -7415,6 +7734,7 @@ def pdf_rename_watcher_config():
     arc = _pdf_settings().get("archive") or {}
     return jsonify({"pm": pm, "folder": w.get("folder") or "", "enabled": bool(w.get("enabled", True)),
                     "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024),
+                    "image_max_mb": 20,   # 照片會在後端縮小轉成 PDF，原檔可以比較大
                     # pm 留空＝任何開著的電腦都可以歸檔（大家都存同一個公司雲端），用 archive-claim 避免兩台搶同一份
                     "archive": {"enabled": bool(arc.get("enabled")) and (not arc.get("pm") or arc.get("pm") == pm),
                                 "roots": [x.strip() for x in (arc.get("roots") or "").splitlines() if x.strip()]}})
@@ -7549,17 +7869,105 @@ def pdf_rename_save_settings():
 
 @app.route("/api/pdf-rename/import-learn", methods=["POST"])
 def pdf_rename_import_learn():
-    """匯入 tools/pdf_learn.py 產生的 report.json：目前用來建立案號 → 簡稱對照（檔名 {簡稱}）。"""
+    """匯入 tools/pdf_learn.py 產生的 report.json：建立案號 → 簡稱對照（檔名 {簡稱}），
+    並用歷史文件上的編號補 Airtable 專案細節空白的編號欄位。"""
     report = request.get_json(force=True) or {}
     al = _pdf_aliases_from_report(report)
-    if not al["map"]:
+    if not al["map"] and not report.get("case_ids"):
         return jsonify({"error": "report.json 裡沒有可用的案場簡稱"}), 400
-    try:
-        _state_set_long(PDF_ALIAS_KEY, json.dumps(al, ensure_ascii=False))
-    except Exception as e:
-        return jsonify({"error": f"儲存失敗：{e}"}), 502
-    PDF_ALIASES["data"] = al
-    return jsonify({"ok": True, "count": len(al["map"]), "rules": al["rules"]})
+    if al["map"]:
+        try:
+            _state_set_long(PDF_ALIAS_KEY, json.dumps(al, ensure_ascii=False))
+        except Exception as e:
+            return jsonify({"error": f"儲存失敗：{e}"}), 502
+        PDF_ALIASES["data"] = None   # 重新讀：內建 pdf_aliases.json ＋ 剛存的
+    ids = {}
+    if report.get("case_ids"):
+        try:
+            ids = _pdf_import_case_ids(report["case_ids"])
+        except Exception as e:
+            ids = {"error": str(e)[:300]}
+    return jsonify({"ok": True, "count": len(al["map"]), "rules": al["rules"], "ids": ids})
+
+
+def _pdf_canon_type(type_base):
+    """檔名裡的類型（可能是別名，例如「審迄圖」「設備登記函」）→ 規則裡的正式類型。"""
+    names = {}
+    for t in _pdf_settings().get("doc_types") or []:
+        names[t["name"]] = t["name"]
+        for x in re.split(r"[、,，]", t.get("synonyms") or ""):
+            if x.strip():
+                names[x.strip()] = t["name"]
+    tb = (type_base or "").split("_")[-1].strip()
+    if tb in names:
+        return names[tb]
+    return next((names[k] for k in sorted(names, key=len, reverse=True) if len(k) >= 2 and k in tb), "")
+
+
+def _pdf_folder_to_case(folder_case_no):
+    """G 槽案場資料夾的案號 → Airtable 案件（收購案場用簡稱對回原本的案號）。"""
+    cases = _pdf_case_ref()
+    c = next((c for c in cases if c["case_no"] == folder_case_no and c.get("record_id")), None)
+    if c:
+        return c
+    short = _pdf_aliases()["map"].get(folder_case_no)
+    if not short:
+        return None
+    hits = [c for c in cases if c.get("record_id") and _pdf_short_name(c["case_no"]) == short]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _pdf_import_case_ids(entries):
+    """report.json 的 case_ids（每份歷史文件上的編號）→ 補專案細節空白欄位。
+    同一案場、同一欄位只在所有文件都是同一個值時才寫；已有不同的值不覆蓋，列出來。"""
+    per_case = {}
+    for e in entries or []:
+        m = re.match(r"^\s*\d+\s*[-_.、 ]?\s*([^\s_（(]+?號)", e.get("case_dir") or "")
+        doc_type = _pdf_canon_type(e.get("type_base"))
+        if not m or not doc_type:
+            continue
+        raw = {f: [v for v in (_pdf_norm_case_id(f, x) for x in vs or []) if v]
+               for f, vs in (e.get("ids") or {}).items() if f in PDF_ID_FIELDS}
+        raw = {f: list(dict.fromkeys(v)) for f, v in raw.items() if v}
+        for f, v in _pdf_writable_ids(raw, doc_type).items():
+            per_case.setdefault(m.group(1), {}).setdefault(f, set()).add(v)
+    stats = {"cases": len(per_case), "filled": 0, "filled_cases": 0, "same": 0, "conflicts": [],
+             "inconsistent": [], "no_case": []}
+    patches = []
+    for folder_cn, fields in per_case.items():
+        case = _pdf_folder_to_case(folder_cn)
+        if not case:
+            stats["no_case"].append(folder_cn)
+            continue
+        patch = {}
+        for f, vals in fields.items():
+            if len(vals) > 1:
+                stats["inconsistent"].append(f"{folder_cn} {f}：{'、'.join(sorted(vals))}")
+                continue
+            v = next(iter(vals))
+            old = (case["ids"].get(f) or "").strip()
+            if not old:
+                patch[PDF_ID_FIELDS[f]] = v
+            elif _norm_id(old) == _norm_id(v):
+                stats["same"] += 1
+            else:
+                stats["conflicts"].append(f"{case['case_no']} {f}：Airtable {old}／文件 {v}")
+        if patch:
+            patches.append((case, patch))
+    for i in range(0, len(patches), 10):
+        batch = patches[i:i + 10]
+        r = requests.patch(CASE_API_URL, headers=airtable_headers(), timeout=60,
+                           json={"records": [{"id": c["record_id"], "fields": p} for c, p in batch]})
+        if r.status_code >= 400:
+            raise Exception(f"寫入 Airtable 失敗（已完成 {stats['filled_cases']} 個案場）：{r.text[:200]}")
+        for c, p in batch:
+            stats["filled"] += len(p)
+            stats["filled_cases"] += 1
+            inv = {v: k for k, v in PDF_ID_FIELDS.items()}
+            c["ids"].update({inv[k]: v for k, v in p.items()})
+    for k in ("conflicts", "inconsistent", "no_case"):
+        stats[k] = stats[k][:50]
+    return stats
 
 
 @app.route("/api/pdf-rename/test-ocr", methods=["POST"])
@@ -7585,9 +7993,14 @@ def pdf_rename_preview_name():
     body = request.get_json(force=True) or {}
     case_no = (body.get("case_no") or "").strip()
     case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None) if case_no else None
+    ext = (body.get("ext") or ".pdf").lower()
+    doc_type = (body.get("doc_type") or "").strip()
     return jsonify({"name": _pdf_build_name(_pdf_settings().get("template"), case or {"case_no": case_no},
-                                            body.get("doc_type") or "", body.get("doc_date") or ""),
-                    "alias": (case or {}).get("alias", ""), "known_case": bool(case)})
+                                            doc_type, body.get("doc_date") or "",
+                                            ext if ext in PDF_OFFICE_EXTS else ".pdf"),
+                    "alias": (case or {}).get("alias", ""), "known_case": bool(case),
+                    # 確認前提醒：同案場已經有同類型的文件
+                    "same_type": _pdf_same_type(case_no, doc_type, (body.get("id") or "").strip()) if case_no else []})
 
 
 @app.route("/api/pdf-rename/<record_id>/confirm", methods=["POST"])
@@ -7604,8 +8017,20 @@ def pdf_rename_confirm(record_id):
         return jsonify({"error": "日期格式要是 YYYY-MM-DD"}), 400
     if any(c in final_name for c in '\\/:*?"<>|'):
         return jsonify({"error": '檔名不能含 \\ / : * ? " < > |'}), 400
-    if not final_name.lower().endswith(".pdf"):
-        final_name += ".pdf"
+    try:
+        cur = _pdf_record_to_dict(_pdf_get_record(record_id))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    ext = cur["file_ext"] if cur["file_ext"] in PDF_OFFICE_EXTS else ".pdf"
+    if _pdf_ext(final_name) in (".pdf", ".docx", ".xlsx"):
+        final_name = os.path.splitext(final_name)[0]
+    final_name += ext
+    # 文件上的編號：主控台可以修改（body.ids），沒有就用辨識結果
+    trusted = isinstance(body.get("ids"), dict)
+    ids = body.get("ids") if trusted else cur["ids"]
+    ids = {k: [v for v in ([x] if isinstance(x, str) else list(x or [])) if v and str(v).strip()]
+           for k, x in ids.items() if k in PDF_ID_FIELDS}
+    ids = {k: [_pdf_norm_case_id(k, str(v)) or str(v).strip() for v in vs][:5] for k, vs in ids.items() if vs}
     try:
         case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
         _pdf_patch(record_id, {
@@ -7619,7 +8044,7 @@ def pdf_rename_confirm(record_id):
         return jsonify({"error": str(e)}), 502
     wb = ""
     if _pdf_settings().get("writeback") and body.get("writeback", True):
-        wb = _pdf_writeback(record_id, case, doc_type, doc_date)
+        wb = _pdf_writeback(record_id, case, doc_type, doc_date, ids, trusted)
     _pdf_propagate_sibling_date(case_no, doc_type, doc_date)
     return jsonify({"ok": True, "writeback": wb, "final_name": final_name})
 
@@ -7664,9 +8089,10 @@ def pdf_rename_file(record_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     name = d["final_name"] or d["suggested_name"] or d["src_name"] or "document.pdf"
-    disp = "inline" if request.args.get("inline") else "attachment"
-    return Response(pdf.content, mimetype="application/pdf", headers={
-        "Content-Disposition": f"{disp}; filename=\"document.pdf\"; filename*=UTF-8''{quote(name)}"})
+    ext = d["file_ext"] or ".pdf"
+    disp = "inline" if request.args.get("inline") and ext == ".pdf" else "attachment"
+    return Response(pdf.content, mimetype=PDF_OFFICE_MIME.get(ext, "application/pdf"), headers={
+        "Content-Disposition": f"{disp}; filename=\"document{ext}\"; filename*=UTF-8''{quote(name)}"})
 
 
 # 本機歸檔程式用：拿已確認待歸檔的清單，歸檔完回報。
@@ -7678,13 +8104,52 @@ def pdf_rename_confirmed():
                                 + PDF_F["no_archive"] + "}))", list(PDF_F.values()))
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-    return jsonify({"items": [_pdf_record_to_dict(r) for r in recs]})
+    items = []
+    types = {t.get("name"): t for t in _pdf_settings().get("doc_types") or []}
+    for r in recs:
+        d = _pdf_record_to_dict(r)
+        t = types.get(d["doc_type"]) or {}
+        names = [d["doc_type"]] + [x.strip() for x in re.split(r"[、,，]", t.get("synonyms") or "") if x.strip()]
+        d.update({
+            "folder_keys": _pdf_folder_keys(d["case_no"]),
+            "short": _pdf_short_name(d["case_no"]),
+            "type_names": list(dict.fromkeys(names)),
+            # 資料夾裡已經有同簡稱、同類型（日期不同）的檔案 → 先停下來讓人決定；07 設備文件常有好幾份，不檢查
+            "check_same": d["category"] != "07" and not d["archive_force"],
+        })
+        items.append(d)
+    return jsonify({"items": items})
+
+
+@app.route("/api/pdf-rename/<record_id>/archive-force", methods=["POST"])
+def pdf_rename_archive_force(record_id):
+    """資料夾已有同類型檔案時，使用者選「仍要歸檔（兩份都留）」。"""
+    try:
+        old = _pdf_get_record(record_id).get("fields", {}).get(PDF_F["writeback"]) or ""
+        old = "\n".join(x for x in old.splitlines() if not x.startswith("⚠ 同類型已存在"))
+        _pdf_patch(record_id, {PDF_F["no_archive"]: False, PDF_F["archive_force"]: True,
+                               PDF_F["writeback"]: old + ("\n" if old else "") + "已選擇仍要歸檔（資料夾裡的舊檔保留）"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/api/pdf-rename/<record_id>/archived", methods=["POST"])
 def pdf_rename_archived(record_id):
     body = request.get_json(force=True) or {}
     note = (body.get("result") or "").strip()
+    if body.get("conflict"):
+        # 資料夾已有同類型的檔案：先不歸檔（勾「不歸檔」讓背景程式跳過），等使用者在主控台決定
+        try:
+            old = _pdf_get_record(record_id).get("fields", {}).get(PDF_F["writeback"]) or ""
+            old = "\n".join(x for x in old.splitlines() if not x.startswith(("⚠ 同類型已存在", "⚠ 歸檔失敗")))
+            existing = body.get("existing") or []
+            files = "、".join(str(x) for x in ([existing] if isinstance(existing, str) else existing)[:5])
+            _pdf_patch(record_id, {PDF_F["no_archive"]: True, PDF_F["writeback"]: (old + "\n" if old else "")
+                                   + f"⚠ 同類型已存在：案場資料夾裡已經有 {files}，先不歸檔，請到主控台選擇"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        return jsonify({"ok": True})
     if body.get("ok") is False:
         # 歸檔失敗：狀態留在「已確認」，原因記在寫回結果，主控台看得到
         try:
