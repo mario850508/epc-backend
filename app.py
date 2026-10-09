@@ -321,6 +321,9 @@ def _auth_request_token():
 
 @app.before_request
 def _auth_gate():
+    # 重啟後第一個請求進來時，在背景把業務自治區的快照（已公證案件／取消案號／座標／屋主資料）還原回記憶體
+    if not _BIZ_SNAPSHOT_LOADED["done"]:
+        threading.Thread(target=_ensure_biz_snapshots_loaded, daemon=True).start()
     if not _auth_password():
         return None                      # 還沒設定 DASHBOARD_PASSWORD：不啟用（跟以前一樣）
     path = request.path
