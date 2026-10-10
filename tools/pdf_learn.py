@@ -22,11 +22,13 @@ PDF 公文更名：從「已經改好檔名」的歷史檔案學習辨識規則�
 import argparse
 import base64
 import collections
+import concurrent.futures
 import io
 import json
 import os
 import re
 import sys
+import threading
 import time
 
 try:
@@ -214,15 +216,17 @@ def collect(args, out_dir):
                 ocr_url = ""
     ocr_errors = collections.Counter()
     per_type = collections.Counter()
-    ocr_used = 0
     # errors="replace"：少數 PDF 抽出來的文字有壞掉的字元（例如單獨的 surrogate），寫不進 UTF-8 檔會整個中斷，改成問號
     out = open(cache_path, "a", encoding="utf-8", errors="replace")
     rows = []
-    last_log, n_cached, n_new = time.time(), 0, 0
+    n_cached = 0
+
+    # 第一步：決定哪些檔案要讀（讀過的直接沿用；每個（分類, 類型, 區域）最多 --per-type 份）
+    todo, planned, ocr_planned = [], collections.Counter(), 0
+    last_log = time.time()
     for i, (cat, case_dir, region, path, fn) in enumerate(files):
-        # 每 30 秒回報一次進度（讀過的檔案會直接跳過、OCR 一份要 10～40 秒，不回報看起來像停住）
         if time.time() - last_log > 30:
-            log(f"  {i}/{len(files)}…（沿用上次讀過的 {n_cached} 份、這次新讀 {n_new} 份、OCR {ocr_used} 份）目前：{fn[:40]}")
+            log(f"  整理清單 {i}/{len(files)}…")
             last_log = time.time()
         stem, ext = os.path.splitext(fn)
         label = parse_filename(stem)
@@ -237,45 +241,79 @@ def collect(args, out_dir):
         except OSError:
             continue
         key = f"{row['rel']}|{st.st_size}|{int(st.st_mtime)}"
-        if key in cache and not (args.ocr and ocr_url and cache[key].get("scan") and not cache[key].get("ocr")
-                                 and ocr_used < args.ocr_limit) and not cache[key].get("error"):
-            rows.append(cache[key])
+        cached = cache.get(key)
+        need_ocr = bool(cached and args.ocr and ocr_url and cached.get("scan") and not cached.get("ocr"))
+        if cached and not cached.get("error") and not (need_ocr and ocr_planned < args.ocr_limit):
+            rows.append(cached)
             per_type[tkey] += 1
             n_cached += 1
             continue
-        if per_type[tkey] >= args.per_type or st.st_size > args.max_mb * 1024 * 1024:
+        if per_type[tkey] + planned[tkey] >= args.per_type or st.st_size > args.max_mb * 1024 * 1024:
             rows.append(row)
             continue
+        if need_ocr:
+            ocr_planned += 1
+        planned[tkey] += 1
+        todo.append((row, path, key, st.st_size))
+
+    # 第二步：同時處理好幾份（從雲端硬碟下載、送 Google OCR 大部分時間都在等網路，一次一份很慢）
+    lock = threading.Lock()
+    state = {"ocr_used": 0, "ocr_url": ocr_url, "recent": collections.deque(maxlen=30)}
+    log(f"沿用上次讀過的 {n_cached} 份；這次要讀 {len(todo)} 份（OCR 最多 {args.ocr_limit} 份），同時處理 {args.workers} 份")
+
+    def work(item):
+        row, path, key, size = item
         try:
             data, reader, pages, text = pdf_text(path)
-            row.update(pages=pages, size=st.st_size)
+            row.update(pages=pages, size=size)
             if len(re.sub(r"\s", "", text)) < MIN_TEXT:
                 row["scan"] = True
-                if args.ocr and ocr_url and ocr_used < args.ocr_limit:
-                    ocr_used += 1
+                url = ""
+                with lock:
+                    if args.ocr and state["ocr_url"] and state["ocr_used"] < args.ocr_limit:
+                        state["ocr_used"] += 1
+                        url = state["ocr_url"]
+                if url:
                     try:
-                        text = ocr(first_pages_pdf(reader), ocr_url)
+                        text = ocr(first_pages_pdf(reader), url)
                         row["ocr"] = True
+                        with lock:
+                            state["recent"].append(True)
                     except Exception as e:
                         msg = f"{type(e).__name__}: {e}"[:160]
-                        ocr_errors[msg] += 1
                         row["ocr_error"] = msg
-                        if ocr_errors[msg] <= 2:
-                            log(f"  ⚠ OCR 失敗（{fn}）：{msg}")
-                        if sum(ocr_errors.values()) >= 10 and not any(r.get("ocr") for r in rows[-30:]):
-                            log("  ⚠ OCR 連續失敗，這次先停止 OCR，請把上面的錯誤訊息截圖給 Claude")
-                            ocr_url = ""
-                            args._ocr_stopped = True
+                        with lock:
+                            state["recent"].append(False)
+                            ocr_errors[msg] += 1
+                            if ocr_errors[msg] <= 2:
+                                log(f"  ⚠ OCR 失敗（{row['file']}）：{msg}")
+                            if (state["ocr_url"] and sum(ocr_errors.values()) >= 10 and len(state["recent"]) >= 10
+                                    and not any(list(state["recent"])[-10:])):
+                                log("  ⚠ OCR 連續失敗，這次先停止 OCR，請把上面的錯誤訊息截圖給 Claude")
+                                state["ocr_url"] = ""
+                                args._ocr_stopped = True
             row["text"] = text[:MAX_TEXT]
         except Exception as e:
             row["error"] = f"{type(e).__name__}: {e}"[:200]
         row["key"] = key
-        out.write(json.dumps(row, ensure_ascii=False) + "\n")
-        out.flush()
-        rows.append(row)
-        per_type[tkey] += 1
-        n_new += 1
+        return row
+
+    n_new, last_log = 0, time.time()
+    started = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futs = [ex.submit(work, it) for it in todo]
+        for fut in concurrent.futures.as_completed(futs):
+            row = fut.result()
+            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+            out.flush()
+            rows.append(row)
+            n_new += 1
+            if time.time() - last_log > 30:
+                rate = n_new / max(1, time.time() - started) * 3600
+                log(f"  新讀 {n_new}/{len(todo)} 份、OCR {state['ocr_used']} 份（每小時約 {int(rate)} 份）最近：{row['file'][:40]}")
+                last_log = time.time()
     out.close()
+    ocr_used = state["ocr_used"]
     if ocr_errors:
         log("OCR 錯誤統計：")
         for msg, n in ocr_errors.most_common(5):
@@ -595,6 +633,7 @@ def main():
                     help="全自動：每輪做完自動匯入主控台、上傳學習資料，接著下一輪繼續 OCR，直到做完或 Google 額度用完")
     ap.add_argument("--upload", action="store_true", help="跑完自動匯入主控台並上傳學習資料（只跑一輪）")
     ap.add_argument("--max-rounds", type=int, default=30, help="--auto 最多跑幾輪，預設 30")
+    ap.add_argument("--workers", type=int, default=4, help="同時處理幾份（下載＋OCR），預設 4")
     args = ap.parse_args()
     if args.auto:
         args.ocr = True
