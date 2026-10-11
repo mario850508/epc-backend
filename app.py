@@ -8333,6 +8333,18 @@ def _pdf_load_base():
     with gzip.open(os.path.join(_HERE, "pdf_base_stats.json.gz"), "rt", encoding="utf-8") as f:
         return json.load(f), "內建版"
 PDF_CONFIRMED_WEIGHT = 2   # 確認過的檔案比歷史樣本更新、更準，權重加倍
+PDF_CORRECTED_WEIGHT = 4   # PM 改過（系統判斷錯）的檔案最有參考價值，權重再加倍：同樣的錯不要再犯
+PDF_CORR_FIELDS = (("case_no", "案號"), ("doc_type", "函文類型"), ("doc_date", "日期"), ("name", "檔名"))
+
+
+def _pdf_corrections(pred, final):
+    """系統一開始的判斷 vs PM 確認的結果 → [{field, label, from, to}]（只列改過的）。"""
+    out = []
+    for k, label in PDF_CORR_FIELDS:
+        a, b = (pred or {}).get(k) or "", (final or {}).get(k) or ""
+        if a != b:
+            out.append({"field": k, "label": label, "from": a, "to": b})
+    return out
 
 
 def pdf_retrain():
@@ -8348,7 +8360,9 @@ def pdf_retrain():
                                 + "}='" + PDF_ST_ARCHIVED + "')",
                                 [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["case_no"], PDF_F["final_name"],
                                  PDF_F["result_json"], PDF_F["confirmed_by"], PDF_F["confirmed_at"]])
-        docs, date_ctx, live, learned_alias = [], {}, [], {}
+        docs, fixed_docs, date_ctx, live, learned_alias = [], [], {}, [], {}
+        today = _tw_now_iso()[:10]
+        corr_today = corr_total = 0
         for r in recs:
             g = r.get("fields", {})
             try:
@@ -8357,11 +8371,23 @@ def pdf_retrain():
                 res = {}
             label, case_no, doc_date = g.get(PDF_F["doc_type"]), g.get(PDF_F["case_no"]) or "", g.get(PDF_F["doc_date"]) or ""
             text = res.get("text_excerpt") or ""
-            if label in allowed and len(LC.flat(text)) >= 40:
-                docs.append((label, case_no or r["id"], LC.grams(text)))
-                for k in LC.date_context(text, doc_date) if doc_date else []:
-                    date_ctx.setdefault(label, {})[k] = date_ctx.get(label, {}).get(k, 0) + PDF_CONFIRMED_WEIGHT
             pred = res.get("pred")
+            corr = res.get("corrections")
+            if corr is None and pred:   # 舊的確認紀錄沒存修正明細：用判斷 vs 結果推
+                corr = _pdf_corrections(pred, {"case_no": case_no, "doc_type": label, "doc_date": doc_date,
+                                               "name": g.get(PDF_F["final_name"])})
+            corr = corr or []
+            if corr:
+                corr_total += 1
+                if (g.get(PDF_F["confirmed_at"]) or "")[:10] == today:
+                    corr_today += 1
+            type_fixed = any(c["field"] == "doc_type" for c in corr)
+            date_fixed = any(c["field"] == "doc_date" for c in corr)
+            if label in allowed and len(LC.flat(text)) >= 40:
+                (fixed_docs if type_fixed else docs).append((label, case_no or r["id"], LC.grams(text)))
+                w = PDF_CORRECTED_WEIGHT if date_fixed else PDF_CONFIRMED_WEIGHT
+                for k in LC.date_context(text, doc_date) if doc_date else []:
+                    date_ctx.setdefault(label, {})[k] = date_ctx.get(label, {}).get(k, 0) + w
             if pred and not str(g.get(PDF_F["confirmed_by"]) or "").startswith("自動確認"):
                 live.append({"at": g.get(PDF_F["confirmed_at"]) or "",
                              "type": pred.get("doc_type") == label, "date": pred.get("doc_date") == doc_date,
@@ -8370,14 +8396,16 @@ def pdf_retrain():
             prefix = (g.get(PDF_F["final_name"]) or "").split("_")[0]
             if case_no and re.match(r"^[\u4e00-\u9fff]{1,3}\d+$", prefix):
                 learned_alias.setdefault(case_no, collections.Counter())[prefix] += 1
-        add = LC.stats_from_docs(docs, weight=PDF_CONFIRMED_WEIGHT)
+        add = LC.merge_stats(LC.stats_from_docs(docs, weight=PDF_CONFIRMED_WEIGHT),
+                             LC.stats_from_docs(fixed_docs, weight=PDF_CORRECTED_WEIGHT))
         add["date_ctx"] = date_ctx
         st = LC.merge_stats(base, add)
         live.sort(key=lambda x: x["at"], reverse=True)
         recent = live[:100]
         acc = {k: round(sum(1 for x in recent if x[k]) / len(recent), 3) for k in ("type", "date", "case", "name")} if recent else {}
         model = {"version": 2, "trained_at": _tw_now_iso(), "base_docs": base.get("N", 0),
-                 "confirmed_docs": len(docs), "head": LC.HEAD, "classes": LC.model_from_stats(st),
+                 "confirmed_docs": len(docs) + len(fixed_docs), "corrected_docs": corr_total,
+                 "corrections_today": corr_today, "type_fixed_docs": len(fixed_docs), "head": LC.HEAD, "classes": LC.model_from_stats(st),
                  "date_keys": LC.date_keys_from_ctx(st.get("date_ctx")), "calib": base.get("calib") or [],
                  "cv_accuracy": base.get("cv_accuracy"), "cv_by_cat": base.get("cv_by_cat"), "base_cases": base.get("cases_n"),
                  "base_source": base_src, "base_uploaded_at": base.get("uploaded_at"), "live": dict(acc, n=len(recent))}
@@ -8398,7 +8426,8 @@ def pdf_retrain():
             al = _pdf_aliases()
             al["map"].update(learned_alias)
             _state_set_long(PDF_ALIAS_KEY, json.dumps(al, ensure_ascii=False))
-        print(f"[pdf_rename] 重新學習完成：歷史 {base.get('N', 0)} 份＋確認 {len(docs)} 份，新簡稱 {len(learned_alias)} 個", flush=True)
+        print(f"[pdf_rename] 重新學習完成：歷史 {base.get('N', 0)} 份＋確認 {len(docs) + len(fixed_docs)} 份"
+              f"（其中改過類型 {len(fixed_docs)} 份，今天修正 {corr_today} 份），新簡稱 {len(learned_alias)} 個", flush=True)
         return meta
     except Exception as e:
         PDF_RETRAIN["last_error"] = f"{type(e).__name__}: {e}"[:500]
@@ -8408,6 +8437,9 @@ def pdf_retrain():
         PDF_RETRAIN["running"] = False
 
 
+# 每天 19:00（下班後）把今天確認、修正過的檔案學進去，隔天上班就是新模型；凌晨 2:30 再補一次（晚上加班確認的）
+scheduler.add_job(pdf_retrain, CronTrigger(hour=19, minute=0, timezone="Asia/Taipei"), id="pdf_retrain_evening",
+                  replace_existing=True, max_instances=1, coalesce=True)
 scheduler.add_job(pdf_retrain, CronTrigger(hour=2, minute=30, timezone="Asia/Taipei"), id="pdf_retrain", replace_existing=True,
                   max_instances=1, coalesce=True)
 
@@ -8443,6 +8475,45 @@ def pdf_rename_upload_base_stats():
     if not PDF_RETRAIN["running"]:
         threading.Thread(target=pdf_retrain, daemon=True).start()
     return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/api/pdf-rename/corrections")
+def pdf_rename_corrections():
+    """PM 修正過的檔案（系統判斷 → 修正為），給主控台「修正紀錄」看。?days=7"""
+    try:
+        days = max(1, min(90, int(request.args.get("days") or 7)))
+    except ValueError:
+        days = 7
+    since = (datetime.now(TW_TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+    try:
+        recs = airtable_get_all(PDF_API_URL, "AND(OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',{" + PDF_F["status"]
+                                + "}='" + PDF_ST_ARCHIVED + "'),IS_AFTER({" + PDF_F["confirmed_at"] + "},'" + since + "'))",
+                                [PDF_F["src_name"], PDF_F["final_name"], PDF_F["case_no"], PDF_F["doc_type"], PDF_F["doc_date"],
+                                 PDF_F["confirmed_by"], PDF_F["confirmed_at"], PDF_F["result_json"], PDF_F["uploader"]])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    items, by_field = [], collections.Counter()
+    for r in recs:
+        g = r.get("fields", {})
+        if str(g.get(PDF_F["confirmed_by"]) or "").startswith("自動確認"):
+            continue
+        try:
+            res = json.loads(g.get(PDF_F["result_json"]) or "{}")
+        except ValueError:
+            continue
+        corr = res.get("corrections")
+        if corr is None and res.get("pred"):
+            corr = _pdf_corrections(res["pred"], {"case_no": g.get(PDF_F["case_no"]), "doc_type": g.get(PDF_F["doc_type"]),
+                                                  "doc_date": g.get(PDF_F["doc_date"]), "name": g.get(PDF_F["final_name"])})
+        if not corr:
+            continue
+        for c in corr:
+            by_field[c["label"]] += 1
+        items.append({"id": r["id"], "src_name": g.get(PDF_F["src_name"]) or "", "final_name": g.get(PDF_F["final_name"]) or "",
+                      "by": g.get(PDF_F["confirmed_by"]) or "", "at": g.get(PDF_F["confirmed_at"]) or "",
+                      "uploader": g.get(PDF_F["uploader"]) or "", "corrections": corr})
+    items.sort(key=lambda x: x["at"], reverse=True)
+    return jsonify({"items": items, "by_field": dict(by_field), "days": days})
 
 
 @app.route("/api/pdf-rename/retrain", methods=["POST"])
@@ -8914,7 +8985,8 @@ def pdf_rename_confirm(record_id):
     if any(c in final_name for c in '\\/:*?"<>|'):
         return jsonify({"error": '檔名不能含 \\ / : * ? " < > |'}), 400
     try:
-        cur = _pdf_record_to_dict(_pdf_get_record(record_id))
+        raw_rec = _pdf_get_record(record_id)
+        cur = _pdf_record_to_dict(raw_rec)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     # 好幾位 PM 同時開同一份：畫面打開時還是「待確認」，現在已經被別人確認／歸檔 → 不蓋掉，告訴他
@@ -8932,15 +9004,26 @@ def pdf_rename_confirm(record_id):
     ids = {k: [v for v in ([x] if isinstance(x, str) else list(x or [])) if v and str(v).strip()]
            for k, x in ids.items() if k in PDF_ID_FIELDS}
     ids = {k: [_pdf_norm_case_id(k, str(v)) or str(v).strip() for v in vs][:5] for k, vs in ids.items() if vs}
+    # 修正紀錄：系統一開始的判斷 vs 這次確認的結果，存進辨識結果，晚上重新學習時改過的權重加倍
+    extra = {}
+    try:
+        result = json.loads(raw_rec.get("fields", {}).get(PDF_F["result_json"]) or "{}")
+    except ValueError:
+        result = {}
+    if result.get("pred"):
+        corr = _pdf_corrections(result["pred"], {"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date,
+                                                 "name": final_name})
+        result.update(corrections=corr, corrected_by=(body.get("user") or "主控台").strip()[:50], corrected_at=_tw_now_iso())
+        extra[PDF_F["result_json"]] = json.dumps(result, ensure_ascii=False)[:95000]
     try:
         case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
-        _pdf_patch(record_id, {
+        _pdf_patch(record_id, dict(extra, **{
             PDF_F["case_no"]: case_no, PDF_F["alias"]: (case or {}).get("alias", ""),
             PDF_F["doc_type"]: doc_type, PDF_F["doc_date"]: doc_date or None,
             PDF_F["final_name"]: final_name, PDF_F["status"]: PDF_ST_CONFIRMED,
             PDF_F["no_archive"]: not body.get("archive", True),
             PDF_F["confirmed_at"]: _tw_now_iso(), PDF_F["confirmed_by"]: (body.get("user") or "主控台").strip()[:50],
-        })
+        }))
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     wb = ""
