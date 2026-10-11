@@ -2408,16 +2408,30 @@ def _reminder_when(kind, date, tm):
     return f"{s} {tm}".strip() if tm else s
 
 
+def _msg_when(date, tm=""):
+    """給屋主的訊息用的日期：今天／明天會直接寫出來，其餘只寫日期＋星期。"""
+    if not date:
+        return ""
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    tomorrow = (datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)).strftime("%Y-%m-%d")
+    s = _wd_label(date)
+    if date == today:
+        s = "今天 " + s
+    elif date == tomorrow:
+        s = "明天 " + s
+    return f"{s} {tm}".strip() if tm else s
+
+
 def _reminder_owner_msg(b, kind, date, tm):
-    when = _reminder_when(kind, date, tm)
+    when = _msg_when(date, "" if "進場" in kind else tm)
     if "進場" in kind:
-        body = f"我們的施工團隊預計 {when} 進場安裝（實際依現場進度調整），請協助現場出入與用電、用水的配合。"
+        body = f"我們的施工團隊預計 {when} 進場安裝（實際時間依現場進度調整），請記得安排人員幫忙開門。"
     elif "掛表" in kind:
-        body = f"預計 {when} 到現場掛表，請屆時協助開門配合。"
+        body = f"預計 {when} 到現場掛表，請記得安排人員幫忙開門。"
     elif "植筋" in kind:
-        body = f"預計 {when} 到現場植筋施作，請協助現場出入。"
+        body = f"預計 {when} 到現場植筋施作，請記得安排人員幫忙開門。"
     elif "場勘" in kind or "放樣" in kind:
-        body = f"我們預計 {when} 到現場{kind}，請協助現場出入。"
+        body = f"我們預計 {when} 到現場{kind}，請記得安排人員幫忙開門。"
     elif "出貨" in kind:
         body = f"設備預計 {when} 出貨，到貨前會再跟您確認。"
     else:
@@ -2428,10 +2442,10 @@ def _reminder_owner_msg(b, kind, date, tm):
 
 def _owner_confirm_msg(b, kind, date, tm):
     """業務傳給屋主的「確認預約」訊息（屋主沒辦法自己填單時，由業務代為預約、再通知屋主）。"""
-    when = _reminder_when(kind, date, tm)
-    return (f"{b['owner_name'] or '屋主'} 您好，已經幫您確認「{kind}」的預約：{when}。"
+    when = _msg_when(date, "" if "進場" in kind else tm)
+    return (f"{b['owner_name'] or '屋主'} 您好，已經幫您確認「{kind}」的預約：{when}（實際時間依現場進度調整）。"
             + (f"地點：{b['address']}。" if b["address"] else "")
-            + "當天請協助現場出入配置，如果這個時間有任何問題，請隨時跟我聯絡。\n—陽光伏特家"
+            + "當天請記得安排人員幫忙開門，如果這個時間有任何問題，請隨時跟我聯絡。\n—陽光伏特家"
             + (f" {b['rep_name']}" if b["rep_name"] else ""))
 
 
