@@ -1514,6 +1514,27 @@ def book_vendor_slot_task(token):
     return jsonify({"ok": True, "record": record})
 
 
+@app.route("/api/vendor-slots/public-task/<token>/owner-share")
+def public_task_owner_share(token):
+    """book.html 預約完成後的「📤 傳確認預約給屋主」：回傳 LIFF 分享連結（訊息範本由後端組）。"""
+    try:
+        r = _find_task_by_token(token)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個連結對應的任務"}), 404
+    task = _task_to_dict(r)
+    if task["status"] != TASK_STATUS_DONE or not task["booking_id"]:
+        return jsonify({"error": "這個任務還沒完成預約"}), 409
+    rec = _get_booking(task["booking_id"])
+    if not rec:
+        return jsonify({"error": "找不到預約記錄"}), 404
+    f = rec.get("fields", {})
+    url = _owner_share_url(f.get(FIELD_SLOT_CASE_NO, ""), "、".join(f.get(FIELD_SLOT_TYPE) or []), f.get(FIELD_SLOT_DATE, ""),
+                           f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}" if f.get(FIELD_SLOT_START) else "", "confirm")
+    return jsonify({"ok": True, "liff_url": url})
+
+
 # ---- 2026-10-04：「原時間屋主不行，業務提供其他時間」協調流程 ----
 # 業務在 book.html 勾「原預約時間屋主無法配合」→ 填幾組其他日期＋時間（propose）
 # → 窗口（PM）在主控台跟廠商確認後，從裡面選一個（choose）→ 業務打開同一條連結看到
@@ -2144,6 +2165,15 @@ def _booking_time_text(f):
     return _owner_time_text({"type": f.get(FIELD_SLOT_TYPE) or []}, date, f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, ""))
 
 
+def _rep_confirm_buttons(f, case_no, address, coords):
+    """業務卡片的按鈕：第一顆是「📤 傳確認預約給屋主」（開 LIFF 分享頁選屋主聊天室），其餘是撥號／地圖／複製屋主資料。"""
+    types = f.get(FIELD_SLOT_TYPE) or []
+    tm = f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}" if f.get(FIELD_SLOT_START) else ""
+    url = _owner_share_url(case_no, "、".join(types), f.get(FIELD_SLOT_DATE, ""), tm, "confirm")
+    btns = _vendor_card_buttons(f, address, coords)
+    return ([("📤 傳確認預約給屋主", url)] if url else []) + btns
+
+
 def _rep_notice_card(rec):
     """2026-10-10：窗口手動「通知業務」用的卡片（業務沒綁 LINE 或離職、由別人代處理時，轉傳給代辦同事）。"""
     f = rec.get("fields", {})
@@ -2157,8 +2187,8 @@ def _rep_notice_card(rec):
               ("地址", address), ("座標", coords or ""),
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("備註", (f.get(FIELD_SLOT_NOTE) or "").strip())],
-        note="請記得在行程前一天跟屋主提醒、確認時間",
-        buttons=_vendor_card_buttons(f, address, coords),
+        note="請記得在行程前一天跟屋主提醒、確認時間；屋主沒辦法自己填單的話，可按「傳確認預約給屋主」",
+        buttons=_rep_confirm_buttons(f, case_no, address, coords),
     )
 
 
@@ -2396,10 +2426,34 @@ def _reminder_owner_msg(b, kind, date, tm):
             + (f" {b['rep_name']}" if b["rep_name"] else ""))
 
 
+def _owner_confirm_msg(b, kind, date, tm):
+    """業務傳給屋主的「確認預約」訊息（屋主沒辦法自己填單時，由業務代為預約、再通知屋主）。"""
+    when = _reminder_when(kind, date, tm)
+    return (f"{b['owner_name'] or '屋主'} 您好，已經幫您確認「{kind}」的預約：{when}。"
+            + (f"地點：{b['address']}。" if b["address"] else "")
+            + "當天請協助現場出入配置，如果這個時間有任何問題，請隨時跟我聯絡。\n—陽光伏特家"
+            + (f" {b['rep_name']}" if b["rep_name"] else ""))
+
+
+def _owner_share_url(case_no, kind, date, tm="", mode="remind"):
+    """LINE 卡片按鈕用：開 LIFF 分享頁，業務（或窗口）自己選屋主的聊天室，把訊息傳出去。
+    mode＝remind（行程提醒）或 confirm（確認預約）。簽章 token，45 天有效。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id or not case_no or not date:
+        return ""
+    token = _reminder_token_make({"c": case_no, "k": (kind or "")[:20], "d": date, "t": (tm or "")[:20], "n": "",
+                                  "m": mode, "x": int(time.time()) + 45 * 86400})
+    return f"https://liff.line.me/{liff_id}?vshare={token}~own"
+
+
 def _reminder_card(b, kind, date, tm, note=""):
     rep = b["rep_name"]
     fake = {FIELD_SLOT_OWNER_NAME: b["owner_name"], FIELD_SLOT_OWNER_PHONE: b["owner_phone"]}
-    buttons = [("📋 複製給屋主的訊息", {"clipboard": _reminder_owner_msg(b, kind, date, tm)})]
+    buttons = []
+    own_url = _owner_share_url(b["case"], kind, date, tm, "remind")
+    if own_url:
+        buttons.append(("📤 傳給屋主", own_url))
+    buttons.append(("📋 複製給屋主的訊息", {"clipboard": _reminder_owner_msg(b, kind, date, tm)}))
     buttons += _vendor_card_buttons(fake, b["address"], b["coords"] or None)[:2]
     return _card(
         "⏰ 行程提醒｜請通知屋主", "#D97706", f"{b['case']} {b['alias']}".strip(),
@@ -2506,6 +2560,8 @@ def _split_share_token(token):
     token = (token or "").strip()
     if token.endswith("~rep"):
         return token[:-4], "rep"
+    if token.endswith("~own"):
+        return token[:-4], "own"
     return token, "vendor"
 
 
@@ -2516,7 +2572,12 @@ def vendor_share_get(token):
         data = _reminder_token_parse(token)
         if not data:
             return jsonify({"error": "這則提醒已失效，請回主控台重新產生"}), 404
-        card = _reminder_card(_case_brief(data.get("c")), data.get("k", ""), data.get("d", ""), data.get("t", ""), data.get("n", ""))
+        b = _case_brief(data.get("c"))
+        if kind == "own":   # 要傳給屋主的文字訊息
+            fn = _owner_confirm_msg if data.get("m") == "confirm" else _reminder_owner_msg
+            return jsonify({"kind": "own", "mode": data.get("m", "remind"), "text": fn(b, data.get("k", ""), data.get("d", ""), data.get("t", "")),
+                            "title": f"{b['case']} {b['alias']}".strip(), "sent_at": ""})
+        card = _reminder_card(b, data.get("k", ""), data.get("d", ""), data.get("t", ""), data.get("n", ""))
         return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "rep", "sent_at": ""})
     try:
         rec = _find_booking_by_vendor_token(token)
@@ -2532,7 +2593,7 @@ def vendor_share_get(token):
 @app.route("/api/vendor-share/<token>/sent", methods=["POST"])
 def vendor_share_sent(token):
     token, kind = _split_share_token(token)
-    if kind == "rep":   # 通知業務不記錄「已通知廠商」
+    if kind in ("rep", "own"):   # 通知業務／傳給屋主不記錄「已通知廠商」
         return jsonify({"ok": True})
     try:
         rec = _find_booking_by_vendor_token(token)
@@ -5416,8 +5477,10 @@ def _send_day_before_reminders_impl():
             ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
             ("備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
         ]
+        own_url = _owner_share_url(case_no, types, tmr, f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}", "remind")
         rep_card = _card("📅 明天有行程｜給業務", "#7C3AED", title, subtitle=f"{rep_name} 您好" if rep_name else "",
-                         rows=base_rows, note="請今天聯絡屋主，提醒明天的行程 🙏")
+                         rows=base_rows, note="請今天聯絡屋主，提醒明天的行程 🙏",
+                         buttons=[("📤 傳提醒給屋主", own_url)] if own_url else None)
         rep_ok = _push_to_name(rep_name, rep_card)
         sched_ok = False
         if creator and creator != rep_name:
@@ -5486,6 +5549,26 @@ def _state_set(key, value):
         raise Exception(resp.text)
 
 
+def _rep_for_case(case_no):
+    """輕量查案件的負責業務（只讀記憶體快取，不打 Airtable）：業務自治區 A01資訊 → 場勘快取 → 已公證快取。"""
+    try:
+        _ensure_biz_snapshots_loaded()
+    except Exception:
+        pass
+    rep = CASE_REP_CACHE.get(case_no)
+    if not rep:
+        for c in SURVEY_CACHE.get("cases") or []:
+            if c.get("case") == case_no and c.get("sales_person"):
+                rep = c["sales_person"]
+                break
+    if not rep:
+        for c in CERTIFIED_CASE_CACHE.get("cases") or []:
+            if c.get("case") == case_no and c.get("sales_person"):
+                rep = c["sales_person"]
+                break
+    return rep or ""
+
+
 def _collect_tomorrow_events(tmr):
     events, seen = [], set()   # seen：(案號, 項目) 避免「時段預約」跟「預計日期欄位」重複列
     # 1. 廠商時段預約（含 PM 自己直接預約的）
@@ -5505,7 +5588,7 @@ def _collect_tomorrow_events(tmr):
             "vendor": f.get(FIELD_SLOT_VENDOR) or "", "kind": "/".join(types),
             "time": f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}",
             "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""),
-            "extra": f"業務：{f.get(FIELD_SLOT_REGISTRANT)}" if f.get(FIELD_SLOT_REGISTRANT) else "",
+            "extra": f"業務：{f.get(FIELD_SLOT_REGISTRANT)}" if (f.get(FIELD_SLOT_REGISTRANT) and not f.get(FIELD_SLOT_REGISTRANT).startswith("屋主")) else "",
         })
     # 2. 出貨／進場（來自出貨進場排程快取）
     case_vendor = {}
@@ -5539,6 +5622,12 @@ def _collect_tomorrow_events(tmr):
             seen.add((c.get("case"), "場勘"))
             events.append({"vendor": c.get("vendor") or "", "kind": "場勘", "time": "", "case": c.get("case", ""),
                            "alias": c.get("alias", ""), "extra": f"業務：{c['sales_person']}" if c.get("sales_person") else ""})
+    # 每一筆都標業務（業務自治區 A01資訊 → 其他快取）；屋主自己約的預約，登記人是「屋主 xxx」不算業務
+    for ev in events:
+        if ev["case"] and "業務：" not in (ev.get("extra") or ""):
+            rep = _rep_for_case(ev["case"])
+            if rep:
+                ev["extra"] = "；".join(x for x in [ev.get("extra"), f"業務：{rep}"] if x)
     # 廠商還不知道的（例如案件已不在出貨進場排程裡），直接去案件表用案號查
     missing = sorted({e["case"] for e in events if not e["vendor"] and e["case"]})
     for i in range(0, len(missing), 20):
