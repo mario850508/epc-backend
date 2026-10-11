@@ -6957,9 +6957,54 @@ def _pdf_get_record(record_id):
 def _pdf_patch(record_id, fields):
     resp = requests.patch(f"{PDF_API_URL}/{record_id}", headers=airtable_headers(),
                           json={"fields": fields}, timeout=30)
+    _pdf_items_dirty()
     if resp.status_code >= 400:
         raise Exception(resp.text)
     return resp.json()
+
+
+# 主控台清單的快取：每次打開頁面都從 Airtable 撈全部（含很長的辨識結果）要 10～30 秒。
+# 改成伺服器記著，有任何修改就標記過期；已歸檔超過 30 天的不載入。
+PDF_ITEMS_CACHE = {"at": 0.0, "dirty": True, "items": None}
+PDF_ITEMS_LOCK = threading.Lock()
+PDF_ITEMS_MAX_AGE = 90          # 秒：別人直接在 Airtable 改的，最多 90 秒後看得到
+PDF_ARCHIVED_KEEP_DAYS = 30
+
+
+def _pdf_items_dirty():
+    PDF_ITEMS_CACHE["dirty"] = True
+
+
+def _pdf_items_all():
+    with PDF_ITEMS_LOCK:
+        if (PDF_ITEMS_CACHE["items"] is not None and not PDF_ITEMS_CACHE["dirty"]
+                and time.time() - PDF_ITEMS_CACHE["at"] < PDF_ITEMS_MAX_AGE):
+            return PDF_ITEMS_CACHE["items"]
+        PDF_ITEMS_CACHE["dirty"] = False
+        started = time.time()
+        formula = ("OR({" + PDF_F["status"] + "}!='" + PDF_ST_ARCHIVED + "',IS_AFTER({" + PDF_F["confirmed_at"]
+                   + "},DATEADD(TODAY(),-" + str(PDF_ARCHIVED_KEEP_DAYS) + ",'days')))")
+        try:
+            recs = airtable_get_all(PDF_API_URL, formula, list(PDF_F.values()))
+        except Exception:
+            PDF_ITEMS_CACHE["dirty"] = True
+            raise
+        items = [_pdf_record_to_dict(r) for r in recs]
+        # 待確認、檔名沒被手動改過的：用目前的命名規則重新產生（例如後來新增「工程苗栗 → 工苗」的簡稱規則）
+        try:
+            tpl = _pdf_settings().get("template")
+            by_no = {c["case_no"]: c for c in _pdf_case_ref()}
+            for x in items:
+                if x["status"] == PDF_ST_REVIEW and x["case_no"] and x["final_name"] == x["suggested_name"]:
+                    name = _pdf_build_name(tpl, by_no.get(x["case_no"]) or {"case_no": x["case_no"]}, x["doc_type"],
+                                           x["doc_date"], x["file_ext"] if x["file_ext"] in PDF_OFFICE_EXTS else ".pdf")
+                    x["suggested_name"] = x["final_name"] = name
+        except Exception as e:
+            print(f"[pdf_rename] 重新產生檔名失敗：{e}", flush=True)
+        items.sort(key=lambda x: x["uploaded_at"] or "", reverse=True)
+        PDF_ITEMS_CACHE.update(items=items, at=time.time())
+        print(f"[pdf_rename] 清單快取更新：{len(items)} 份，{time.time() - started:.1f} 秒", flush=True)
+        return items
 
 
 def _pdf_doc_category(doc_type):
@@ -8559,7 +8604,9 @@ def pdf_rename_progress():
 @app.route("/api/pdf-rename/status")
 def pdf_rename_status():
     try:
-        counts = _pdf_counts()
+        counts = {}
+        for x in _pdf_items_all():
+            counts[x["status"]] = counts.get(x["status"], 0) + 1
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     s = _pdf_settings()
@@ -8584,30 +8631,28 @@ def pdf_rename_status():
 
 @app.route("/api/pdf-rename/items")
 def pdf_rename_items():
+    """清單（伺服器快取）。?lite=1 不帶辨識出的全文（打開單份時再用 /info 拿），傳輸量小很多。"""
     status = (request.args.get("status") or "").strip()
-    formula = None
-    if status == "active":
-        formula = "{" + PDF_F["status"] + "}!='" + PDF_ST_ARCHIVED + "'"
-    elif status and status != "all":
-        formula = "{" + PDF_F["status"] + "}='" + status.replace("'", "\\'") + "'"
     try:
-        recs = airtable_get_all(PDF_API_URL, formula, list(PDF_F.values()))
+        items = _pdf_items_all()
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-    items = [_pdf_record_to_dict(r) for r in recs]
-    # 待確認、檔名沒被手動改過的：用目前的命名規則重新產生（例如後來新增「工程苗栗 → 工苗」的簡稱規則）
+    if status == "active":
+        items = [x for x in items if x["status"] != PDF_ST_ARCHIVED]
+    elif status and status != "all":
+        items = [x for x in items if x["status"] == status]
+    if request.args.get("lite"):
+        items = [dict(x, text_excerpt="", lite=True) for x in items]
+    return jsonify({"items": items, "archived_days": PDF_ARCHIVED_KEEP_DAYS})
+
+
+@app.route("/api/pdf-rename/<record_id>/info")
+def pdf_rename_info(record_id):
+    """單份完整資料（含辨識出的全文），主控台打開確認視窗時用。"""
     try:
-        tpl = _pdf_settings().get("template")
-        by_no = {c["case_no"]: c for c in _pdf_case_ref()}
-        for x in items:
-            if x["status"] == PDF_ST_REVIEW and x["case_no"] and x["final_name"] == x["suggested_name"]:
-                name = _pdf_build_name(tpl, by_no.get(x["case_no"]) or {"case_no": x["case_no"]}, x["doc_type"],
-                                       x["doc_date"], x["file_ext"] if x["file_ext"] in PDF_OFFICE_EXTS else ".pdf")
-                x["suggested_name"] = x["final_name"] = name
+        return jsonify(_pdf_record_to_dict(_pdf_get_record(record_id)))
     except Exception as e:
-        print(f"[pdf_rename] 重新產生檔名失敗：{e}", flush=True)
-    items.sort(key=lambda x: x["uploaded_at"] or "", reverse=True)
-    return jsonify({"items": items})
+        return jsonify({"error": str(e)}), 502
 
 
 def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", src_path="", received_at=""):
@@ -8658,6 +8703,7 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
         if resp.status_code >= 400:
             raise Exception(resp.text)
         rid = resp.json()["id"]
+        _pdf_items_dirty()
         try:
             upload_attachment_to_ops_record(rid, PDF_F["file"], base64.b64encode(data).decode(), name,
                                             content_type=content_type)
@@ -9055,6 +9101,7 @@ def pdf_rename_reopen(record_id):
 @app.route("/api/pdf-rename/<record_id>", methods=["DELETE"])
 def pdf_rename_delete(record_id):
     resp = requests.delete(f"{PDF_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+    _pdf_items_dirty()
     if resp.status_code >= 400:
         return jsonify({"error": resp.text}), 502
     return jsonify({"ok": True})
