@@ -2436,7 +2436,7 @@ def _reminder_owner_msg(b, kind, date, tm):
         body = f"設備預計 {when} 出貨，到貨前會再跟您確認。"
     else:
         body = f"預計 {when} 安排「{kind}」，請協助配合。"
-    return (f"{b['owner_name'] or '屋主'} 您好，{body}如果這個時間不方便，請隨時跟我說。\n—陽光伏特家"
+    return (f"{b['owner_name'] or '屋主'} 您好，{body}謝謝您的配合。\n—陽光伏特家"
             + (f" {b['rep_name']}" if b["rep_name"] else ""))
 
 
@@ -2445,7 +2445,7 @@ def _owner_confirm_msg(b, kind, date, tm):
     when = _msg_when(date, "" if "進場" in kind else tm)
     return (f"{b['owner_name'] or '屋主'} 您好，已經幫您確認「{kind}」的預約：{when}（實際時間依現場進度調整）。"
             + (f"地點：{b['address']}。" if b["address"] else "")
-            + "當天請記得安排人員幫忙開門，如果這個時間有任何問題，請隨時跟我聯絡。\n—陽光伏特家"
+            + "當天請記得安排人員幫忙開門，謝謝您的配合。\n—陽光伏特家"
             + (f" {b['rep_name']}" if b["rep_name"] else ""))
 
 
