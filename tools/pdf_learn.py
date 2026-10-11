@@ -17,6 +17,7 @@ PDF 公文更名：從「已經改好檔名」的歷史檔案學習辨識規則�
   pip install pypdf requests
   python pdf_learn.py "G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠"
   （掃描檔要 OCR：加 --ocr；每次最多 OCR --ocr-limit 份，預設 150）
+只學某些區域／資料夾：加 --regions 中部,南部、--folders 潤特綠能,陽光工程
 結果在同一層的 pdf_learn_data\\ 資料夾：report.md、report.json、samples.jsonl。
 """
 import argparse
@@ -150,6 +151,21 @@ def find_targets(root, max_depth=5):
             queue.extend((os.path.join(path, d), depth + 1) for d in subdirs)
 
 
+def region_norm(s):
+    return (s or "").replace("台", "臺")
+
+
+def region_keys(text):
+    """--regions "臺中,彰化,南部" → 地名清單；「中部」「南部」「北部」可以直接寫。"""
+    groups = {"北部": "基隆 臺北 新北 桃園 新竹 宜蘭", "中部": "苗栗 臺中 彰化 南投 雲林",
+              "南部": "嘉義 臺南 高雄 屏東", "東部": "花蓮 臺東"}
+    keys = []
+    for t in re.split(r"[,，、\s]+", region_norm(text)):
+        if t:
+            keys.extend(groups.get(t, t).split())
+    return keys
+
+
 def collect(args, out_dir):
     cache_path = os.path.join(out_dir, "samples.jsonl")
     cache = {}
@@ -166,11 +182,21 @@ def collect(args, out_dir):
     files = list(getattr(args, "_files", None) or [])   # --auto 第二輪起沿用第一輪的檔案清單，不用再掃一次雲端硬碟
     if not files:
         n_folders = 0
-        for cat, case_dir, region, folder in find_targets(args.root):
-            n_folders += 1
-            for dirpath, _, fnames in os.walk(folder):
-                for fn in fnames:
-                    files.append((cat, case_dir, region, os.path.join(dirpath, fn), fn))
+        regions = region_keys(args.regions)
+        folders = [region_norm(t) for t in re.split(r"[,，、\s]+", args.folders or "") if t]
+        for root in args.root:
+            log(f"掃描：{root}")
+            for cat, case_dir, region, folder in find_targets(root):
+                # --regions：區域資料夾或案場資料夾名稱有其中一個地名才讀（例如「06 潤特臺中」「工程臺中3號_…」）
+                if regions and not any(k in region_norm(region + " " + case_dir) for k in regions):
+                    continue
+                # --folders：只讀路徑裡有這些字的資料夾（例如「潤特綠能,陽光工程」）
+                if folders and not any(k in region_norm(os.path.relpath(folder, root)) for k in folders):
+                    continue
+                n_folders += 1
+                for dirpath, _, fnames in os.walk(folder):
+                    for fn in fnames:
+                        files.append((cat, case_dir, region, os.path.join(dirpath, fn), fn, root))
             if n_folders % 20 == 0:
                 log(f"  已找到 {n_folders} 個分類資料夾、{len(files)} 個檔案…")
         args._files = list(files)
@@ -223,14 +249,14 @@ def collect(args, out_dir):
     # 第一步：決定哪些檔案要讀（讀過的直接沿用；每個（分類, 類型, 區域）最多 --per-type 份）
     todo, planned, ocr_planned = [], collections.Counter(), 0
     last_log = time.time()
-    for i, (cat, case_dir, region, path, fn) in enumerate(files):
+    for i, (cat, case_dir, region, path, fn, root) in enumerate(files):
         if time.time() - last_log > 30:
             log(f"  整理清單 {i}/{len(files)}…")
             last_log = time.time()
         stem, ext = os.path.splitext(fn)
         label = parse_filename(stem)
         row = {"category": cat, "case_dir": case_dir, "region": region, "file": fn,
-               "rel": os.path.relpath(path, args.root), "ext": ext.lower(), "label": label}
+               "rel": os.path.relpath(path, root), "ext": ext.lower(), "label": label}
         if ext.lower() != ".pdf" or not label:
             rows.append(row)
             continue
@@ -664,7 +690,12 @@ def upload_learning(out_dir, report):
 
 def main():
     ap = argparse.ArgumentParser(description="從已改名的歷史檔案學習公文辨識規則")
-    ap.add_argument("root", help="已上架電廠資料夾，例如 G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠")
+    ap.add_argument("root", nargs="+",
+                    help="已上架電廠資料夾（可以一次給好幾個，例如潤特跟工程），例如 G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠")
+    ap.add_argument("--regions", default="",
+                    help="只學某些區域，例如 --regions 中部,南部 或 --regions 臺中,彰化（台／臺都可以）")
+    ap.add_argument("--folders", default="",
+                    help="只學路徑裡有這些字的資料夾，例如 --folders 潤特綠能,陽光工程")
     ap.add_argument("--per-type", type=int, default=10, help="每個（分類, 類型, 區域）最多讀幾份，預設 10")
     ap.add_argument("--max-mb", type=int, default=25, help="超過幾 MB 的檔案略過，預設 25")
     ap.add_argument("--ocr", action="store_true", help="掃描檔用主控台設定的 Google OCR 轉文字")
@@ -680,9 +711,14 @@ def main():
     args = ap.parse_args()
     if args.auto:
         args.ocr = True
-    if not os.path.isdir(args.root):
-        log("找不到資料夾：", args.root)
-        sys.exit(1)
+    for root in args.root:
+        if not os.path.isdir(root):
+            log("找不到資料夾：", root)
+            sys.exit(1)
+    if args.regions:
+        log("只學這些區域：" + "、".join(region_keys(args.regions)))
+    if args.folders:
+        log("只學這些資料夾：" + args.folders)
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_learn_data")
     os.makedirs(out_dir, exist_ok=True)
     can_upload = (args.auto or args.upload) and ensure_login(out_dir)
