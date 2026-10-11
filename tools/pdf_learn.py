@@ -195,8 +195,7 @@ def collect(args, out_dir):
     if args.ocr and not ocr_url:
         for attempt in range(3):   # Render 免費方案剛醒來可能要 1 分鐘
             try:
-                import requests
-                ocr_url = requests.get(BACKEND + "/api/pdf-rename/status", timeout=120).json()["settings"].get("ocr_url", "")
+                ocr_url = api("GET", "/api/pdf-rename/status", timeout=120).json()["settings"].get("ocr_url", "")
                 break
             except Exception as e:
                 log(f"讀取主控台 OCR 設定失敗（第 {attempt + 1} 次）：{e}")
@@ -554,6 +553,51 @@ def analyze(rows, out_dir):
     return report
 
 
+AUTH = {"token": "", "path": ""}
+
+
+def api(method, path, **kw):
+    """呼叫主控台後端（主控台有設登入密碼時帶上登入憑證）。"""
+    import requests
+    headers = dict(kw.pop("headers", None) or {})
+    if AUTH["token"]:
+        headers["Authorization"] = "Bearer " + AUTH["token"]
+    return requests.request(method, BACKEND + path, headers=headers, **kw)
+
+
+def ensure_login(out_dir):
+    """主控台有設登入密碼時，一開始就先登入（--auto 會跑一整晚，不能等到半夜才問密碼）。
+    登入憑證存在 pdf_learn_data\\.dashboard_token，30 天內不用再輸入。"""
+    import getpass
+    AUTH["path"] = os.path.join(out_dir, ".dashboard_token")
+    try:
+        with open(AUTH["path"], encoding="utf-8") as f:
+            AUTH["token"] = f.read().strip()
+    except OSError:
+        pass
+    for attempt in range(3):
+        try:
+            st = api("GET", "/api/auth/status", timeout=180).json()
+        except Exception as e:
+            log(f"連不到主控台（可能剛醒來，等一下）：{e}")
+            time.sleep(30)
+            continue
+        if not st.get("required") or st.get("valid"):
+            return True
+        pw = getpass.getpass("主控台有設登入密碼，請輸入（輸入時畫面不會顯示，打完按 Enter）：")
+        r = api("POST", "/api/login", json={"password": pw}, timeout=60)
+        d = r.json() if r.content else {}
+        if r.status_code == 200 and d.get("token"):
+            AUTH["token"] = d["token"]
+            with open(AUTH["path"], "w", encoding="utf-8") as f:
+                f.write(AUTH["token"])
+            log("✓ 已登入主控台（30 天內不用再輸入密碼）")
+            return True
+        log(f"⚠ 登入失敗：{d.get('error') or r.status_code}")
+    log("⚠ 沒有登入成功，這次不會自動上傳（跑完可以把 samples.jsonl 傳給 Claude）")
+    return False
+
+
 def load_core():
     """pdf_learncore.py（分類模型的核心計算，跟後端同一份）：每次從 GitHub 下載最新版放在這支程式旁邊。"""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -580,11 +624,10 @@ def upload_learning(out_dir, report):
     再用全部讀過的文件算好用字統計上傳，後端收到會立刻重新學習。"""
     import gzip
     import platform
-    import requests
     log("── 上傳到主控台 ──")
     for attempt in range(3):
         try:
-            r = requests.post(BACKEND + "/api/pdf-rename/import-learn", json=report, timeout=600)
+            r = api("POST", "/api/pdf-rename/import-learn", json=report, timeout=600)
             d = r.json()
             if r.status_code >= 400:
                 raise Exception(d.get("error") or r.text[:200])
@@ -597,7 +640,7 @@ def upload_learning(out_dir, report):
             time.sleep(30)
     try:
         C = load_core()
-        settings = requests.get(BACKEND + "/api/pdf-rename/status", timeout=180).json().get("settings") or {}
+        settings = api("GET", "/api/pdf-rename/status", timeout=180).json().get("settings") or {}
         canon = C.canon_from_doc_types(settings.get("doc_types"))
         rows = []
         with open(os.path.join(out_dir, "samples.jsonl"), encoding="utf-8", errors="replace") as f:
@@ -609,8 +652,8 @@ def upload_learning(out_dir, report):
         log("  重新計算分類模型（含交叉驗證，約 1～3 分鐘）…")
         _, base = C.build_base(rows, canon, log=lambda *a: log("  ", *a))
         raw = gzip.compress(json.dumps(base, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        r = requests.post(BACKEND + "/api/pdf-rename/base-stats", timeout=600,
-                          json={"data": base64.b64encode(raw).decode(), "summary": {"host": platform.node()}})
+        r = api("POST", "/api/pdf-rename/base-stats", timeout=600,
+                json={"data": base64.b64encode(raw).decode(), "summary": {"host": platform.node()}})
         d = r.json()
         if r.status_code >= 400:
             raise Exception(d.get("error") or r.text[:200])
@@ -642,6 +685,7 @@ def main():
         sys.exit(1)
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_learn_data")
     os.makedirs(out_dir, exist_ok=True)
+    can_upload = (args.auto or args.upload) and ensure_login(out_dir)
     rounds = max(1, args.max_rounds) if args.auto else 1
     for rnd in range(1, rounds + 1):
         if args.auto:
@@ -653,7 +697,7 @@ def main():
         log("")
         log(f"這一輪完成：案場 {len(report['aliases'])} 個、已 OCR {report['ocr_done']} 份、"
             f"還沒 OCR 的掃描檔 {report['scans_without_text']} 份")
-        if args.auto or args.upload:
+        if can_upload:
             upload_learning(out_dir, report)
         if not args.auto:
             if not args.upload:
@@ -668,7 +712,7 @@ def main():
             log(f"在目前的抽樣範圍內（--per-type {args.per_type}）掃描檔都 OCR 完了。想學更多可以加大 --per-type 再跑。")
             break
     log("")
-    log("全部結束！" + ("學習資料已經自動上傳，主控台會用新的模型。" if (args.auto or args.upload) else ""))
+    log("全部結束！" + ("學習資料已經自動上傳，主控台會用新的模型。" if can_upload else ""))
 
 
 if __name__ == "__main__":
