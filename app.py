@@ -2291,6 +2291,9 @@ def vendor_slot_rep_notice(record_id):
 # 提醒卡片＝機器人推給業務（有綁 LINE），沒綁／離職就產生簽章過的 LIFF 分享連結
 # （payload 直接簽在 token 裡，不用另外存資料），讓窗口轉傳給代辦同事。
 # ===================================================================
+FIELD_CASE_REP_SELECT = "fldLENq6KiXl76Uzc"   # 專案細節「業務」單選（Alvin／Cindy／彥銘／Gina…），有些案件沒填
+
+
 def _case_brief(case_no, booking_id=""):
     case_no = (case_no or "").strip()
     out = {"case": case_no, "alias": "", "vendor": "", "address": "", "coords": "", "sales_person": "",
@@ -2300,7 +2303,7 @@ def _case_brief(case_no, booking_id=""):
     esc = case_no.replace("'", chr(92) + "'")
     try:
         sf = get_sales_field_id()
-        fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_PLANT_COORDS] + ([sf] if sf else [])
+        fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_PLANT_COORDS, FIELD_CASE_REP_SELECT] + ([sf] if sf else [])
         recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", fields)
         if recs:
             f = recs[0]["fields"]
@@ -2308,7 +2311,7 @@ def _case_brief(case_no, booking_id=""):
             out["vendor"] = f.get(FIELD_VENDOR, "") or ""
             out["address"] = " ".join((f.get(FIELD_ADDRESS) or "").split())
             out["coords"] = _parse_coords(f.get(FIELD_PLANT_COORDS)) or ""
-            out["sales_person"] = (f.get(sf) if sf else "") or ""
+            out["sales_person"] = (f.get(sf) if sf else "") or f.get(FIELD_CASE_REP_SELECT) or ""
     except Exception as e:
         print(f"[_case_brief] 查案件失敗：{e}", flush=True)
     # 案件表沒有的（還沒建檔）退回場勘快取／已公證快取
@@ -2321,6 +2324,8 @@ def _case_brief(case_no, booking_id=""):
             break
     try:
         _ensure_biz_snapshots_loaded()
+        if CASE_REP_CACHE.get(case_no):   # 業務自治區的業務欄最準，蓋過其他來源
+            out["sales_person"] = CASE_REP_CACHE[case_no]
         for c in CERTIFIED_CASE_CACHE.get("cases") or []:
             if c.get("case") == case_no:
                 out["alias"] = out["alias"] or c.get("alias") or ""
@@ -2580,6 +2585,14 @@ def site_survey_cancelled_sync():
             new_owner_cache[case_no] = {"name": name, "phone": phone}
     OWNER_CONTACT_CACHE.clear()
     OWNER_CONTACT_CACHE.update(new_owner_cache)
+    reps_in = body.get("case_reps")
+    if isinstance(reps_in, list):
+        new_reps = {}
+        for c in reps_in:
+            if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("sales") or "").strip():
+                new_reps[c["case"].strip()] = c["sales"].strip()
+        CASE_REP_CACHE.clear()
+        CASE_REP_CACHE.update(new_reps)
     coords_in = body.get("plant_coords")
     if isinstance(coords_in, list):
         new_coords = {}
@@ -2601,6 +2614,7 @@ def site_survey_cancelled_sync():
         "certified_count": len(CERTIFIED_CASE_CACHE["cases"]),
         "owner_contact_count": len(OWNER_CONTACT_CACHE),
         "plant_coords_count": len(BIZ_COORDS_CACHE),
+        "case_reps_count": len(CASE_REP_CACHE),
     })
 
 
@@ -2609,6 +2623,9 @@ def site_survey_cancelled_sync():
 # 記憶體快取在 Render 重啟後會清空，所以每次推送也存一份 JSON 快照到「系統狀態」表的「長值」，
 # 快取是空的時候先從快照還原（公證書屋主資料 OWNER_CONTACT_CACHE 也一樣處理）。
 BIZ_COORDS_CACHE = {}
+# 2026-10-11：業務自治區 A01資訊「業務」欄（U）——所有案件的負責業務（{案號: 業務名}），不限「已公證」。
+# 已公證案件清單只有狀態＝已公證的，案件一進到「已簽約」就查不到業務了。
+CASE_REP_CACHE = {}
 STATE_FIELD_LONG = "fld4BuR3sfKTkDvsi"   # 系統狀態「長值」（multilineText）
 _BIZ_SNAPSHOT_LOADED = {"done": False}
 
@@ -2659,6 +2676,7 @@ def _persist_biz_snapshots():
     import hashlib as _hl
     items = {
         "biz_plant_coords": dict(BIZ_COORDS_CACHE),
+        "biz_case_reps": dict(CASE_REP_CACHE),
         "biz_owner_contacts": dict(OWNER_CONTACT_CACHE),
         "biz_certified_cases": list(CERTIFIED_CASE_CACHE.get("cases") or []),
         "biz_cancelled_cases": sorted(CANCELLED_CASE_CACHE.get("case_nos") or []),
@@ -2688,6 +2706,10 @@ def _ensure_biz_snapshots_loaded():
             raw = _state_get_chunked("biz_plant_coords")
             if raw:
                 BIZ_COORDS_CACHE.update(json.loads(raw))
+        if not CASE_REP_CACHE:
+            raw = _state_get_chunked("biz_case_reps")
+            if raw:
+                CASE_REP_CACHE.update(json.loads(raw))
         if not OWNER_CONTACT_CACHE:
             raw = _state_get_chunked("biz_owner_contacts")
             if raw:
