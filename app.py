@@ -2559,6 +2559,14 @@ def site_survey_cancelled_sync():
     body = request.get_json(force=True)
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
+    if (isinstance(body.get("case_reps"), list) and "cancelled_case_numbers" not in body
+            and "certified_cases" not in body and "owner_contacts" not in body):
+        # 只補「案件業務」的部分推送：不碰取消／已公證／屋主資料（避免被當成空清單清掉）
+        CASE_REP_CACHE.clear()
+        CASE_REP_CACHE.update({c["case"].strip(): c["sales"].strip() for c in body["case_reps"]
+                               if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("sales") or "").strip()})
+        threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
+        return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE)})
     case_nos = body.get("cancelled_case_numbers") or []
     CANCELLED_CASE_CACHE["case_nos"] = {c for c in case_nos if c}
     CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
