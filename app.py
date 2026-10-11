@@ -6748,6 +6748,9 @@ PDF_DEFAULT_SETTINGS = {
     # 自動歸檔到 G 槽：由 pm 那台電腦的背景程式，把「已確認」的檔案用確認檔名放進
     # 「根目錄底下的案場資料夾 → 03/04/06/07 分類資料夾」。roots 可多個（一行一個）。
     "archive": {"enabled": False, "pm": "", "roots": ""},
+    # 使用公文更名的 PM（主控台「我是」選單）。跟 line-pdf-collector 的 GROUP_OWNER_MAP「PM-家豪」等對應：
+    # LINE 群組的檔案由 line-pdf-collector 收到後直接送進來，標成這些名字
+    "pm_names": ["家豪", "敏萱", "宇哲"],
 }
 PDF_WATCHER_STATUS = {}   # {pm: 最後一次回報}，記憶體即可（背景程式每分鐘回報一次）
 PDF_SETTINGS = {"data": None}
@@ -8726,6 +8729,8 @@ def pdf_rename_save_settings():
         a = body["archive"]
         s["archive"] = {"enabled": bool(a.get("enabled")), "pm": (a.get("pm") or "").strip()[:30],
                         "roots": (a.get("roots") or "").strip()[:2000]}
+    if isinstance(body.get("pm_names"), list):
+        s["pm_names"] = [str(x).strip()[:20] for x in body["pm_names"] if str(x).strip()][:20]
     if "engine" in body:
         if body["engine"] not in ("free", "hybrid", "ai"):
             return jsonify({"error": "engine 只能是 free／hybrid／ai"}), 400
