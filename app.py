@@ -5556,7 +5556,7 @@ def _collect_tomorrow_events(tmr):
     return [e for e in events if (not e["vendor"]) or e["vendor"] in DIGEST_VENDORS]
 
 
-def send_tomorrow_digest(force=False):
+def send_tomorrow_digest(force=False, dry=False):
     token, target = _line_config()
     if not token or not target:
         return
@@ -5601,6 +5601,8 @@ def send_tomorrow_digest(force=False):
     card = _card("📅 明日行程總覽｜給你", "#0F766E", f"明天 {_wd_label(tmr)}", subtitle=f"共 {len(events)} 筆",
                  sections=sections, button=("開啟主控台", _dash_url() + "/"),
                  footer="每筆右邊的「📤 發送」：產生提醒卡片，自己選要傳給哪位業務／同事")
+    if dry:   # 只組卡片、不發送，排查用
+        return _card_to_flex(card)
     ok, err = _line_push_card(card)
     if ok:
         DIGEST_STATE["sent_for"] = tmr
@@ -5633,6 +5635,8 @@ def line_run_job():
         send_deadline_reminders()
         return jsonify({"ok": True})
     if job == "digest":
+        if body.get("dry"):
+            return jsonify({"ok": True, "flex": send_tomorrow_digest(force=True, dry=True)})
         send_tomorrow_digest(force=bool(body.get("force")))
         return jsonify({"ok": True, "state": DIGEST_STATE})
     return jsonify({"error": "job 必須是 deadline 或 day_before"}), 400
