@@ -2285,6 +2285,197 @@ def vendor_slot_rep_notice(record_id):
     })
 
 
+# ===================================================================
+# 2026-10-11：行事曆／近一週／場勘放樣頁點進去的「案件詳細」＋「提醒業務通知屋主」。
+# 不限於時段預約的案件（出貨、場勘日…也能點），所以資料用案號現查；
+# 提醒卡片＝機器人推給業務（有綁 LINE），沒綁／離職就產生簽章過的 LIFF 分享連結
+# （payload 直接簽在 token 裡，不用另外存資料），讓窗口轉傳給代辦同事。
+# ===================================================================
+def _case_brief(case_no, booking_id=""):
+    case_no = (case_no or "").strip()
+    out = {"case": case_no, "alias": "", "vendor": "", "address": "", "coords": "", "sales_person": "",
+           "rep_name": "", "owner_name": "", "owner_phone": "", "bookings": []}
+    if not case_no:
+        return out
+    esc = case_no.replace("'", chr(92) + "'")
+    try:
+        sf = get_sales_field_id()
+        fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS, FIELD_PLANT_COORDS] + ([sf] if sf else [])
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", fields)
+        if recs:
+            f = recs[0]["fields"]
+            out["alias"] = f.get(FIELD_ALIAS, "") or ""
+            out["vendor"] = f.get(FIELD_VENDOR, "") or ""
+            out["address"] = " ".join((f.get(FIELD_ADDRESS) or "").split())
+            out["coords"] = _parse_coords(f.get(FIELD_PLANT_COORDS)) or ""
+            out["sales_person"] = (f.get(sf) if sf else "") or ""
+    except Exception as e:
+        print(f"[_case_brief] 查案件失敗：{e}", flush=True)
+    # 案件表沒有的（還沒建檔）退回場勘快取／已公證快取
+    for c in SURVEY_CACHE.get("cases") or []:
+        if c.get("case") == case_no:
+            out["alias"] = out["alias"] or c.get("alias") or ""
+            out["vendor"] = out["vendor"] or c.get("vendor") or ""
+            out["address"] = out["address"] or " ".join((c.get("address") or "").split())
+            out["sales_person"] = out["sales_person"] or c.get("sales_person") or ""
+            break
+    try:
+        _ensure_biz_snapshots_loaded()
+        for c in CERTIFIED_CASE_CACHE.get("cases") or []:
+            if c.get("case") == case_no:
+                out["alias"] = out["alias"] or c.get("alias") or ""
+                out["vendor"] = out["vendor"] or c.get("vendor") or ""
+                out["sales_person"] = out["sales_person"] or c.get("sales_person") or ""
+                break
+        biz = _parse_coords(BIZ_COORDS_CACHE.get(case_no))   # 座標以業務自治區為準
+        if biz:
+            out["coords"] = biz
+        oc = OWNER_CONTACT_CACHE.get(case_no) or {}
+        out["owner_name"], out["owner_phone"] = oc.get("name", ""), oc.get("phone", "")
+    except Exception as e:
+        print(f"[_case_brief] 讀快取失敗：{e}", flush=True)
+    rep = (out["sales_person"] or "").strip()
+    try:
+        brs = airtable_get_all(
+            SLOT_API_URL, f"AND({{{FIELD_SLOT_CASE_NO}}}='{esc}',{{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}')",
+            [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_OWNER_NAME,
+             FIELD_SLOT_OWNER_PHONE, FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_VENDOR_NOTIFIED])
+        brs.sort(key=lambda r: r["fields"].get(FIELD_SLOT_DATE, ""))
+        for r in brs:
+            f = r["fields"]
+            out["bookings"].append({
+                "record_id": r["id"], "date": f.get(FIELD_SLOT_DATE, ""), "start_time": f.get(FIELD_SLOT_START, ""),
+                "end_time": f.get(FIELD_SLOT_END, ""), "type": f.get(FIELD_SLOT_TYPE) or [],
+                "vendor_notified": bool(f.get(FIELD_SLOT_VENDOR_NOTIFIED)),
+            })
+            if f.get(FIELD_SLOT_OWNER_NAME) or f.get(FIELD_SLOT_OWNER_PHONE):   # 預約上填的屋主資料較新，優先
+                out["owner_name"] = f.get(FIELD_SLOT_OWNER_NAME) or out["owner_name"]
+                out["owner_phone"] = f.get(FIELD_SLOT_OWNER_PHONE) or out["owner_phone"]
+            reg = (f.get(FIELD_SLOT_REGISTRANT) or "").strip()
+            if not rep and reg and not reg.startswith("屋主"):
+                rep = reg
+    except Exception as e:
+        print(f"[_case_brief] 查預約失敗：{e}", flush=True)
+    if not rep:
+        try:
+            trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_CASE_NO + "}='" + esc + "'", [FIELD_TASK_ASSIGNEE])
+            rep = next((t["fields"][FIELD_TASK_ASSIGNEE] for t in trs if t["fields"].get(FIELD_TASK_ASSIGNEE)), "")
+        except Exception:
+            pass
+    out["rep_name"] = _canon_rep(rep) if rep else ""
+    return out
+
+
+def _reminder_when(kind, date, tm):
+    s = _wd_label(date) if date else ""
+    if "進場" in kind:
+        return f"{s}（預計施工 3～5 天）"
+    return f"{s} {tm}".strip() if tm else s
+
+
+def _reminder_owner_msg(b, kind, date, tm):
+    when = _reminder_when(kind, date, tm)
+    if "進場" in kind:
+        body = f"我們的施工團隊預計 {when} 進場安裝（實際依現場進度調整），請協助現場出入與用電、用水的配合。"
+    elif "掛表" in kind:
+        body = f"預計 {when} 到現場掛表，請屆時協助開門配合。"
+    elif "植筋" in kind:
+        body = f"預計 {when} 到現場植筋施作，請協助現場出入。"
+    elif "場勘" in kind or "放樣" in kind:
+        body = f"我們預計 {when} 到現場{kind}，請協助現場出入。"
+    elif "出貨" in kind:
+        body = f"設備預計 {when} 出貨，到貨前會再跟您確認。"
+    else:
+        body = f"預計 {when} 安排「{kind}」，請協助配合。"
+    return (f"{b['owner_name'] or '屋主'} 您好，{body}如果這個時間不方便，請隨時跟我說。\n—陽光伏特家"
+            + (f" {b['rep_name']}" if b["rep_name"] else ""))
+
+
+def _reminder_card(b, kind, date, tm, note=""):
+    rep = b["rep_name"]
+    fake = {FIELD_SLOT_OWNER_NAME: b["owner_name"], FIELD_SLOT_OWNER_PHONE: b["owner_phone"]}
+    buttons = [("📋 複製給屋主的訊息", {"clipboard": _reminder_owner_msg(b, kind, date, tm)})]
+    buttons += _vendor_card_buttons(fake, b["address"], b["coords"] or None)[:2]
+    return _card(
+        "⏰ 行程提醒｜請通知屋主", "#D97706", f"{b['case']} {b['alias']}".strip(),
+        subtitle=f"{rep} 您好" if rep else "",
+        rows=[("項目", kind), ("時間", _reminder_when(kind, date, tm)), ("廠商", b["vendor"]),
+              ("地址", b["address"]), ("座標", b["coords"]),
+              ("屋主", _owner_str(b["owner_name"], b["owner_phone"])), ("備註", (note or "").strip())],
+        note="請記得通知屋主這次的行程、確認屋主那天方便。可按下方「複製給屋主的訊息」直接貼給屋主。",
+        buttons=buttons,
+    )
+
+
+def _reminder_token_make(data):
+    payload = _b64(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode())
+    sig = _b64(hmac.new(_auth_secret(), ("rm." + payload).encode(), hashlib.sha256).digest())[:24]
+    return f"rm.{payload}.{sig}"
+
+
+def _reminder_token_parse(token):
+    try:
+        _, payload, sig = token.split(".", 2)
+        good = _b64(hmac.new(_auth_secret(), ("rm." + payload).encode(), hashlib.sha256).digest())[:24]
+        if not hmac.compare_digest(sig, good):
+            return None
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return data if int(data.get("x", 0)) > time.time() else None
+    except Exception:
+        return None
+
+
+@app.route("/api/case-brief")
+def case_brief():
+    """案件詳細（行事曆點進去的浮動視窗用）：案場、業務、屋主、地址、座標、這案的預約，＋業務有沒有綁 LINE。"""
+    case_no = (request.args.get("case") or "").strip()
+    if not case_no:
+        return jsonify({"error": "缺少案號"}), 400
+    b = _case_brief(case_no)
+    bound = False
+    if b["rep_name"]:
+        try:
+            bound = bool(_get_line_binding(b["rep_name"]))
+        except Exception:
+            pass
+    b["rep_bound"] = bound
+    return jsonify(b)
+
+
+@app.route("/api/case-reminder", methods=["POST"])
+def case_reminder():
+    """窗口手動「提醒業務通知屋主」。業務有綁 LINE → 機器人直接推；沒綁／離職／失敗 → 回傳分享連結＋文字版。
+    body: {case, kind（進場/場勘/放樣/掛表…）, date, time（選填）, note（選填）, share（強制走分享）}"""
+    body = request.get_json(force=True) or {}
+    case_no = (body.get("case") or "").strip()
+    kind = (body.get("kind") or "").strip()[:20]
+    date = (body.get("date") or "").strip()
+    tm = (body.get("time") or "").strip()[:20]
+    note = (body.get("note") or "").strip()[:300]
+    if not case_no or not kind or not date:
+        return jsonify({"error": "缺少案號／項目／日期"}), 400
+    b = _case_brief(case_no)
+    card = _reminder_card(b, kind, date, tm, note)
+    rep = b["rep_name"]
+    bound = False
+    if rep:
+        try:
+            bound = bool(_get_line_binding(rep))
+        except Exception as e:
+            print(f"[case-reminder] 查綁定失敗：{e}", flush=True)
+    if bound and not body.get("share"):
+        if _push_to_name(rep, card):
+            return jsonify({"ok": True, "sent": True, "rep_name": rep})
+    token = _reminder_token_make({"c": case_no, "k": kind, "d": date, "t": tm, "n": note,
+                                  "x": int(time.time()) + 45 * 86400})
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    return jsonify({
+        "ok": True, "sent": False, "rep_name": rep, "bound": bound,
+        "liff_url": f"https://liff.line.me/{liff_id}?vshare={token}~rep" if liff_id else "",
+        "plain_text": _card_plain_text(card),
+    })
+
+
 def _find_booking_by_vendor_token(token):
     token = (token or "").strip()
     if len(token) < 10:
@@ -2305,6 +2496,12 @@ def _split_share_token(token):
 @app.route("/api/vendor-share/<token>")
 def vendor_share_get(token):
     token, kind = _split_share_token(token)
+    if token.startswith("rm."):   # 案件提醒（簽章 token，不對應預約記錄）
+        data = _reminder_token_parse(token)
+        if not data:
+            return jsonify({"error": "這則提醒已失效，請回主控台重新產生"}), 404
+        card = _reminder_card(_case_brief(data.get("c")), data.get("k", ""), data.get("d", ""), data.get("t", ""), data.get("n", ""))
+        return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "rep", "sent_at": ""})
     try:
         rec = _find_booking_by_vendor_token(token)
     except Exception as e:
