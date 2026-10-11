@@ -8562,8 +8562,16 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
     if len(data) > PDF_MAX_BYTES:
         return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"}
     try:
-        dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'", [PDF_F["status"], PDF_F["src_name"]])
+        dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'",
+                               [PDF_F["status"], PDF_F["src_name"], PDF_F["uploader"]])
         if dup:
+            # 好幾位 PM 都收到同一份（例如同一個廠商群組）：不重複辨識，但把這位 PM 也記上去，各自的清單都看得到
+            have = dup[0].get("fields", {}).get(PDF_F["uploader"]) or ""
+            if uploader and uploader not in [x.strip() for x in have.split("、")]:
+                try:
+                    _pdf_patch(dup[0]["id"], {PDF_F["uploader"]: ((have + "、") if have else "") + uploader[:20]})
+                except Exception as e:
+                    print(f"[pdf_rename] 記錄收件人失敗：{e}", flush=True)
             return {"name": name, "ok": True, "duplicate": True, "id": dup[0]["id"],
                     "status": dup[0].get("fields", {}).get(PDF_F["status"], "")}
         resp = requests.post(PDF_API_URL, headers=airtable_headers(), json={"fields": {
@@ -8904,6 +8912,11 @@ def pdf_rename_confirm(record_id):
         cur = _pdf_record_to_dict(_pdf_get_record(record_id))
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+    # 好幾位 PM 同時開同一份：畫面打開時還是「待確認」，現在已經被別人確認／歸檔 → 不蓋掉，告訴他
+    expect = (body.get("expect_status") or "").strip()
+    if expect == PDF_ST_REVIEW and cur["status"] in (PDF_ST_CONFIRMED, PDF_ST_ARCHIVED):
+        return jsonify({"error": f"這份已經被 {cur['confirmed_by'] or '其他人'} 確認了（{cur['final_name']}），"
+                                 "重新整理就會看到；要改的話打開後按「更新確認內容」", "conflict": True}), 409
     ext = cur["file_ext"] if cur["file_ext"] in PDF_OFFICE_EXTS else ".pdf"
     if _pdf_ext(final_name) in (".pdf", ".docx", ".xlsx"):
         final_name = os.path.splitext(final_name)[0]
