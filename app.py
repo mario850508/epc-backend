@@ -2418,6 +2418,17 @@ def _reminder_token_make(data):
     return f"rm.{payload}.{sig}"
 
 
+def _reminder_share_url(case_no, kind, date, tm=""):
+    """給 LINE 卡片按鈕用：直接開 LIFF 分享頁（簽章 token，45 天有效）。沒設 LIFF_ID 回空字串。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id:
+        return ""
+    tm = tm or ""
+    token = _reminder_token_make({"c": case_no, "k": (kind or "")[:20], "d": date, "t": tm[:20], "n": "",
+                                  "x": int(time.time()) + 45 * 86400})
+    return f"https://liff.line.me/{liff_id}?vshare={token}~rep"
+
+
 def _reminder_token_parse(token):
     try:
         _, payload, sig = token.split(".", 2)
@@ -5065,7 +5076,15 @@ def _card_to_flex(card):
     for heading, lines in card.get("sections") or []:
         contents.append({"type": "text", "text": heading, "size": "sm", "weight": "bold", "color": card["color"], "margin": "lg"})
         for ln in lines:
-            contents.append({"type": "text", "text": ln, "size": "sm", "wrap": True, "margin": "xs", "color": "#1B2333"})
+            if isinstance(ln, (tuple, list)):
+                text, uri = ln
+                contents.append({"type": "box", "layout": "horizontal", "margin": "sm", "spacing": "sm", "alignItems": "center", "contents": [
+                    {"type": "text", "text": text, "size": "sm", "wrap": True, "color": "#1B2333", "flex": 5},
+                    {"type": "button", "style": "secondary", "height": "sm", "flex": 3,
+                     "action": {"type": "uri", "label": "📤 發送", "uri": uri}},
+                ]})
+            else:
+                contents.append({"type": "text", "text": ln, "size": "sm", "wrap": True, "margin": "xs", "color": "#1B2333"})
     if card.get("note"):
         contents.append({"type": "text", "text": card["note"], "size": "sm", "wrap": True, "margin": "lg", "color": "#B45309", "weight": "bold"})
     bubble = {
@@ -5104,7 +5123,7 @@ def _card_plain_text(card):
     lines += [f"{k}：{v}" for k, v in (card.get("rows") or []) if v not in (None, "")]
     for heading, sec in card.get("sections") or []:
         lines.append("\n" + heading)
-        lines += sec
+        lines += [x[0] if isinstance(x, (tuple, list)) else x for x in sec]
     if card.get("note"):
         lines.append("\n" + card["note"])
     if card.get("footer"):
@@ -5574,10 +5593,14 @@ def send_tomorrow_digest(force=False):
         lines = []
         for e in sorted(by_vendor[vendor], key=lambda x: (x["time"] or "99", x["kind"])):
             head = f"• {e['kind']}" + (f" {e['time']}" if e["time"] else "")
-            lines.append(f"{head}｜{e['case']} {e['alias']}".rstrip() + (f"（{e['extra']}）" if e["extra"] else ""))
+            text = f"{head}｜{e['case']} {e['alias']}".rstrip() + (f"（{e['extra']}）" if e["extra"] else "")
+            # 2026-10-11：每一筆右邊一顆「📤 發送」→ 開 LIFF 分享頁，自己選要傳給誰（業務沒綁 LINE 時手動提醒）
+            share = _reminder_share_url(e["case"], e["kind"], tmr, e["time"]) if e.get("case") else ""
+            lines.append((text, share) if share else text)
         sections.append((f"【{vendor}】", lines))
     card = _card("📅 明日行程總覽｜給你", "#0F766E", f"明天 {_wd_label(tmr)}", subtitle=f"共 {len(events)} 筆",
-                 sections=sections, button=("開啟主控台", _dash_url() + "/"))
+                 sections=sections, button=("開啟主控台", _dash_url() + "/"),
+                 footer="每筆右邊的「📤 發送」：產生提醒卡片，自己選要傳給哪位業務／同事")
     ok, err = _line_push_card(card)
     if ok:
         DIGEST_STATE["sent_for"] = tmr
