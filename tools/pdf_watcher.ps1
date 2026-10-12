@@ -9,6 +9,8 @@
   「案場資料夾 → 03/04/06/07」，同名檔案不覆蓋；資料夾裡已經有同類型的檔案（例如已有
   桃1_20250106_併聯審查.pdf）會先停下來，到主控台選「仍要歸檔」或「不歸檔」。
   電腦關機期間下載的檔案，下次開機會自動補送。每分鐘回報一次狀態，主控台看得到。
+  LINE 機器人直接送進主控台的檔案，也會下載一份原檔（原檔名，前面加收件時間）放到這個資料夾當備份，
+  不會再送一次辨識，也不會刪除。
 
 安裝（只要一次，會設定成開機自動在背景執行，不會跳視窗）：
   powershell -ExecutionPolicy Bypass -File pdf_watcher.ps1 -Install
@@ -24,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.5"
+$Version = "1.6"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -170,7 +172,44 @@ $saved = Read-JsonFile $SeenPath
 if ($saved) { foreach ($p in $saved.PSObject.Properties) { $seen[$p.Name] = [string]$p.Value } }
 
 $stats = @{ uploaded_total = 0; skipped = 0; last_error = ""; last_upload = "";
-            archived_total = 0; last_archive = ""; archive_error = ""; case_folders = 0 }
+            archived_total = 0; last_archive = ""; archive_error = ""; case_folders = 0; saved_total = 0 }
+
+# ---------------- LINE 原檔備份 ----------------
+# LINE 機器人直接把檔案送進主控台（電腦沒開也收得到）；這裡再把原檔下載一份到 LINE 收件資料夾留底
+function Save-LineOriginals([string]$folder) {
+    $res = Invoke-Api "GET" ("/api/pdf-rename/line-originals?days=14&pm=" + [uri]::EscapeDataString($Pm))
+    foreach ($it in @($res.items)) {
+        $tmp = ""
+        $mark = "line|" + $it.id
+        if ($seen.ContainsKey($mark)) { continue }
+        $name = [string]$it.src_name
+        foreach ($c in [IO.Path]::GetInvalidFileNameChars()) { $name = $name.Replace([string]$c, "_") }
+        $stem = [IO.Path]::GetFileNameWithoutExtension($name)
+        if (-not $stem) { $stem = "line_" + $it.id }
+        $ext = [string]$it.file_ext
+        if (-not $ext) { $ext = ".pdf" }
+        $stamp = ""
+        try { $stamp = ([datetimeoffset]::Parse([string]$it.uploaded_at)).ToLocalTime().ToString("yyyyMMdd_HHmmss") + "_" } catch { }
+        $target = Join-Path $folder ($stamp + $stem + $ext)
+        try {
+            if (-not (Test-Path -LiteralPath $target)) {
+                $tmp = Join-Path $AppDir ("ln_" + $it.id + $ext)
+                Invoke-WebRequest -Uri ($Backend + "/api/pdf-rename/" + $it.id + "/file") -OutFile $tmp -TimeoutSec 300 -UseBasicParsing
+                [IO.File]::Move($tmp, $target)
+                $stats.saved_total++
+                Write-Log "已備份 LINE 原檔：$target"
+            }
+            # 已經在主控台了：記成處理過，資料夾掃描時不再送一次
+            $f = Get-Item -LiteralPath $target
+            $seen[$f.FullName + "|" + $f.Length + "|" + $f.LastWriteTimeUtc.Ticks] = "line_backup"
+            $seen[$mark] = "saved"
+            Write-JsonFile $SeenPath $seen
+        } catch {
+            Write-Log "備份 LINE 原檔失敗（下次重試）：$($it.src_name)：$(Get-ErrorText $_)"
+            if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
 
 # ---------------- 自動歸檔 ----------------
 $caseIndex = @{}          # 案號 → 案場資料夾完整路徑
@@ -313,6 +352,7 @@ while ($true) {
             $stats.last_error = "這台電腦找不到資料夾：$folder"
         } else {
             $folderOk = $true
+            try { Save-LineOriginals $folder } catch { Write-Log "讀取 LINE 原檔清單失敗：$(Get-ErrorText $_)" }
             $files = @(Get-ChildItem -LiteralPath $folder -Recurse -File -ErrorAction SilentlyContinue |
                        Where-Object { ($WatchExts -contains $_.Extension.ToLower()) -and -not $_.Name.StartsWith("~$") } |
                        Sort-Object LastWriteTimeUtc)
@@ -387,7 +427,7 @@ while ($true) {
             uploaded_total = $stats.uploaded_total; skipped = $stats.skipped
             last_error = $stats.last_error; last_upload = $stats.last_upload
             archived_total = $stats.archived_total; last_archive = $stats.last_archive
-            archive_error = $stats.archive_error; case_folders = $stats.case_folders
+            archive_error = $stats.archive_error; case_folders = $stats.case_folders; saved_total = $stats.saved_total
         } | Out-Null
     } catch { }
     if ($Once) { break }
