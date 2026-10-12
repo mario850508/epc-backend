@@ -1468,6 +1468,8 @@ def get_vendor_slot_task_by_token(token):
                     })
         except Exception as e:
             print(f"[get_vendor_slot_task_by_token] 撈已預約時段失敗（不影響頁面）：{e}", flush=True)
+    if task["status"] != TASK_STATUS_DONE and task.get("duration_min") and not task.get("est_start"):
+        task["windows"] = [list(w) for w in _owner_windows(task)]   # 交由業務安排：開始時間只能選這些時段內
     liff_id = os.environ.get("LIFF_ID", "").strip()
     line_bound = False
     if liff_id and task["assignee"]:
