@@ -6851,9 +6851,9 @@ PDF_DEFAULT_DOC_TYPES = [
      "keywords": "再生能源發電設備購售電契約、購售電契約書、立契約書人、契約條款", "date_keys": "簽訂日期、簽約日期、中華民國"},
     {"name": "台電契約函", "category": "06", "milestone": "購售契約函文", "synonyms": "台電契約函文、購售契約函文",
      "keywords": "檢送、購售電契約、契約乙份"},
-    # 台電函「修訂貴我雙方簽訂之…購售契約…內容」（例如變更變流器型號後修訂契約附件），2026-10-12 使用者指定叫「範本修約」。
+    # 台電函「修訂貴我雙方簽訂之…購售契約…內容」（例如變更變流器型號後修訂契約附件），2026-10-12 使用者指定叫「換文修約」（一開始叫範本修約，同日改名）。
     # 很少見、學習模型沒看過，所以主旨符合 subject_regex 就直接判定（比學習模型優先）
-    {"name": "範本修約", "category": "06", "milestone": "", "synonyms": "範本修約函、契約修訂",
+    {"name": "換文修約", "category": "06", "milestone": "", "synonyms": "換文修約函、範本修約、契約修訂",
      "keywords": "修訂、修約、契約附件、責任分界圖面、內容如說明", "subject_regex": "修訂.{0,40}契約|契約.{0,20}修訂|修約"},
     {"name": "台電契約移轉", "category": "06", "milestone": "移轉契約", "synonyms": "",
      "keywords": "契約移轉、移轉、承受、過戶、轉讓"},
@@ -6979,7 +6979,9 @@ def _tw_now_iso():
     return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
-PDF_LATER_DOC_TYPES = {"範本修約"}   # 第一次存設定之後才加進預設的類型
+PDF_LATER_DOC_TYPES = {"換文修約"}   # 第一次存設定之後才加進預設的類型
+PDF_RENAMED_DOC_TYPES = {"範本修約": "換文修約"}   # 類型改名：存過的設定跟著改
+PDF_DEFAULT_TYPE_BY_NAME = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
 
 
 def _pdf_settings():
@@ -6998,8 +7000,13 @@ def _pdf_settings():
                      "正式售電函", "竣工備查", "設備登記", "台電審訖圖", "電表租約", "第一張電費單"}
         if {t.get("name") for t in data.get("doc_types") or []} == old_names:
             data["doc_types"] = PDF_DEFAULT_DOC_TYPES
-        # 之後才加的新類型（例如範本修約）：存過的設定裡沒有就補上；記在 doc_types_added，使用者刪掉後不會再加回來
-        added = set(data.get("doc_types_added") or [])
+        # 類型改名（例如範本修約 → 換文修約）
+        for t in data.get("doc_types") or []:
+            if t.get("name") in PDF_RENAMED_DOC_TYPES:
+                t["name"] = PDF_RENAMED_DOC_TYPES[t["name"]]
+                t["synonyms"] = PDF_DEFAULT_TYPE_BY_NAME.get(t["name"], {}).get("synonyms", t.get("synonyms", ""))
+        # 之後才加的新類型（例如換文修約）：存過的設定裡沒有就補上；記在 doc_types_added，使用者刪掉後不會再加回來
+        added = {PDF_RENAMED_DOC_TYPES.get(x, x) for x in data.get("doc_types_added") or []}
         have = {t.get("name") for t in data.get("doc_types") or []}
         for t in PDF_DEFAULT_DOC_TYPES:
             if t["name"] in PDF_LATER_DOC_TYPES and t["name"] not in added:
