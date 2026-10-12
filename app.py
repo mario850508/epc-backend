@@ -9625,11 +9625,13 @@ def _g_wins_text(wins):
 def _group_to_dict(rec):
     f = rec["fields"]
     prefs = []
-    for p in _json_or_default(f.get(G_PREFS), []):
+    for idx, p in enumerate(_json_or_default(f.get(G_PREFS), [])):
         if not isinstance(p, dict) or not p.get("date"):
             continue
         wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
-        prefs.append({"date": p["date"], "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
+        # tier＝第幾期望（同一期望可以有 2～3 個日期；屋主這一組日期都不行才看下一組）。舊資料沒有 tier 就一天算一組。
+        prefs.append({"date": p["date"], "tier": int(p.get("tier") or (idx + 1)),
+                      "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
     return {
         "id": rec["id"], "title": f.get(G_TITLE, ""), "vendor": f.get(G_VENDOR, ""),
         "type": [t for t in (f.get(G_ITEMS) or "").split("、") if t],
@@ -9676,12 +9678,20 @@ def _g_avail_intervals(wins, avail):
     return [(max(a, lo), min(b, hi)) for a, b in wins if min(b, hi) - max(a, lo) > 0]
 
 
+def _g_picks(reply):
+    """屋主選的（日期、時段）清單。新格式 picks；舊格式 pref/avail 在 _g_owner_intervals 裡另外換算。"""
+    return [x for x in ((reply or {}).get("picks") or []) if isinstance(x, dict) and x.get("date")]
+
+
 def _g_owner_intervals(prefs, reply, date):
     """屋主在某一天方便的時段（分鐘區間，已排序合併）。沒回覆或那天不方便＝空。"""
     out = []
     if not reply:
         return out
-    p = reply.get("pref")
+    for pk in _g_picks(reply):
+        if pk["date"] == date:
+            out += _g_avail_intervals(_g_vendor_wins(prefs, date), pk.get("avail") or "all")
+    p = reply.get("pref")   # 舊格式（第 p 個期望日）
     if isinstance(p, int) and 1 <= p <= len(prefs) and prefs[p - 1]["date"] == date:
         out += _g_avail_intervals(_g_mins(prefs[p - 1]["windows"]), reply.get("avail") or "all")
     for c in reply.get("custom") or []:
@@ -9701,13 +9711,18 @@ def _g_reply_text(prefs, reply):
     if not reply:
         return "尚未回覆"
     parts = []
+    picks = _g_picks(reply)
+    if picks:
+        tier = reply.get("tier") or next((p["tier"] for p in prefs if p["date"] == picks[0]["date"]), 1)
+        parts.append(f"第{['一', '二', '三', '四'][min(int(tier), 4) - 1]}期望：" + "、".join(
+            f"{_wd_label(x['date'])}{AVAIL_LABEL.get(x.get('avail') or 'all', '全天')}" for x in picks) + " 可以")
     p = reply.get("pref")
     if isinstance(p, int) and 1 <= p <= len(prefs):
         parts.append(f"第{['一', '二', '三', '四'][p - 1]}期望 {_wd_label(prefs[p - 1]['date'])} {AVAIL_LABEL.get(reply.get('avail') or 'all', '全天')}可以")
     cu = reply.get("custom") or []
     if cu:
         parts.append("自訂：" + "、".join(f"{_wd_label(c['date'])}{AVAIL_LABEL.get(c.get('avail') or 'all', '全天')}" for c in cu))
-    return "；".join(parts) or "兩個期望日都不行"
+    return "；".join(parts) or "期望日都不行"
 
 
 def _g_plan_for_date(group, tasks, date):
@@ -9786,10 +9801,11 @@ def _task_share_url(task_id, mode, suffix):
 
 
 def _joint_invite_text(group, task):
-    dates = "、".join(_wd_label(p["date"]) for p in group["prefs"])
+    first = [p["date"] for p in group["prefs"] if p["tier"] == min(q["tier"] for q in group["prefs"])] if group["prefs"] else []
+    dates = "、".join(_wd_label(d) for d in first)
     items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in group["type"])
     return (f"{(task.get('owner_name') or '屋主')} 您好，我們要為您安排「{items}」。廠商預計在 {dates} 到現場，"
-            f"想先請您點下面的連結，告訴我們這幾天哪些時段您方便（我們會把同一區的案子排在同一天，排好後再請您確認時間）：\n"
+            f"想先請您點下面的連結，告訴我們哪些日期、哪個時段您方便（我們會把同一區的案子排在同一天，排好後再請您確認時間）：\n"
             f"{_task_owner_link(task)}\n—陽光伏特家")
 
 
@@ -9939,13 +9955,20 @@ def joint_create():
         if c and c not in cases:
             cases.append(c)
     prefs_in = []
-    for p in (body.get("prefs") or [])[:4]:
-        try:
-            datetime.strptime((p.get("date") or ""), "%Y-%m-%d")
-        except Exception:
-            continue
-        wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
-        prefs_in.append({"date": p["date"], "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
+    tiers_in = body.get("tiers")
+    if not isinstance(tiers_in, list):   # 舊格式：prefs 每個日期一組
+        tiers_in = [{"days": [p]} for p in (body.get("prefs") or [])[:4] if isinstance(p, dict)]
+    for ti, tier in enumerate(tiers_in[:3], 1):
+        for p in ((tier or {}).get("days") or [])[:4]:
+            try:
+                datetime.strptime((p.get("date") or ""), "%Y-%m-%d")
+            except Exception:
+                continue
+            if any(x["date"] == p["date"] for x in prefs_in):
+                continue
+            wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
+            prefs_in.append({"date": p["date"], "tier": ti,
+                             "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
     if not vendor or not types or len(cases) < 2 or not prefs_in:
         return jsonify({"error": "請選廠商、項目，至少兩個案件，並至少設定第一期望日"}), 400
     try:
@@ -10117,7 +10140,7 @@ def _owner_group_info(task, group):
             iv = _g_avail_intervals(wins, k)
             if iv:
                 parts[k] = _g_wins_text(iv)
-        prefs.append({"date": p["date"], "parts": parts})
+        prefs.append({"date": p["date"], "tier": p["tier"], "parts": parts})
     reply = task.get("owner_reply")
     return {"id": group["id"], "status": group["status"], "prefs": prefs, "duration_min": group["duration_min"],
             "reply": reply, "reply_text": _g_reply_text(group["prefs"], reply),
@@ -10126,7 +10149,9 @@ def _owner_group_info(task, group):
 
 @app.route("/api/owner-booking/<otoken>/group-reply", methods=["POST"])
 def owner_group_reply(otoken):
-    """聯合排程：屋主回覆方便的時段。body: {pref:1|2|null, avail:'all'|'am'|'pm', custom:[{date,avail}], owner_name, owner_phone, note}"""
+    """聯合排程：屋主回覆方便的日期／時段。
+    body: {tier:1|2|null, picks:[{date, avail:'all'|'am'|'pm'}], custom:[{date,avail}], owner_name, owner_phone, note}
+    picks＝屋主在某一組期望日裡選的（可以選好幾天，每天各自選時段）；都不行才用 custom 提供其他日期。"""
     try:
         r = _owner_find_task(otoken)
     except Exception as e:
@@ -10145,13 +10170,23 @@ def owner_group_reply(otoken):
     name, phone, err_msg = _owner_contact(body)
     if err_msg:
         return jsonify({"error": err_msg}), 400
-    pref = body.get("pref")
-    avail = body.get("avail") or "all"
-    if pref is not None:
-        if not isinstance(pref, int) or not (1 <= pref <= len(group["prefs"])):
-            return jsonify({"error": "選的期望日不存在"}), 400
-        if avail not in AVAIL_LABEL or not _g_avail_intervals(_g_mins(group["prefs"][pref - 1]["windows"]), avail):
+    by_date = {p["date"]: p for p in group["prefs"]}
+    picks, seen_d = [], set()
+    tier = body.get("tier")
+    for x in (body.get("picks") or [])[:10]:
+        d = (x.get("date") or "").strip() if isinstance(x, dict) else ""
+        av = x.get("avail") if isinstance(x, dict) else None
+        if d not in by_date or d in seen_d:
+            return jsonify({"error": "選的日期不在可選範圍內"}), 400
+        if av not in AVAIL_LABEL or not _g_avail_intervals(_g_mins(by_date[d]["windows"]), av):
             return jsonify({"error": "選的時段不存在"}), 400
+        seen_d.add(d)
+        picks.append({"date": d, "avail": av})
+    if picks:
+        tier = by_date[picks[0]["date"]]["tier"]
+        if any(by_date[x["date"]]["tier"] != tier for x in picks):
+            return jsonify({"error": "一次只能回覆同一組期望日"}), 400
+        picks.sort(key=lambda x: x["date"])
     custom, seen = [], set()
     for c in (body.get("custom") or [])[:10]:
         d = (c.get("date") or "").strip() if isinstance(c, dict) else ""
@@ -10162,10 +10197,11 @@ def owner_group_reply(otoken):
         if d not in seen:
             seen.add(d)
             custom.append({"date": d, "avail": c.get("avail") if c.get("avail") in AVAIL_LABEL else "all"})
-    if pref is None and not custom:
-        return jsonify({"error": "請至少選一個您方便的時段，或提供其他日期"}), 400
-    reply = {"pref": pref, "avail": avail if pref is not None else None, "custom": custom, "name": name, "phone": phone,
-             "note": (body.get("note") or "").strip()[:300], "at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")}
+    if not picks and not custom:
+        return jsonify({"error": "請至少選一個您方便的日期與時段，或提供其他日期"}), 400
+    reply = {"tier": tier if picks else None, "picks": picks, "custom": custom, "name": name, "phone": phone,
+             "note": (body.get("note") or "").strip()[:300],
+             "at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")}
     try:
         _patch_task(r["id"], {FIELD_TASK_OWNER_REPLY: json.dumps(reply, ensure_ascii=False),
                               FIELD_TASK_OWNER_NAME: name, FIELD_TASK_OWNER_PHONE: phone})
