@@ -4279,6 +4279,29 @@ scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 # 2026-10-09：CronTrigger 物件預設吃伺服器時區（Render＝UTC），不是 scheduler 的時區，一律明確指定台北時間
 scheduler.add_job(refresh_cache, CronTrigger(hour="0,6,12,18", minute=0, timezone="Asia/Taipei"))
 scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", minute=5, timezone="Asia/Taipei"))
+
+
+def sync_milestone_done():
+    """進度管理：完成日期已經到了（今天或以前）但節點還是「尚未完成」的，改成「已完成」。
+    有日期就算完成；日期在未來的（預定出貨、預約進場）等那天到了再改。每小時跑一次，人工在 Airtable 填的日期也會跟上。"""
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    formula = ("AND({" + FIELD_MS_ACTUAL_DATE + "}!='',NOT(IS_AFTER({" + FIELD_MS_ACTUAL_DATE + "},'" + today + "')),{"
+               + FIELD_MS_STATUS + "}!='" + MS_STATUS_DONE + "')")
+    try:
+        recs = airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS])
+        for i in range(0, len(recs), 10):
+            r = requests.patch(MILESTONE_API_URL, headers=airtable_headers(), timeout=30,
+                               json={"records": [{"id": x["id"], "fields": {FIELD_MS_STATUS: MS_STATUS_DONE}} for x in recs[i:i + 10]]})
+            if r.status_code >= 400:
+                raise Exception(r.text[:300])
+        if recs:
+            print(f"[milestone] 有完成日期的節點改為已完成：{len(recs)} 筆", flush=True)
+    except Exception as e:
+        print(f"[milestone] 同步已完成失敗：{e}", flush=True)
+
+
+scheduler.add_job(sync_milestone_done, CronTrigger(minute=7, timezone="Asia/Taipei"), id="milestone_done",
+                  replace_existing=True, max_instances=1, coalesce=True)
 # 注意（2026-08-30 修改十三）：這裡刻意不呼叫 scheduler.start()。
 # 實際啟動移到 gunicorn.conf.py 的 post_fork() hook 裡呼叫，確保排程是在
 # 真正處理請求的 worker process 裡執行，而不是 gunicorn 的 master process
