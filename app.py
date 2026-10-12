@@ -1909,8 +1909,23 @@ def _valid_hhmm(raw, default):
         return default
 
 
+def _addr_fallback(case_no):
+    """Airtable 案件表沒有這案（還沒建檔）時的地址備援：業務自治區 A01資訊「地址」欄 → 場勘快取。"""
+    try:
+        _ensure_biz_snapshots_loaded()
+    except Exception:
+        pass
+    a = CASE_ADDR_CACHE.get(case_no)
+    if a:
+        return " ".join(a.split())
+    for c in SURVEY_CACHE.get("cases") or []:
+        if c.get("case") == case_no and c.get("address"):
+            return " ".join(c["address"].split())
+    return ""
+
+
 def _case_address(case_no):
-    """案件地址：Airtable 案件表優先，沒有的話用場勘快取裡的地址。"""
+    """案件地址：Airtable 案件表優先，沒有的話用業務自治區／場勘快取裡的地址。"""
     case_no = (case_no or "").strip()
     if not case_no:
         return ""
@@ -1921,10 +1936,7 @@ def _case_address(case_no):
             return " ".join(recs[0]["fields"][FIELD_ADDRESS].split())
     except Exception as e:
         print(f"[_case_address] 查地址失敗：{e}", flush=True)
-    for c in SURVEY_CACHE.get("cases") or []:
-        if c.get("case") == case_no and c.get("address"):
-            return " ".join(c["address"].split())
-    return ""
+    return _addr_fallback(case_no)
 
 
 def _owner_find_task(otoken):
@@ -2366,6 +2378,8 @@ def _booking_context(rec):
                 coords = biz
         except Exception as e:
             print(f"[_vendor_notice_card] 查業務自治區座標失敗：{e}", flush=True)
+    if not address and case_no:   # 案件還沒建進 Airtable：用業務自治區／場勘快取的地址
+        address = _addr_fallback(case_no)
     rep_name = f.get(FIELD_SLOT_REGISTRANT, "")
     if rep_name.startswith("屋主"):   # 屋主自己約的：登記人不是業務，只能靠任務的指派對象
         rep_name = ""
@@ -2572,6 +2586,8 @@ def _case_brief(case_no, booking_id=""):
             out["sales_person"] = (f.get(sf) if sf else "") or f.get(FIELD_CASE_REP_SELECT) or ""
     except Exception as e:
         print(f"[_case_brief] 查案件失敗：{e}", flush=True)
+    if not out["address"]:
+        out["address"] = _addr_fallback(case_no)
     # 案件表沒有的（還沒建檔）退回場勘快取／已公證快取
     for c in SURVEY_CACHE.get("cases") or []:
         if c.get("case") == case_no:
@@ -2912,14 +2928,24 @@ def site_survey_cancelled_sync():
     body = request.get_json(force=True)
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
-    if (isinstance(body.get("case_reps"), list) and "cancelled_case_numbers" not in body
-            and "certified_cases" not in body and "owner_contacts" not in body):
-        # 只補「案件業務」的部分推送：不碰取消／已公證／屋主資料（避免被當成空清單清掉）
-        CASE_REP_CACHE.clear()
-        CASE_REP_CACHE.update({c["case"].strip(): c["sales"].strip() for c in body["case_reps"]
-                               if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("sales") or "").strip()})
+    if ("cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body
+            and any(isinstance(body.get(k), list) for k in ("case_reps", "case_addrs", "plant_coords"))):
+        # 部分推送（案件業務／地址／座標）：不碰取消／已公證／屋主資料（避免被當成空清單清掉）
+        if isinstance(body.get("case_reps"), list):
+            CASE_REP_CACHE.clear()
+            CASE_REP_CACHE.update({c["case"].strip(): c["sales"].strip() for c in body["case_reps"]
+                                   if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("sales") or "").strip()})
+        if isinstance(body.get("case_addrs"), list):
+            CASE_ADDR_CACHE.clear()
+            CASE_ADDR_CACHE.update({c["case"].strip(): c["addr"].strip() for c in body["case_addrs"]
+                                    if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("addr") or "").strip()})
+        if isinstance(body.get("plant_coords"), list):
+            BIZ_COORDS_CACHE.clear()
+            BIZ_COORDS_CACHE.update({c["case"].strip(): c["coords"].strip() for c in body["plant_coords"]
+                                     if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("coords") or "").strip()})
         threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
-        return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE)})
+        return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE),
+                        "case_addrs_count": len(CASE_ADDR_CACHE), "plant_coords_count": len(BIZ_COORDS_CACHE)})
     case_nos = body.get("cancelled_case_numbers") or []
     CANCELLED_CASE_CACHE["case_nos"] = {c for c in case_nos if c}
     CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
@@ -2946,6 +2972,11 @@ def site_survey_cancelled_sync():
             new_owner_cache[case_no] = {"name": name, "phone": phone}
     OWNER_CONTACT_CACHE.clear()
     OWNER_CONTACT_CACHE.update(new_owner_cache)
+    addrs_in = body.get("case_addrs")
+    if isinstance(addrs_in, list):
+        CASE_ADDR_CACHE.clear()
+        CASE_ADDR_CACHE.update({c["case"].strip(): c["addr"].strip() for c in addrs_in
+                                if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("addr") or "").strip()})
     reps_in = body.get("case_reps")
     if isinstance(reps_in, list):
         new_reps = {}
@@ -2987,6 +3018,7 @@ BIZ_COORDS_CACHE = {}
 # 2026-10-11：業務自治區 A01資訊「業務」欄（U）——所有案件的負責業務（{案號: 業務名}），不限「已公證」。
 # 已公證案件清單只有狀態＝已公證的，案件一進到「已簽約」就查不到業務了。
 CASE_REP_CACHE = {}
+CASE_ADDR_CACHE = {}   # 2026-10-12：業務自治區 A01資訊「地址」欄（{案號: 地址}），Airtable 還沒有的案件用
 STATE_FIELD_LONG = "fld4BuR3sfKTkDvsi"   # 系統狀態「長值」（multilineText）
 _BIZ_SNAPSHOT_LOADED = {"done": False}
 
@@ -3038,6 +3070,7 @@ def _persist_biz_snapshots():
     items = {
         "biz_plant_coords": dict(BIZ_COORDS_CACHE),
         "biz_case_reps": dict(CASE_REP_CACHE),
+        "biz_case_addrs": dict(CASE_ADDR_CACHE),
         "biz_owner_contacts": dict(OWNER_CONTACT_CACHE),
         "biz_certified_cases": list(CERTIFIED_CASE_CACHE.get("cases") or []),
         "biz_cancelled_cases": sorted(CANCELLED_CASE_CACHE.get("case_nos") or []),
@@ -3071,6 +3104,10 @@ def _ensure_biz_snapshots_loaded():
             raw = _state_get_chunked("biz_case_reps")
             if raw:
                 CASE_REP_CACHE.update(json.loads(raw))
+        if not CASE_ADDR_CACHE:
+            raw = _state_get_chunked("biz_case_addrs")
+            if raw:
+                CASE_ADDR_CACHE.update(json.loads(raw))
         if not OWNER_CONTACT_CACHE:
             raw = _state_get_chunked("biz_owner_contacts")
             if raw:
@@ -10361,7 +10398,7 @@ def _vendor_batch_build(booking_ids, note=""):
         dial = "".join(c for c in it["owner_phone"] if c.isdigit() or c == "+")
         if len(dial) >= 8:
             btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                         "action": {"type": "uri", "label": "📞 撥號", "uri": "tel:" + dial}})
+                         "action": {"type": "uri", "label": "📞 撥號給屋主", "uri": "tel:" + dial}})
         if it["coords"]:
             btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
                          "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["coords"])}})
