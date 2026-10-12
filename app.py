@@ -1239,6 +1239,67 @@ def create_vendor_slot_task():
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/api/vendor-slots/tasks/<record_id>", methods=["PATCH"])
+def update_vendor_slot_task(record_id):
+    """2026-10-12：編輯還沒完成預約的任務（候選日期、項目、案號、指派業務、安排人員、預估時間、
+    屋主可選時段、回覆期限…）。連結（token）不變，已經傳出去的連結仍然有效。
+    body 欄位同建立任務。已完成預約的任務不能改（要改請取消預約）。"""
+    body = request.get_json(force=True) or {}
+    rec = _get_task_by_record_id(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個任務已經完成預約了，要改請到「完成安排」取消預約"}), 409
+    vendor = (body.get("vendor") or "").strip()
+    case_no = (body.get("case") or "").strip()
+    slot_type = _normalize_type_list(body.get("type"))
+    candidate_dates = [d.strip() for d in (body.get("candidate_dates") or []) if d.strip()]
+    if not vendor or not case_no or not slot_type or not candidate_dates:
+        return jsonify({"error": "缺少必填欄位（廠商/案號/項目類型/候選日期至少一天）"}), 400
+    try:
+        duration_min = int(body.get("duration_min")) if body.get("duration_min") else None
+        if duration_min is not None and duration_min <= 0:
+            duration_min = None
+    except (TypeError, ValueError):
+        duration_min = None
+    est_start = (body.get("est_start") or "").strip()
+    try:
+        _parse_hhmm(est_start)
+    except Exception:
+        est_start = ""
+    creator = body.get("creator")
+    if isinstance(creator, list):
+        creator = "、".join(str(x).strip() for x in creator if str(x).strip())
+    fields = {
+        FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(slot_type)} 待業務安排",
+        FIELD_TASK_VENDOR: vendor,
+        FIELD_TASK_CASE_NO: case_no,
+        FIELD_TASK_ALIAS: (body.get("alias") or "").strip(),
+        FIELD_TASK_TYPE: slot_type,
+        FIELD_TASK_CANDIDATE_DATES: ",".join(candidate_dates),
+        FIELD_TASK_ASSIGNEE: _canon_rep((body.get("assignee") or "").strip()),
+        FIELD_TASK_CREATOR: (creator or "").strip(),
+        FIELD_TASK_OWNER_WIN_START: _valid_hhmm(body.get("owner_win_start"), "09:00"),
+        FIELD_TASK_OWNER_WIN_END: _valid_hhmm(body.get("owner_win_end"), "17:00"),
+        FIELD_TASK_DURATION_MIN: duration_min,
+        FIELD_TASK_EST_START: est_start or None,
+        FIELD_TASK_OWNER_NAME: (body.get("owner_name") or "").strip(),
+        FIELD_TASK_OWNER_PHONE: (body.get("owner_phone") or "").strip(),
+    }
+    if "deadline" in body:
+        deadline = _normalize_deadline(body.get("deadline"))
+        fields[FIELD_TASK_DEADLINE] = deadline
+        if (deadline or "") != (task.get("deadline") or ""):
+            fields[FIELD_TASK_REMINDED] = False   # 期限改了就重新武裝提醒
+    try:
+        _patch_task(record_id, fields)
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    rec2 = _get_task_by_record_id(record_id)
+    return jsonify({"ok": True, "task": _task_to_dict(rec2) if rec2 else None, "path": f"/book.html?token={task['token']}"})
+
+
 @app.route("/api/vendor-slots/tasks/<record_id>", methods=["DELETE"])
 def delete_vendor_slot_task(record_id):
     """刪掉一個任務（連結會立刻失效）。"""
