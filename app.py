@@ -589,6 +589,8 @@ FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指�
 FIELD_TASK_OWNER_TOKEN = "fldEAVpfdwAot2wmx"      # 屋主Token
 FIELD_TASK_OWNER_WIN_START = "fldcshgkAyg8iA1mV"  # 屋主可選時段開始 HH:MM（預設 09:00）
 FIELD_TASK_OWNER_WIN_END = "fldZM3kKE3GWpyvvK"    # 屋主可選時段結束 HH:MM（預設 17:00，作業要在這之前結束）
+FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
+FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
@@ -1102,6 +1104,7 @@ def _task_fields():
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
+        FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END,
     ]
 
 
@@ -1154,6 +1157,8 @@ def _task_to_dict(r):
         "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
         "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
         "owner_win_end": f.get(FIELD_TASK_OWNER_WIN_END) or "",
+        "owner_win2_start": f.get(FIELD_TASK_OWNER_WIN2_START) or "",
+        "owner_win2_end": f.get(FIELD_TASK_OWNER_WIN2_END) or "",
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
     }
 
@@ -1213,6 +1218,9 @@ def create_vendor_slot_task():
             FIELD_TASK_OWNER_WIN_START: _valid_hhmm(body.get("owner_win_start"), "09:00"),
             FIELD_TASK_OWNER_WIN_END: _valid_hhmm(body.get("owner_win_end"), "17:00"),
         }
+        w2s, w2e = _opt_window2(body, fields[FIELD_TASK_OWNER_WIN_END])
+        if w2s:
+            fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = w2s, w2e
         if duration_min is not None:
             fields[FIELD_TASK_DURATION_MIN] = duration_min
         deadline = _normalize_deadline(body.get("deadline"))
@@ -1287,6 +1295,8 @@ def update_vendor_slot_task(record_id):
         FIELD_TASK_OWNER_NAME: (body.get("owner_name") or "").strip(),
         FIELD_TASK_OWNER_PHONE: (body.get("owner_phone") or "").strip(),
     }
+    w2s, w2e = _opt_window2(body, fields[FIELD_TASK_OWNER_WIN_END])
+    fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = (w2s or None), (w2e or None)
     if "deadline" in body:
         deadline = _normalize_deadline(body.get("deadline"))
         fields[FIELD_TASK_DEADLINE] = deadline
@@ -1883,8 +1893,35 @@ def _owner_duration(task):
     return task.get("duration_min") or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in task.get("type") or []) or 60
 
 
+def _opt_window2(body, win1_end):
+    """第二個可選時段（選填）：兩個時間都有效、結束晚於開始、且不早於第一個時段結束才算；否則視為沒有。"""
+    s = _valid_hhmm(body.get("owner_win2_start"), "")
+    e = _valid_hhmm(body.get("owner_win2_end"), "")
+    try:
+        if s and e and _parse_hhmm(e) > _parse_hhmm(s) and _parse_hhmm(s) >= _parse_hhmm(win1_end):
+            return s, e
+    except Exception:
+        pass
+    return "", ""
+
+
+def _owner_windows(task):
+    """屋主可選的時段清單（1～2 段），例如 [("09:00","12:00"), ("13:00","17:00")]；中間的空檔是工班休息、屋主不能選。"""
+    a, b = _valid_hhmm(task.get("owner_win_start"), "09:00"), _valid_hhmm(task.get("owner_win_end"), "17:00")
+    out = [(a, b)]
+    c, d = _valid_hhmm(task.get("owner_win2_start"), ""), _valid_hhmm(task.get("owner_win2_end"), "")
+    try:
+        if c and d and _parse_hhmm(d) > _parse_hhmm(c) and _parse_hhmm(c) >= _parse_hhmm(b):
+            out.append((c, d))
+    except Exception:
+        pass
+    return out
+
+
 def _owner_window(task):
-    return _valid_hhmm(task.get("owner_win_start"), "09:00"), _valid_hhmm(task.get("owner_win_end"), "17:00")
+    """整體範圍（第一段開始～最後一段結束）。進場（整天）預約用這個。"""
+    w = _owner_windows(task)
+    return w[0][0], w[-1][1]
 
 
 def _vendor_busy_slots(vendor):
@@ -1908,12 +1945,12 @@ def _owner_slot_from_start(task, date, start):
         st = _parse_hhmm(start or "")
     except Exception:
         return None, "日期或時間格式不正確"
-    ws, we = _owner_window(task)
+    wins = _owner_windows(task)
     et = st + _owner_duration(task)
     if st % 60 != 0:   # 屋主只能選整點開始（2026-10-12 使用者要求，半點不好安排）
         return None, "請選整點的開始時間"
-    if st < _parse_hhmm(ws) or et > _parse_hhmm(we):
-        return None, f"請選 {ws}–{we} 之間的時間"
+    if not any(st >= _parse_hhmm(a) and et <= _parse_hhmm(b) for a, b in wins):
+        return None, "請選 " + "、".join(f"{a}–{b}" for a, b in wins) + " 之間的時間"
     return {"date": date, "start_time": f"{st // 60:02d}:{st % 60:02d}", "end_time": f"{et // 60:02d}:{et % 60:02d}"}, None
 
 
@@ -1963,6 +2000,7 @@ def owner_booking_get(otoken):
         "date_only": _owner_date_only(task),
         "duration_label": _owner_multiday_label(task),
         "window_start": ws, "window_end": we,
+        "windows": [list(w) for w in _owner_windows(task)],
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
         "address": _case_address(task["case"]),
@@ -2168,7 +2206,8 @@ def vendor_slot_task_owner_link(record_id):
         "ok": True, "owner_path": f"/owner.html?t={task['owner_token']}",
         "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
-        "window_start": ws, "window_end": we, "assignee": task["assignee"], "status": task["status"],
+        "window_start": ws, "window_end": we, "windows": [list(w) for w in _owner_windows(task)],
+        "assignee": task["assignee"], "status": task["status"],
         "assignee_bound": bool(task["assignee"] and _get_line_binding(task["assignee"])),
         "rep_bind_url": _rep_bind_url(task["assignee"]),
     })
