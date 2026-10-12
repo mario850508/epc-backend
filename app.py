@@ -2745,6 +2745,8 @@ def _split_share_token(token):
         return token[:-4], "fwd"
     if token.endswith("~card"):
         return token[:-5], "card"
+    if token.endswith("~vb"):
+        return token[:-3], "vb"
     return token, "vendor"
 
 
@@ -2755,6 +2757,12 @@ def vendor_share_get(token):
         data = _reminder_token_parse(token)
         if not data:
             return jsonify({"error": "這則提醒已失效，請回主控台重新產生"}), 404
+        if data.get("b"):   # 一起通知廠商（多筆合成一張卡）
+            built = _vendor_batch_build(data["b"], data.get("n", ""))
+            if not built:
+                return jsonify({"error": "找不到這些預約，可能已經取消或刪除"}), 404
+            preview, flex, alt, _plain, _items = built
+            return jsonify({"card": preview, "flex": flex, "alt": alt, "kind": "vendor", "sent_at": ""})
         if data.get("tid"):   # 聯合排程：邀請訊息（文字）／確認卡
             tr = _get_task_by_record_id(data["tid"])
             if not tr:
@@ -2791,6 +2799,18 @@ def vendor_share_get(token):
 @app.route("/api/vendor-share/<token>/sent", methods=["POST"])
 def vendor_share_sent(token):
     token, kind = _split_share_token(token)
+    if kind == "vb":   # 一起通知廠商：這幾筆預約都記下「廠商通知時間」
+        data = _reminder_token_parse(token)
+        if not data or not data.get("b"):
+            return jsonify({"error": "找不到這則廠商通知"}), 404
+        now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        for bid in data["b"]:
+            try:
+                requests.patch(f"{SLOT_API_URL}/{bid}", headers=airtable_headers(),
+                               json={"fields": {FIELD_SLOT_VENDOR_NOTIFIED: now}}, timeout=20)
+            except Exception as e:
+                print(f"[vendor_share_sent] 記錄廠商通知時間失敗 {bid}：{e}", flush=True)
+        return jsonify({"ok": True, "sent_at": now})
     if kind in ("rep", "own", "fwd", "card"):   # 通知業務／傳給屋主／廠商轉分享不記錄「已通知廠商」
         return jsonify({"ok": True})
     try:
@@ -10154,6 +10174,118 @@ def owner_group_reply(otoken):
     task["owner_reply"], task["owner_name"], task["owner_phone"] = reply, name, phone
     threading.Thread(target=_joint_after_reply, args=(task,), daemon=True).start()
     return jsonify({"ok": True, "reply_text": _g_reply_text(group["prefs"], reply)})
+
+
+# ===================================================================
+# 2026-10-12：「一起通知廠商」——完成安排裡勾選同一家廠商的多筆預約，合成「一張」卡片（依日期時間排序），
+# 每筆顯示：時間、案號、地址、屋主姓名電話、備註，以及各自的 📞 撥號、📍 地圖 按鈕。避免 5～6 筆各傳一張卡片洗版。
+# 分享：LIFF 分享頁（~vb），傳送成功後把這幾筆的「廠商通知時間」一起記下來。
+# ===================================================================
+def _vendor_batch_items(booking_ids):
+    items, ctx_cache = [], {}
+    for bid in booking_ids:
+        rec = _get_booking(bid)
+        if not rec:
+            continue
+        f = rec.get("fields", {})
+        if f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+            continue
+        case_no = f.get(FIELD_SLOT_CASE_NO, "")
+        if case_no not in ctx_cache:
+            ctx_cache[case_no] = _booking_context(rec)
+        address, coords, _rep = ctx_cache[case_no]
+        types = f.get(FIELD_SLOT_TYPE) or []
+        tm = f"{f.get(FIELD_SLOT_START, '')}–{f.get(FIELD_SLOT_END, '')}" if f.get(FIELD_SLOT_START) else ""
+        items.append({
+            "id": bid, "vendor": f.get(FIELD_SLOT_VENDOR, ""), "date": f.get(FIELD_SLOT_DATE, ""), "start": f.get(FIELD_SLOT_START, ""),
+            "when": _owner_time_text({"type": types}, f.get(FIELD_SLOT_DATE, ""), f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, "")),
+            "time_text": tm, "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""), "types": "、".join(types),
+            "address": address, "coords": coords or "", "owner_name": (f.get(FIELD_SLOT_OWNER_NAME) or "").strip(),
+            "owner_phone": (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip(), "note": (f.get(FIELD_SLOT_NOTE) or "").strip(),
+            "pm_note": (f.get(FIELD_SLOT_PM_NOTE) or "").strip(), "fields": f,
+        })
+    items.sort(key=lambda x: (x["date"], x["start"]))
+    return items
+
+
+def _vendor_batch_build(booking_ids, note=""):
+    """回 (preview_card, flex, alt, plain_text)；沒有有效預約回 None。"""
+    from urllib.parse import quote
+    items = _vendor_batch_items(booking_ids)
+    if not items:
+        return None
+    vendor = items[0]["vendor"]
+    n = len(items)
+    first, last = items[0]["date"], items[-1]["date"]
+    span = _wd_label(first) + (f" ～ {_wd_label(last)}" if last != first else "")
+    contents = [{"type": "text", "text": f"{vendor}｜共 {n} 筆", "weight": "bold", "size": "lg", "wrap": True},
+                {"type": "text", "text": span, "size": "sm", "color": "#6B7280", "wrap": True, "margin": "xs"}]
+    plain = [f"📋 施工排程通知｜給廠商", f"{vendor}｜共 {n} 筆", span, ""]
+    prows = []
+    for i, it in enumerate(items, 1):
+        head = f"{i}. {it['when']}"   # when 已含時間（進場是「預計施工 3～5 天」）
+        contents.append({"type": "separator", "margin": "lg"})
+        contents.append({"type": "text", "text": head, "weight": "bold", "size": "md", "color": "#2563EB", "wrap": True, "margin": "md"})
+        contents.append({"type": "text", "text": f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else ""),
+                         "size": "sm", "wrap": True, "margin": "xs"})
+        lines = [f"{head}", f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else "")]
+        for label, val in (("地址", it["address"]), ("屋主", _owner_str(it["owner_name"], it["owner_phone"])),
+                           ("現場備註", it["note"]), ("陽光備註", it["pm_note"])):
+            if val:
+                contents.append({"type": "box", "layout": "baseline", "margin": "xs", "spacing": "sm", "contents": [
+                    {"type": "text", "text": label, "size": "xs", "color": "#6B7280", "flex": 2},
+                    {"type": "text", "text": val, "size": "xs", "color": "#1B2333", "wrap": True, "flex": 6}]})
+                lines.append(f"{label}：{val}")
+        if it["coords"]:
+            lines.append(f"座標：{it['coords']}")
+        btns = []
+        dial = "".join(c for c in it["owner_phone"] if c.isdigit() or c == "+")
+        if len(dial) >= 8:
+            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                         "action": {"type": "uri", "label": "📞 撥號", "uri": "tel:" + dial}})
+        if it["coords"]:
+            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                         "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["coords"])}})
+        elif it["address"]:
+            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                         "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["address"])}})
+        if btns:
+            contents.append({"type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md", "contents": btns})
+        plain += lines + [""]
+        prows.append((head, f"{it['case']} {it['alias']}｜屋主 {_owner_str(it['owner_name'], it['owner_phone'])}".strip()))
+    if (note or "").strip():
+        contents.append({"type": "separator", "margin": "lg"})
+        contents.append({"type": "text", "text": "備註：" + note.strip(), "size": "sm", "wrap": True, "color": "#B45309", "weight": "bold", "margin": "md"})
+        plain.append("備註：" + note.strip())
+    flex = {"type": "bubble", "size": "giga",
+            "header": {"type": "box", "layout": "vertical", "backgroundColor": "#2563EB", "paddingAll": "12px",
+                       "contents": [{"type": "text", "text": "📋 施工排程通知｜給廠商", "color": "#FFFFFF", "weight": "bold", "size": "sm"}]},
+            "body": {"type": "box", "layout": "vertical", "paddingAll": "14px", "contents": contents}}
+    alt = (f"施工排程通知｜{vendor} 共{n}筆：" + "；".join(f"{it['when']} {it['case']}" for it in items))[:390]
+    preview = _card("📋 施工排程通知｜給廠商（一起通知）", "#2563EB", f"{vendor}｜共 {n} 筆", subtitle=span, rows=prows,
+                    note=("備註：" + note.strip()) if (note or "").strip() else "")
+    return preview, flex, alt, "\n".join(plain).strip(), items
+
+
+@app.route("/api/vendor-slots/batch-vendor-notice", methods=["POST"])
+def vendor_batch_notice():
+    """body: {ids:[預約 record id...], note}。必須是同一家廠商。回傳 LIFF 分享連結＋文字版。"""
+    body = request.get_json(force=True) or {}
+    ids = [i for i in (body.get("ids") or []) if isinstance(i, str)][:30]
+    if len(ids) < 1:
+        return jsonify({"error": "請先勾選要通知的預約"}), 400
+    built = _vendor_batch_build(ids, body.get("note") or "")
+    if not built:
+        return jsonify({"error": "找不到這些預約，可能已經取消或刪除"}), 404
+    preview, flex, alt, plain, items = built
+    if len({it["vendor"] for it in items}) > 1:
+        return jsonify({"error": "一次只能通知同一家廠商，請分開勾選"}), 400
+    token = _reminder_token_make({"b": [it["id"] for it in items], "n": (body.get("note") or "").strip()[:300],
+                                  "x": int(time.time()) + 45 * 86400})
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    return jsonify({"ok": True, "count": len(items), "plain_text": plain,
+                    "liff_url": f"https://liff.line.me/{liff_id}?vshare={token}~vb" if liff_id else "",
+                    "missing_phone": [it["case"] for it in items if len("".join(c for c in it["owner_phone"] if c.isdigit())) < 8]})
 
 
 if __name__ == "__main__":
