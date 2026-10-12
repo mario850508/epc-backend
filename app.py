@@ -538,6 +538,8 @@ FIELD_SLOT_OWNER_NAME = "fld3ljzB0bpzQzaXL"  # 屋主姓名，2026-10-01 新增
 FIELD_SLOT_VENDOR_TOKEN = "fldny0M5w7oBVr14z"     # 廠商通知Token
 FIELD_SLOT_PM_NOTE = "flddfOVk2OdqMElSm"          # 給廠商備註
 FIELD_SLOT_VENDOR_NOTIFIED = "fldCC1k8KciTDtK61"  # 廠商通知時間（ISO 字串）
+FIELD_SLOT_COMPANIONS = "fldlxoJL1pxlXnmxV"        # 同時預約案號（2026-10-12：拆成兩案的同一個案場，一起施作；「、」分隔）
+FIELD_TASK_COMPANIONS = "fldz9O4lPkdYpTA0l"        # 任務：預約時要一起預約的其他案件
 FIELD_SLOT_OWNER_PHONE = "fldT1YrJY2Rp8L33S"  # 屋主電話，2026-10-01 新增
 SLOT_KIND_WINDOW = "開放時段"
 SLOT_KIND_BOOKING = "已預約"
@@ -631,7 +633,7 @@ def list_vendor_slots():
             FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START,
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
             FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
-            FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_CANCEL_REASON, FIELD_SLOT_CANCELLED_AT,
+            FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_CANCEL_REASON, FIELD_SLOT_CANCELLED_AT, FIELD_SLOT_COMPANIONS,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
@@ -650,7 +652,7 @@ def list_vendor_slots():
                 "case": f.get(FIELD_SLOT_CASE_NO, ""), "alias": f.get(FIELD_SLOT_ALIAS, ""),
                 "type": f.get(FIELD_SLOT_TYPE) or [], "registrant": f.get(FIELD_SLOT_REGISTRANT, ""),
                 "note": f.get(FIELD_SLOT_NOTE, ""), "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
-                "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""), "cancelled": True,
+                "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""), "cancelled": True, "companions": f.get(FIELD_SLOT_COMPANIONS, ""),
                 "cancel_reason": f.get(FIELD_SLOT_CANCEL_REASON, ""), "cancelled_at": f.get(FIELD_SLOT_CANCELLED_AT, ""),
             })
             cancelled.append(item)
@@ -666,6 +668,7 @@ def list_vendor_slots():
                 "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
                 "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""),
                 "vendor_notified_at": f.get(FIELD_SLOT_VENDOR_NOTIFIED, ""),
+                "companions": f.get(FIELD_SLOT_COMPANIONS, ""),
             })
             bookings.append(item)
         else:
@@ -735,8 +738,33 @@ def _find_slot_conflict(vendor, date, start_time, end_time):
     return None
 
 
+def _clean_companions(raw, primary=""):
+    """同時預約的其他案號：去空白、去重、排除主案、最多 4 個。"""
+    if isinstance(raw, str):
+        raw = [x for x in raw.replace("，", "、").replace(",", "、").split("、")]
+    out = []
+    for x in raw or []:
+        x = (x or "").strip() if isinstance(x, str) else ""
+        if x and x != primary and x not in out:
+            out.append(x)
+    return out[:4]
+
+
+def _case_alias(case_no):
+    try:
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + case_no.replace("'", chr(92) + "'") + "'", [FIELD_CASE_NO, FIELD_ALIAS])
+        if recs and recs[0]["fields"].get(FIELD_ALIAS):
+            return recs[0]["fields"][FIELD_ALIAS]
+    except Exception as e:
+        print(f"[_case_alias] 查別名失敗：{e}", flush=True)
+    for c in CERTIFIED_CASE_CACHE.get("cases") or []:
+        if c.get("case") == case_no and c.get("alias"):
+            return c["alias"]
+    return ""
+
+
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None):
+                       owner_name=None, owner_phone=None, companions=None):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -788,12 +816,37 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
             fields[FIELD_SLOT_OWNER_NAME] = owner_name.strip()
         if owner_phone:
             fields[FIELD_SLOT_OWNER_PHONE] = owner_phone.strip()
+        comp_list = _clean_companions(companions, case_no)
+        if comp_list:
+            fields[FIELD_SLOT_COMPANIONS] = "、".join(comp_list)
         resp = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
             return None, ({"error": "Airtable 寫入失敗", "detail": resp.text}, 502)
         record = resp.json()
     except Exception as e:
         return None, ({"error": str(e)}, 502)
+    # 2026-10-12：同時預約的其他案件（例如拆成兩案的同一個案場）——每案各建一筆同時段的預約，並各自同步日期
+    comp_failed = []
+    for cc in comp_list:
+        try:
+            f2 = dict(fields)
+            f2[FIELD_SLOT_CASE_NO] = cc
+            f2[FIELD_SLOT_ALIAS] = _case_alias(cc)
+            f2[FIELD_SLOT_COMPANIONS] = "、".join([case_no] + [x for x in comp_list if x != cc])
+            r2 = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": f2}, timeout=20)
+            if r2.status_code >= 400:
+                comp_failed.append(cc)
+                print(f"[_book_vendor_slot] 同時預約 {cc} 寫入失敗：{r2.text[:200]}", flush=True)
+                continue
+            try:
+                _sync_booking_to_case_dates(cc, slot_type, date)
+            except Exception as e:
+                print(f"[_book_vendor_slot] 同時預約 {cc} 同步日期失敗：{e}", flush=True)
+        except Exception as e:
+            comp_failed.append(cc)
+            print(f"[_book_vendor_slot] 同時預約 {cc} 例外：{e}", flush=True)
+    if comp_failed:
+        record["_companion_failed"] = comp_failed
     # 預約成功後，把日期同步寫進對應的「預計日期」欄位（失敗不影響預約本身）
     try:
         _sync_booking_to_case_dates(case_no, slot_type, date)
@@ -909,7 +962,8 @@ def cancel_vendor_slot_booking(record_id):
     body = request.get_json(force=True) or {}
     reason = (body.get("reason") or "").strip()[:300]
     reopen = bool(body.get("reopen"))
-    notify = body.get("notify", True) is not False
+    quiet = bool(body.get("quiet"))   # 同時預約的另一案一起取消時，不重複發通知
+    notify = body.get("notify", True) is not False and not quiet
     rec = _get_booking(record_id)
     if not rec:
         return jsonify({"error": "找不到這筆預約"}), 404
@@ -945,7 +999,7 @@ def cancel_vendor_slot_booking(record_id):
         print(f"[cancel_vendor_slot_booking] 更新任務失敗（預約已取消）：{e}", flush=True)
     notice = _cancel_notice(rec, task, reason, reopen)
     rep_ok = _push_to_name(notice["rep_name"], notice["rep_card"]) if (notify and notice["rep_name"]) else False
-    sched_ok = _send_cancel_to_scheduler(notice, task)
+    sched_ok = False if quiet else _send_cancel_to_scheduler(notice, task)
     return jsonify({"ok": True, "owner_message": notice["msg"], "rep_name": notice["rep_name"], "rep_notified": rep_ok,
                     "scheduler_notified": sched_ok,
                     "vendor_was_notified": bool(f.get(FIELD_SLOT_VENDOR_NOTIFIED)), "reopened": reopen})
@@ -1080,11 +1134,12 @@ def create_vendor_slot_booking():
     record, err = _book_vendor_slot(
         body.get("vendor"), body.get("date"), body.get("start_time"), body.get("end_time"),
         body.get("case"), body.get("alias"), body.get("type"), body.get("registrant"), body.get("note"),
+        companions=body.get("companions"),
     )
     if err:
         err_body, status = err
         return jsonify(err_body), status
-    return jsonify({"ok": True, "record": record})
+    return jsonify({"ok": True, "record": record, "companion_failed": record.get("_companion_failed", [])})
 
 
 @app.route("/api/vendor-slots/<record_id>", methods=["DELETE"])
@@ -1109,6 +1164,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
+        FIELD_TASK_COMPANIONS,
     ]
 
 
@@ -1161,6 +1217,7 @@ def _task_to_dict(r):
         "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
         "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
         "owner_win_end": f.get(FIELD_TASK_OWNER_WIN_END) or "",
+        "companions": _clean_companions(f.get(FIELD_TASK_COMPANIONS) or "", f.get(FIELD_TASK_CASE_NO, "")),
         "group_id": f.get(FIELD_TASK_GROUP_ID) or "",
         "owner_reply": _json_or_default(f.get(FIELD_TASK_OWNER_REPLY), {}) or None,
         "owner_win2_start": f.get(FIELD_TASK_OWNER_WIN2_START) or "",
@@ -1227,6 +1284,9 @@ def create_vendor_slot_task():
         w2s, w2e = _opt_window2(body, fields[FIELD_TASK_OWNER_WIN_END])
         if w2s:
             fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = w2s, w2e
+        comps = _clean_companions(body.get("companions"), case_no)
+        if comps:
+            fields[FIELD_TASK_COMPANIONS] = "、".join(comps)
         if duration_min is not None:
             fields[FIELD_TASK_DURATION_MIN] = duration_min
         deadline = _normalize_deadline(body.get("deadline"))
@@ -1303,6 +1363,7 @@ def update_vendor_slot_task(record_id):
     }
     w2s, w2e = _opt_window2(body, fields[FIELD_TASK_OWNER_WIN_END])
     fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = (w2s or None), (w2e or None)
+    fields[FIELD_TASK_COMPANIONS] = "、".join(_clean_companions(body.get("companions"), case_no)) or None
     if "deadline" in body:
         deadline = _normalize_deadline(body.get("deadline"))
         fields[FIELD_TASK_DEADLINE] = deadline
@@ -1562,7 +1623,7 @@ def book_vendor_slot_task(token):
     record, err = _book_vendor_slot(
         task["vendor"], date, body.get("start_time"), body.get("end_time"),
         task["case"], task["alias"], task["type"], body.get("registrant"), body.get("note"),
-        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"),
+        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
     )
     if err:
         err_body, status = err
@@ -1802,7 +1863,7 @@ def confirm_vendor_slot_chosen(token):
         task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"],
         task["case"], task["alias"], task["type"],
         (body.get("registrant") or task["assignee"] or "").strip(), body.get("note"),
-        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"),
+        owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
     )
     if err:
         err_body, status = err
@@ -2033,6 +2094,7 @@ def owner_booking_get(otoken):
         "window_start": ws, "window_end": we,
         "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
+        "companions": task.get("companions") or [],
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
         "address": _case_address(task["case"]),
@@ -2102,7 +2164,7 @@ def owner_booking_book(otoken):
     db_note = note + (("　" if note else "") + f"［預計施工 {_owner_multiday_label(task)}］" if _owner_date_only(task) else "")
     record, err = _book_vendor_slot(
         task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
-        f"屋主 {name}", db_note, owner_name=name, owner_phone=phone,
+        f"屋主 {name}", db_note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
     )
     if err:
         err_body, status = err
@@ -2206,7 +2268,7 @@ def owner_booking_confirm(otoken):
     note = (body.get("note") or "").strip()[:300]
     record, err = _book_vendor_slot(
         task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
-        task["type"], f"屋主 {name}", note, owner_name=name, owner_phone=phone,
+        task["type"], f"屋主 {name}", note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
     )
     if err:
         err_body, status = err
@@ -2364,6 +2426,7 @@ def _vendor_notice_card(rec):
     return _card(
         "📋 施工排程通知｜給廠商", "#2563EB", f"{case_no} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
         rows=[("廠商", f.get(FIELD_SLOT_VENDOR, "")), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])),
+              ("同時施作", f.get(FIELD_SLOT_COMPANIONS, "")),
               ("時間", _booking_time_text(f)),
               ("地址", address), ("座標", coords or ""),
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
@@ -10258,7 +10321,7 @@ def _vendor_batch_items(booking_ids):
             "time_text": tm, "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""), "types": "、".join(types),
             "address": address, "coords": coords or "", "owner_name": (f.get(FIELD_SLOT_OWNER_NAME) or "").strip(),
             "owner_phone": (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip(), "note": (f.get(FIELD_SLOT_NOTE) or "").strip(),
-            "pm_note": (f.get(FIELD_SLOT_PM_NOTE) or "").strip(), "fields": f,
+            "pm_note": (f.get(FIELD_SLOT_PM_NOTE) or "").strip(), "companions": (f.get(FIELD_SLOT_COMPANIONS) or "").strip(), "fields": f,
         })
     items.sort(key=lambda x: (x["date"], x["start"]))
     return items
@@ -10285,7 +10348,7 @@ def _vendor_batch_build(booking_ids, note=""):
         contents.append({"type": "text", "text": f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else ""),
                          "size": "sm", "wrap": True, "margin": "xs"})
         lines = [f"{head}", f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else "")]
-        for label, val in (("地址", it["address"]), ("屋主", _owner_str(it["owner_name"], it["owner_phone"])),
+        for label, val in (("同時施作", it["companions"]), ("地址", it["address"]), ("屋主", _owner_str(it["owner_name"], it["owner_phone"])),
                            ("現場備註", it["note"]), ("陽光備註", it["pm_note"])):
             if val:
                 contents.append({"type": "box", "layout": "baseline", "margin": "xs", "spacing": "sm", "contents": [
