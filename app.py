@@ -2076,6 +2076,27 @@ def _notify_owner_action(task, tag_scheduler, tag_rep, color, rows, note_rep="")
             task["assignee"], _card(tag_rep, color, title, rows=rows, note=note_rep))).start()
 
 
+def _norm_addr(a):
+    return "".join((a or "").split()).replace("臺", "台")
+
+
+def _owner_companion_addrs(task):
+    """屋主頁用：同時預約的案件如果「地址不同」才回傳那個地址（讓屋主知道一次會跑兩個地點）；
+    同一個地址（同個案場拆成兩案）不重複顯示，也不顯示案號等內部資訊。"""
+    comps = task.get("companions") or []
+    if not comps:
+        return []
+    main = _norm_addr(_case_address(task["case"]))
+    out, seen = [], {main}
+    for c in comps:
+        a = _case_address(c)
+        n = _norm_addr(a)
+        if a and n not in seen:
+            seen.add(n)
+            out.append(" ".join(a.split()))
+    return out
+
+
 @app.route("/api/owner-booking/<otoken>")
 def owner_booking_get(otoken):
     try:
@@ -2106,7 +2127,7 @@ def owner_booking_get(otoken):
         "window_start": ws, "window_end": we,
         "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
-        "companions": task.get("companions") or [],
+        "companion_addrs": _owner_companion_addrs(task),
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
         "address": _case_address(task["case"]),
