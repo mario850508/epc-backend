@@ -6830,6 +6830,10 @@ PDF_DEFAULT_DOC_TYPES = [
      "keywords": "再生能源發電設備購售電契約、購售電契約書、立契約書人、契約條款", "date_keys": "簽訂日期、簽約日期、中華民國"},
     {"name": "台電契約函", "category": "06", "milestone": "購售契約函文", "synonyms": "台電契約函文、購售契約函文",
      "keywords": "檢送、購售電契約、契約乙份"},
+    # 台電函「修訂貴我雙方簽訂之…購售契約…內容」（例如變更變流器型號後修訂契約附件），2026-10-12 使用者指定叫「範本修約」。
+    # 很少見、學習模型沒看過，所以主旨符合 subject_regex 就直接判定（比學習模型優先）
+    {"name": "範本修約", "category": "06", "milestone": "", "synonyms": "範本修約函、契約修訂",
+     "keywords": "修訂、修約、契約附件、責任分界圖面、內容如說明", "subject_regex": "修訂.{0,40}契約|契約.{0,20}修訂|修約"},
     {"name": "台電契約移轉", "category": "06", "milestone": "移轉契約", "synonyms": "",
      "keywords": "契約移轉、移轉、承受、過戶、轉讓"},
     {"name": "設備登記", "category": "06", "milestone": "設備登記", "synonyms": "設備登記函",
@@ -6954,6 +6958,9 @@ def _tw_now_iso():
     return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
+PDF_LATER_DOC_TYPES = {"範本修約"}   # 第一次存設定之後才加進預設的類型
+
+
 def _pdf_settings():
     if PDF_SETTINGS["data"] is None:
         data = dict(PDF_DEFAULT_SETTINGS)
@@ -6970,6 +6977,15 @@ def _pdf_settings():
                      "正式售電函", "竣工備查", "設備登記", "台電審訖圖", "電表租約", "第一張電費單"}
         if {t.get("name") for t in data.get("doc_types") or []} == old_names:
             data["doc_types"] = PDF_DEFAULT_DOC_TYPES
+        # 之後才加的新類型（例如範本修約）：存過的設定裡沒有就補上；記在 doc_types_added，使用者刪掉後不會再加回來
+        added = set(data.get("doc_types_added") or [])
+        have = {t.get("name") for t in data.get("doc_types") or []}
+        for t in PDF_DEFAULT_DOC_TYPES:
+            if t["name"] in PDF_LATER_DOC_TYPES and t["name"] not in added:
+                if t["name"] not in have:
+                    data["doc_types"] = list(data.get("doc_types") or []) + [dict(t)]
+                added.add(t["name"])
+        data["doc_types_added"] = sorted(added)
         # 存過的類型缺少新版預設才有的設定（例如審訖圖的印章日期）時補上，使用者改過的欄位不動
         defaults = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
         data["doc_types"] = [dict({k: v for k, v in defaults.get(t.get("name"), {}).items() if k not in t}, **t)
@@ -7954,7 +7970,17 @@ def _pdf_model_doc_type(flat, settings):
 
 
 def _pdf_rule_doc_type(flat, subject, settings):
-    """先用學習模型；沒有模型或判斷不出來時，用關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。"""
+    """先用學習模型；沒有模型或判斷不出來時，用關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。
+    類型設了 subject_regex（主旨規則）且主旨符合時直接判定，比學習模型優先（給少見、模型沒學過的類型用）。"""
+    for t in settings.get("doc_types") or []:
+        rx = (t.get("subject_regex") or "").strip()
+        if rx and subject and t.get("name"):
+            try:
+                m = re.search(rx, subject)
+            except re.error:
+                continue
+            if m:
+                return t["name"], 90, f"主旨有「{m.group(0)}」（{t['name']}的主旨規則）"
     learned = _pdf_model_doc_type(flat, settings)
     if learned:
         return learned
