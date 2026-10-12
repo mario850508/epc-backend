@@ -2935,17 +2935,22 @@ def site_survey_cancelled_sync():
             CASE_REP_CACHE.clear()
             CASE_REP_CACHE.update({c["case"].strip(): c["sales"].strip() for c in body["case_reps"]
                                    if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("sales") or "").strip()})
+        merge = bool(body.get("merge"))   # merge＝只加入／更新，不清空（大批資料分段推送用）
         if isinstance(body.get("case_addrs"), list):
-            CASE_ADDR_CACHE.clear()
+            if not merge:
+                CASE_ADDR_CACHE.clear()
             CASE_ADDR_CACHE.update({c["case"].strip(): c["addr"].strip() for c in body["case_addrs"]
                                     if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("addr") or "").strip()})
         if isinstance(body.get("plant_coords"), list):
-            BIZ_COORDS_CACHE.clear()
+            if not merge:
+                BIZ_COORDS_CACHE.clear()
             BIZ_COORDS_CACHE.update({c["case"].strip(): c["coords"].strip() for c in body["plant_coords"]
                                      if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("coords") or "").strip()})
         threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
         return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE),
                         "case_addrs_count": len(CASE_ADDR_CACHE), "plant_coords_count": len(BIZ_COORDS_CACHE)})
+    if "cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body:
+        return jsonify({"error": "沒有可處理的欄位（完整推送至少要帶 cancelled_case_numbers／certified_cases／owner_contacts 其中之一）"}), 400
     case_nos = body.get("cancelled_case_numbers") or []
     CANCELLED_CASE_CACHE["case_nos"] = {c for c in case_nos if c}
     CANCELLED_CASE_CACHE["updated_at"] = datetime.now().isoformat()
