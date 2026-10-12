@@ -982,7 +982,7 @@ def _send_cancel_to_scheduler(notice, task):
     creator = ((task or {}).get("creator") or "").strip()
     try:
         if creator:
-            return _push_to_name(creator, notice["sched_card"])
+            return any([_push_to_name(n, notice["sched_card"]) for n in _split_names(creator)])
         ok, _ = _line_push_card(notice["sched_card"])
         return ok
     except Exception as e:
@@ -1869,7 +1869,7 @@ def _notify_owner_action(task, tag_scheduler, tag_rep, color, rows, note_rep="")
     title = f"{task['case']} {task['alias']}".strip()
     _notify_scheduler_async(task["creator"], _card(tag_scheduler, color, title, rows=rows,
                                                    button=("開啟主控台", _dash_url() + "/")))
-    if task.get("assignee") and task["assignee"] != task.get("creator"):
+    if task.get("assignee") and task["assignee"] not in _split_names(task.get("creator")):
         threading.Thread(target=_push_to_name, daemon=True, args=(
             task["assignee"], _card(tag_rep, color, title, rows=rows, note=note_rep))).start()
 
@@ -2194,6 +2194,15 @@ def _rep_notice_card(rec):
     )
 
 
+def _vendor_forward_button(f):
+    """給廠商卡片的「📤 分享這張卡片」：廠商窗口可以再轉給自己的同事／群組（開 LIFF 分享頁，不會改動「廠商通知時間」）。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    tok = f.get(FIELD_SLOT_VENDOR_TOKEN)
+    if not liff_id or not tok:
+        return []
+    return [("📤 分享這張卡片", f"https://liff.line.me/{liff_id}?vshare={tok}~fwd")]
+
+
 def _vendor_notice_card(rec):
     f = rec.get("fields", {})
     case_no = f.get(FIELD_SLOT_CASE_NO, "")
@@ -2206,7 +2215,7 @@ def _vendor_notice_card(rec):
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
               ("陽光備註", (f.get(FIELD_SLOT_PM_NOTE) or "").strip())],
-        buttons=_vendor_card_buttons(f, address, coords),
+        buttons=_vendor_card_buttons(f, address, coords) + _vendor_forward_button(f),
     )
 
 
@@ -2578,6 +2587,8 @@ def _split_share_token(token):
         return token[:-4], "rep"
     if token.endswith("~own"):
         return token[:-4], "own"
+    if token.endswith("~fwd"):
+        return token[:-4], "fwd"
     return token, "vendor"
 
 
@@ -2603,13 +2614,13 @@ def vendor_share_get(token):
         return jsonify({"error": "找不到這則通知，可能已失效，請回主控台重新產生"}), 404
     card = _rep_notice_card(rec) if kind == "rep" else _vendor_notice_card(rec)
     return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": kind,
-                    "sent_at": "" if kind == "rep" else rec.get("fields", {}).get(FIELD_SLOT_VENDOR_NOTIFIED, "")})
+                    "sent_at": "" if kind in ("rep", "fwd") else rec.get("fields", {}).get(FIELD_SLOT_VENDOR_NOTIFIED, "")})
 
 
 @app.route("/api/vendor-share/<token>/sent", methods=["POST"])
 def vendor_share_sent(token):
     token, kind = _split_share_token(token)
-    if kind in ("rep", "own"):   # 通知業務／傳給屋主不記錄「已通知廠商」
+    if kind in ("rep", "own", "fwd"):   # 通知業務／傳給屋主／廠商轉分享不記錄「已通知廠商」
         return jsonify({"ok": True})
     try:
         rec = _find_booking_by_vendor_token(token)
@@ -5344,10 +5355,16 @@ def _list_scheduler_names():
     return sorted({(r["fields"].get(FIELD_BIND_NAME) or "").strip() for r in recs} - {""})
 
 
+def _split_names(s):
+    """安排人員可以複選，建立人欄位存成「A、B」；拆回名字清單。"""
+    import re as _re
+    return [x.strip() for x in _re.split(r"[、,，;；]+", s or "") if x.strip()]
+
+
 def _scheduler_summary(creator):
-    """這位安排人員名下任務的目前狀況，附在每則通知後面。"""
+    """這位安排人員名下任務的目前狀況，附在每則通知後面（任務的安排人員欄含這個名字就算）。"""
     esc = creator.replace("\\", "\\\\").replace("'", "\\'")
-    recs = airtable_get_all(TASK_API_URL, f"{{{FIELD_TASK_CREATOR}}}='{esc}'", [FIELD_TASK_STATUS, FIELD_TASK_STAGE])
+    recs = airtable_get_all(TASK_API_URL, f"FIND('{esc}',{{{FIELD_TASK_CREATOR}}})>0", [FIELD_TASK_STATUS, FIELD_TASK_STAGE])
     wait_rep = wait_pm = wait_confirm = done = 0
     for r in recs:
         f = r["fields"]
@@ -5365,8 +5382,14 @@ def _scheduler_summary(creator):
     )
 
 
-def _notify_scheduler(creator, headline):
-    """推播給安排人員（用名字對應「業務LINE綁定」表）。headline 可以是卡片（_card）或純文字。
+def _notify_scheduler(creators, headline):
+    """推播給安排人員（可多位，名字用「、」分隔）。任一位成功就回 True。"""
+    results = [_notify_scheduler_one(n, headline) for n in _split_names(creators)]
+    return any(results)
+
+
+def _notify_scheduler_one(creator, headline):
+    """推播給一位安排人員（用名字對應「業務LINE綁定」表）。headline 可以是卡片（_card）或純文字。
     沒綁定回 False。卡片會在底部附上「你名下的任務」狀態摘要。"""
     creator = (creator or "").strip()
     token, _ = _line_config()
@@ -5499,13 +5522,12 @@ def _send_day_before_reminders_impl():
                          buttons=[("📤 傳提醒給屋主", own_url)] if own_url else None)
         rep_ok = _push_to_name(rep_name, rep_card)
         sched_ok = False
-        if creator and creator != rep_name:
-            sched_ok = _push_to_name(
-                creator,
-                _card("📅 明天有行程｜給安排人員", "#7C3AED", title, rows=[("業務", rep_name)] + base_rows,
-                      note=(f"已通知業務 {rep_name}" if rep_ok else f"業務 {rep_name or '?'} 沒綁定 LINE，請你確認有提醒屋主"),
-                      button=("開啟主控台", _dash_url() + "/")),
-            )
+        sched_names = [n for n in _split_names(creator) if n != rep_name]
+        if sched_names:
+            sched_card = _card("📅 明天有行程｜給安排人員", "#7C3AED", title, rows=[("業務", rep_name)] + base_rows,
+                               note=(f"已通知業務 {rep_name}" if rep_ok else f"業務 {rep_name or '?'} 沒綁定 LINE，請你確認有提醒屋主"),
+                               button=("開啟主控台", _dash_url() + "/"))
+            sched_ok = any([_push_to_name(n, sched_card) for n in sched_names])
         ok = rep_ok or sched_ok
         if not ok:
             if not default_target:
