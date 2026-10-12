@@ -591,6 +591,8 @@ FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指�
 FIELD_TASK_OWNER_TOKEN = "fldEAVpfdwAot2wmx"      # 屋主Token
 FIELD_TASK_OWNER_WIN_START = "fldcshgkAyg8iA1mV"  # 屋主可選時段開始 HH:MM（預設 09:00）
 FIELD_TASK_OWNER_WIN_END = "fldZM3kKE3GWpyvvK"    # 屋主可選時段結束 HH:MM（預設 17:00，作業要在這之前結束）
+FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝一般任務）
+FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
@@ -1106,7 +1108,7 @@ def _task_fields():
         FIELD_TASK_STAGE, FIELD_TASK_ALT_SLOTS, FIELD_TASK_CHOSEN_SLOT, FIELD_TASK_REP_NOTE,
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
-        FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END,
+        FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
     ]
 
 
@@ -1159,6 +1161,8 @@ def _task_to_dict(r):
         "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
         "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
         "owner_win_end": f.get(FIELD_TASK_OWNER_WIN_END) or "",
+        "group_id": f.get(FIELD_TASK_GROUP_ID) or "",
+        "owner_reply": _json_or_default(f.get(FIELD_TASK_OWNER_REPLY), {}) or None,
         "owner_win2_start": f.get(FIELD_TASK_OWNER_WIN2_START) or "",
         "owner_win2_end": f.get(FIELD_TASK_OWNER_WIN2_END) or "",
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
@@ -2053,6 +2057,15 @@ def owner_booking_get(otoken):
             out["busy_slots"] = _vendor_busy_slots(task["vendor"])
         except Exception as e:
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
+    if task.get("group_id"):
+        g = _get_group(task["group_id"])
+        if g:
+            out["group"] = _owner_group_info(task, g)
+            out["duration_min"] = g["duration_min"]
+            if g["status"] == GS_CANCEL:
+                out["status"] = "cancelled"
+            elif out["status"] == "open":
+                out["status"] = "g_replied" if task.get("owner_reply") else "g_open"
     return jsonify(out)
 
 
@@ -2069,6 +2082,8 @@ def owner_booking_book(otoken):
         return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
     if task["status"] == TASK_STATUS_DONE:
         return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
+    if task.get("group_id"):
+        return jsonify({"error": "這是聯合排程，請先回覆您方便的時段，我們排好後會再請您確認時間"}), 400
     body = request.get_json(force=True) or {}
     date = (body.get("date") or "").strip()
     if date not in task["candidate_dates"]:
@@ -2151,6 +2166,11 @@ def owner_booking_propose(otoken):
         })
     except Exception as e:
         return jsonify({"error": "送出失敗，請稍後再試", "detail": str(e)}), 502
+    if task.get("group_id"):
+        try:
+            _patch_group(task["group_id"], {G_STATUS: GS_PLAN})
+        except Exception as e:
+            print(f"[owner_booking_propose] 更新聯合排程狀態失敗：{e}", flush=True)
     slot_lines = "\n".join(f"{i + 1}. {_wd_label(sl['date'])}" for i, sl in enumerate(slots))
     _notify_owner_action(
         task, "🏠 屋主提供其他日期｜給安排人員", "🏠 屋主提供其他日期｜給業務", "#D97706",
@@ -2179,6 +2199,8 @@ def owner_booking_confirm(otoken):
         return jsonify({"error": "目前還沒有需要確認的時間"}), 409
     body = request.get_json(force=True) or {}
     name, phone, err_msg = _owner_contact(body)
+    if err_msg and task.get("group_id") and task.get("owner_name") and task.get("owner_phone"):
+        name, phone, err_msg = task["owner_name"], task["owner_phone"], None   # 聯合排程：回覆時已填過
     if err_msg:
         return jsonify({"error": err_msg}), 400
     note = (body.get("note") or "").strip()[:300]
@@ -2196,12 +2218,15 @@ def owner_booking_confirm(otoken):
     except Exception as e:
         print(f"[owner_booking_confirm] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
     _notify_owner_action(
-        task, "🏠 屋主已確認時間｜給安排人員", "🏠 屋主已確認時間｜給業務", "#16A34A",
+        {**task, "creator": ""} if task.get("group_id") else task,   # 聯合排程的進度通知另外發（_joint_after_confirm）
+        "🏠 屋主已確認時間｜給安排人員", "🏠 屋主已確認時間｜給業務", "#16A34A",
         [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
          ("時間", _owner_time_text(task, chosen['date'], chosen['start_time'], chosen['end_time'])),
          ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
         note_rep="屋主已確認時間，前一天請記得再跟屋主確認",
     )
+    if task.get("group_id"):
+        threading.Thread(target=_joint_after_confirm, args=(task,), daemon=True).start()
     return jsonify({"ok": True, "booked": chosen})
 
 
@@ -2718,6 +2743,8 @@ def _split_share_token(token):
         return token[:-4], "own"
     if token.endswith("~fwd"):
         return token[:-4], "fwd"
+    if token.endswith("~card"):
+        return token[:-5], "card"
     return token, "vendor"
 
 
@@ -2728,6 +2755,21 @@ def vendor_share_get(token):
         data = _reminder_token_parse(token)
         if not data:
             return jsonify({"error": "這則提醒已失效，請回主控台重新產生"}), 404
+        if data.get("tid"):   # 聯合排程：邀請訊息（文字）／確認卡
+            tr = _get_task_by_record_id(data["tid"])
+            if not tr:
+                return jsonify({"error": "找不到這個案件"}), 404
+            t = _task_to_dict(tr)
+            g = _get_group(t["group_id"]) if t["group_id"] else None
+            if not g:
+                return jsonify({"error": "找不到這個聯合排程"}), 404
+            if data.get("m") == "gconfirm":
+                if not t.get("chosen_slot"):
+                    return jsonify({"error": "這案還沒有排好的時間"}), 404
+                card = _joint_owner_card(t, t["chosen_slot"])
+                return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "card", "sent_at": ""})
+            return jsonify({"kind": "own", "mode": "ginvite", "text": _joint_invite_text(g, t),
+                            "title": f"{t['case']} {t['alias']}".strip(), "sent_at": ""})
         b = _case_brief(data.get("c"))
         if kind == "own":   # 要傳給屋主的文字訊息
             fn = _owner_confirm_msg if data.get("m") == "confirm" else _reminder_owner_msg
@@ -2749,7 +2791,7 @@ def vendor_share_get(token):
 @app.route("/api/vendor-share/<token>/sent", methods=["POST"])
 def vendor_share_sent(token):
     token, kind = _split_share_token(token)
-    if kind in ("rep", "own", "fwd"):   # 通知業務／傳給屋主／廠商轉分享不記錄「已通知廠商」
+    if kind in ("rep", "own", "fwd", "card"):   # 通知業務／傳給屋主／廠商轉分享不記錄「已通知廠商」
         return jsonify({"ok": True})
     try:
         rec = _find_booking_by_vendor_token(token)
@@ -5439,6 +5481,8 @@ def send_deadline_reminders():
             continue
         if f.get(FIELD_TASK_STATUS, TASK_STATUS_PENDING) != TASK_STATUS_PENDING:
             continue
+        if f.get(FIELD_TASK_GROUP_ID) and f.get(FIELD_TASK_OWNER_REPLY):
+            continue   # 聯合排程：屋主已經回覆了
         # 待窗口確認＝業務已經回傳備選時段，球在窗口手上，不用催業務
         if f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_PM:
             continue
@@ -9509,6 +9553,607 @@ def debug_find_milestone():
         [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE],
     )
     return jsonify({"count": len(recs), "records": [{"id": r["id"], "actual_date": r["fields"].get(FIELD_MS_ACTUAL_DATE)} for r in recs]})
+
+
+# ===================================================================
+# 2026-10-12：聯合排程（把同廠商、同項目的幾個案件綁在一起，約同一天做完）
+# 流程：窗口建立聯合排程（案件、第一／第二期望日與時段）→ 每案屋主點自己的連結，回覆「這天哪個時段方便」
+# （全天／上午／下午，第一期望不行看第二期望，都不行自己提供日期）→ 全部回覆後機器人通知窗口 →
+# 主控台自動排出一版行程，窗口調整後確認 → 機器人把每案的「確認卡」給窗口（附 📤 傳給屋主）→
+# 屋主在卡片按「確認時間沒問題」→ 才真正成立預約（沿用屋主版的確認流程）。
+# 資料：聯合排程表（一組一筆）＋ 任務表（每案一筆，聯合排程ID 指回來、屋主回覆JSON 存屋主的回覆）。
+# ===================================================================
+GROUP_TABLE_ID = "tblmEeI9Xae1PMn8N"
+GROUP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{GROUP_TABLE_ID}"
+G_TITLE = "flduy0t9sEeit6pdO"
+G_VENDOR = "fld7APm4TO6wQeGS8"
+G_ITEMS = "fld1kNejOCP51YNGv"
+G_PREFS = "fldTQ3BoqX7KCVWS3"
+G_DUR = "fldxbgwQM53UM0vmy"
+G_GAP = "fldhozNmb7zai9pAd"
+G_STATUS = "fld6Q4Z3Xtr0qMvko"
+G_PLAN = "fldujQFzj3m6Ey3VX"
+G_CREATORS = "fldX4RUydXVN7kIw9"
+G_DEADLINE = "fldV7JeGKF8mU4gCv"
+G_NOTE = "fldiTBXZUQxD7t7KE"
+G_N_REPLIED = "fldT228xId3cfTa5t"
+G_N_CONFIRMED = "fldJVOzZAj7PYnmla"
+G_FIELDS = [G_TITLE, G_VENDOR, G_ITEMS, G_PREFS, G_DUR, G_GAP, G_STATUS, G_PLAN, G_CREATORS, G_DEADLINE, G_NOTE,
+            G_N_REPLIED, G_N_CONFIRMED]
+GS_COLLECT, GS_PLAN, GS_WAIT_OWNERS, GS_DONE, GS_CANCEL = "收集中", "待排程", "待屋主確認", "已完成", "已取消"
+AVAIL_LABEL = {"all": "全天", "am": "上午", "pm": "下午"}
+
+
+def _g_mins(wins):
+    out = []
+    for a, b in wins or []:
+        try:
+            out.append((_parse_hhmm(a), _parse_hhmm(b)))
+        except Exception:
+            pass
+    return [w for w in out if w[1] > w[0]]
+
+
+def _g_fmt(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _g_wins_text(wins):
+    return "、".join(f"{_g_fmt(a)}–{_g_fmt(b)}" for a, b in wins)
+
+
+def _group_to_dict(rec):
+    f = rec["fields"]
+    prefs = []
+    for p in _json_or_default(f.get(G_PREFS), []):
+        if not isinstance(p, dict) or not p.get("date"):
+            continue
+        wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
+        prefs.append({"date": p["date"], "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
+    return {
+        "id": rec["id"], "title": f.get(G_TITLE, ""), "vendor": f.get(G_VENDOR, ""),
+        "type": [t for t in (f.get(G_ITEMS) or "").split("、") if t],
+        "prefs": prefs, "duration_min": int(f.get(G_DUR) or 60), "gap_min": int(f.get(G_GAP) if f.get(G_GAP) is not None else 30),
+        "status": f.get(G_STATUS) or GS_COLLECT, "plan": _json_or_default(f.get(G_PLAN), {}) or None,
+        "creators": f.get(G_CREATORS, ""), "deadline": f.get(G_DEADLINE, ""), "note": f.get(G_NOTE, ""),
+        "notified_replied": bool(f.get(G_N_REPLIED)), "notified_confirmed": bool(f.get(G_N_CONFIRMED)),
+    }
+
+
+def _get_group(group_id):
+    resp = requests.get(f"{GROUP_API_URL}/{group_id}", headers=airtable_headers(),
+                        params={"returnFieldsByFieldId": "true"}, timeout=20)
+    return _group_to_dict(resp.json()) if resp.status_code < 400 else None
+
+
+def _patch_group(group_id, fields):
+    resp = requests.patch(f"{GROUP_API_URL}/{group_id}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if resp.status_code >= 400:
+        raise RuntimeError(resp.text)
+
+
+def _group_tasks(group_id):
+    recs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_GROUP_ID + "}='" + group_id + "'", _task_fields())
+    tasks = [_task_to_dict(r) for r in recs]
+    tasks.sort(key=lambda t: t["case"])
+    return tasks
+
+
+def _g_vendor_wins(prefs, date):
+    for p in prefs:
+        if p["date"] == date:
+            return _g_mins(p["windows"])
+    return _g_mins(prefs[0]["windows"]) if prefs else [(540, 1020)]
+
+
+def _g_avail_intervals(wins, avail):
+    if avail == "am":
+        lo, hi = 0, 720
+    elif avail == "pm":
+        lo, hi = 720, 1440
+    else:
+        return list(wins)
+    return [(max(a, lo), min(b, hi)) for a, b in wins if min(b, hi) - max(a, lo) > 0]
+
+
+def _g_owner_intervals(prefs, reply, date):
+    """屋主在某一天方便的時段（分鐘區間，已排序合併）。沒回覆或那天不方便＝空。"""
+    out = []
+    if not reply:
+        return out
+    p = reply.get("pref")
+    if isinstance(p, int) and 1 <= p <= len(prefs) and prefs[p - 1]["date"] == date:
+        out += _g_avail_intervals(_g_mins(prefs[p - 1]["windows"]), reply.get("avail") or "all")
+    for c in reply.get("custom") or []:
+        if c.get("date") == date:
+            out += _g_avail_intervals(_g_vendor_wins(prefs, date), c.get("avail") or "all")
+    out.sort()
+    merged = []
+    for a, b in out:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _g_reply_text(prefs, reply):
+    if not reply:
+        return "尚未回覆"
+    parts = []
+    p = reply.get("pref")
+    if isinstance(p, int) and 1 <= p <= len(prefs):
+        parts.append(f"第{['一', '二', '三', '四'][p - 1]}期望 {_wd_label(prefs[p - 1]['date'])} {AVAIL_LABEL.get(reply.get('avail') or 'all', '全天')}可以")
+    cu = reply.get("custom") or []
+    if cu:
+        parts.append("自訂：" + "、".join(f"{_wd_label(c['date'])}{AVAIL_LABEL.get(c.get('avail') or 'all', '全天')}" for c in cu))
+    return "；".join(parts) or "兩個期望日都不行"
+
+
+def _g_plan_for_date(group, tasks, date):
+    prefs, dur, gap = group["prefs"], group["duration_min"], group["gap_min"]
+    vwins = _g_vendor_wins(prefs, date)
+    rows = []
+    for t in tasks:
+        iv = _g_owner_intervals(prefs, t.get("owner_reply"), date)
+        # 只留「做得完」的時段（也要在廠商當天可作業時段內）
+        iv2 = []
+        for a, b in iv:
+            for va, vb in vwins:
+                lo, hi = max(a, va), min(b, vb)
+                if hi - lo >= dur:
+                    iv2.append((lo, hi))
+        rows.append((t, iv2))
+    order = sorted(rows, key=lambda r: (sum(b - a for a, b in r[1]) or 10 ** 6))
+    occupied, placed, unplaced = [], [], []
+    for t, iv in order:
+        if not t.get("owner_reply"):
+            unplaced.append({"task_id": t["record_id"], "case": t["case"], "reason": "屋主還沒回覆"})
+            continue
+        if not iv:
+            unplaced.append({"task_id": t["record_id"], "case": t["case"], "reason": "屋主這天不方便"})
+            continue
+        got = None
+        for a, b in iv:
+            s = ((a + 29) // 30) * 30
+            while s + dur <= b:
+                if not any(s < oe + gap and os_ < s + dur + gap for os_, oe in occupied):
+                    got = s
+                    break
+                s += 30
+            if got is not None:
+                break
+        if got is None:
+            unplaced.append({"task_id": t["record_id"], "case": t["case"], "reason": "排不進（時間被其他案占滿）"})
+            continue
+        occupied.append((got, got + dur))
+        placed.append({"task_id": t["record_id"], "case": t["case"], "alias": t["alias"],
+                       "start": _g_fmt(got), "end": _g_fmt(got + dur)})
+    placed.sort(key=lambda x: x["start"])
+    return {"date": date, "items": placed, "unplaced": unplaced}
+
+
+def _group_candidate_dates(group, tasks):
+    out = [p["date"] for p in group["prefs"]]
+    extra = set()
+    for t in tasks:
+        for c in (t.get("owner_reply") or {}).get("custom") or []:
+            if c.get("date") and c["date"] not in out:
+                extra.add(c["date"])
+    return out + sorted(extra)
+
+
+def _group_plan(group, tasks, date=None):
+    cands = _group_candidate_dates(group, tasks)
+    plans = [_g_plan_for_date(group, tasks, d) for d in cands]
+    best = max(range(len(plans)), key=lambda i: (len(plans[i]["items"]), -i)) if plans else None
+    pick = next((p for p in plans if p["date"] == date), None) if date else (plans[best] if best is not None else None)
+    return {"candidates": [{"date": p["date"], "placed": len(p["items"]), "total": len(tasks)} for p in plans],
+            "plan": pick}
+
+
+def _task_owner_link(task):
+    return f"{_dash_url()}/owner.html?t={task['owner_token']}"
+
+
+def _task_share_url(task_id, mode, suffix):
+    """LINE 卡片按鈕用：開 LIFF 分享頁（簽章 token，45 天有效）。mode＝ginvite（邀請訊息，文字）／gconfirm（確認卡）。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id:
+        return ""
+    token = _reminder_token_make({"tid": task_id, "m": mode, "x": int(time.time()) + 45 * 86400})
+    return f"https://liff.line.me/{liff_id}?vshare={token}~{suffix}"
+
+
+def _joint_invite_text(group, task):
+    dates = "、".join(_wd_label(p["date"]) for p in group["prefs"])
+    items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in group["type"])
+    return (f"{(task.get('owner_name') or '屋主')} 您好，我們要為您安排「{items}」。廠商預計在 {dates} 到現場，"
+            f"想先請您點下面的連結，告訴我們這幾天哪些時段您方便（我們會把同一區的案子排在同一天，排好後再請您確認時間）：\n"
+            f"{_task_owner_link(task)}\n—陽光伏特家")
+
+
+def _joint_owner_card(task, slot):
+    """傳給屋主的「確認時間」卡：按「確認時間沒問題」開屋主頁的確認畫面。不放廠商／業務等內部資訊，只有地址。"""
+    link = _task_owner_link(task)
+    items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in task["type"])
+    return _card(
+        "🗓️ 施工時間確認｜陽光伏特家", "#16A34A", f"{task['case']} {task['alias']}".strip(),
+        rows=[("項目", items), ("時間", f"{_wd_label(slot['date'])} {slot['start_time']}–{slot['end_time']}"),
+              ("地址", _case_address(task["case"]))],
+        note="我們依您回覆的時段幫您安排了這個時間，請確認是否可以配合。",
+        buttons=[("✅ 確認時間沒問題", link + "&go=confirm"), ("這個時間不方便", link + "&go=alt")],
+    )
+
+
+def _joint_notify(group, card):
+    return _notify_scheduler(group["creators"], card) if group["creators"] else False
+
+
+def _joint_counts(tasks):
+    n = len(tasks)
+    replied = sum(1 for t in tasks if t.get("owner_reply") or t["status"] == TASK_STATUS_DONE)
+    confirmed = sum(1 for t in tasks if t["status"] == TASK_STATUS_DONE)
+    return n, replied, confirmed
+
+
+def _joint_after_reply(task):
+    """屋主回覆後：通知安排人員進度；全員回覆就改成「待排程」並請窗口排程。"""
+    group = _get_group(task["group_id"])
+    if not group or group["status"] in (GS_CANCEL, GS_DONE):
+        return
+    tasks = _group_tasks(group["id"])
+    n, replied, _ = _joint_counts(tasks)
+    reply = next((t for t in tasks if t["record_id"] == task["record_id"]), task).get("owner_reply")
+    open_url = f"{_dash_url()}/#joint={group['id']}"
+    if replied >= n and not group["notified_replied"]:
+        try:
+            _patch_group(group["id"], {G_STATUS: GS_PLAN, G_N_REPLIED: True})
+        except Exception as e:
+            print(f"[_joint_after_reply] 更新狀態失敗：{e}", flush=True)
+        _joint_notify(group, _card(
+            "🧩 聯合排程｜屋主都回覆了", "#7C3AED", group["title"], subtitle=f"{n} 位屋主都已回覆方便的時段",
+            rows=[(t["case"], _g_reply_text(group["prefs"], t.get("owner_reply"))) for t in tasks],
+            note="請到主控台排程：系統已先排出一版，調整後按確認，就能產生給屋主的確認卡",
+            button=("開啟排程", open_url)))
+    else:
+        _joint_notify(group, _card(
+            f"🧩 聯合排程｜屋主已回覆（{replied}/{n}）", "#7C3AED", f"{task['case']} {task['alias']}".strip(),
+            rows=[("回覆", _g_reply_text(group["prefs"], reply)), ("屋主", _owner_str(task["owner_name"], task["owner_phone"])),
+                  ("聯合排程", group["title"])],
+            button=("開啟主控台", open_url)))
+
+
+def _joint_after_confirm(task):
+    """屋主按了確認（預約已成立）：通知安排人員進度；全部確認就標記完成。"""
+    if not task.get("group_id"):
+        return
+    group = _get_group(task["group_id"])
+    if not group:
+        return
+    tasks = _group_tasks(group["id"])
+    for t in tasks:
+        if t["record_id"] == task["record_id"]:
+            t["status"] = TASK_STATUS_DONE   # 剛寫入，查詢可能還沒反映
+    n, _, confirmed = _joint_counts(tasks)
+    if confirmed >= n and not group["notified_confirmed"]:
+        try:
+            _patch_group(group["id"], {G_STATUS: GS_DONE, G_N_CONFIRMED: True})
+        except Exception as e:
+            print(f"[_joint_after_confirm] 更新狀態失敗：{e}", flush=True)
+        plan = {i["task_id"]: i for i in ((group.get("plan") or {}).get("items") or [])}
+        rows = [(t["case"], (lambda s: f"{s['start']}–{s['end']}" if s else "")(plan.get(t["record_id"]))) for t in tasks]
+        _joint_notify(group, _card("🎉 聯合排程完成｜全部屋主都確認了", "#16A34A", group["title"],
+                                   subtitle=_wd_label((group.get("plan") or {}).get("date", "")) if group.get("plan") else "",
+                                   rows=rows, button=("開啟主控台", f"{_dash_url()}/")))
+    else:
+        _joint_notify(group, _card(
+            f"🧩 聯合排程｜屋主已確認（{confirmed}/{n}）", "#16A34A", f"{task['case']} {task['alias']}".strip(),
+            rows=[("聯合排程", group["title"])], button=("開啟主控台", f"{_dash_url()}/#joint={group['id']}")))
+
+
+def _joint_task_status(group, t):
+    if t["status"] == TASK_STATUS_DONE:
+        return "已確認"
+    if t["status"] == TASK_STATUS_CANCELLED:
+        return "已取消"
+    if t["stage"] == TASK_STAGE_WAIT_PM:
+        return "屋主不方便，提供了其他日期"
+    if t["stage"] == TASK_STAGE_WAIT_REP and t.get("chosen_slot"):
+        return "已排時間，等屋主確認"
+    return "已回覆" if t.get("owner_reply") else "等屋主回覆"
+
+
+def _joint_view(group, tasks):
+    out = dict(group)
+    out["tasks"] = [{
+        "task_id": t["record_id"], "case": t["case"], "alias": t["alias"], "assignee": t["assignee"],
+        "owner_name": t["owner_name"], "owner_phone": t["owner_phone"],
+        "status_text": _joint_task_status(group, t), "reply": t.get("owner_reply"),
+        "reply_text": _g_reply_text(group["prefs"], t.get("owner_reply")), "chosen_slot": t.get("chosen_slot"),
+        "alt_slots": t["alt_slots"] if t["stage"] == TASK_STAGE_WAIT_PM else [],
+        "owner_link": _task_owner_link(t) if t["owner_token"] else "",
+        "invite_share_url": _task_share_url(t["record_id"], "ginvite", "own"),
+        "invite_text": _joint_invite_text(group, t),
+        "confirm_share_url": _task_share_url(t["record_id"], "gconfirm", "card") if t.get("chosen_slot") else "",
+        "done": t["status"] == TASK_STATUS_DONE,
+    } for t in tasks]
+    n, replied, confirmed = _joint_counts(tasks)
+    out["counts"] = {"total": n, "replied": replied, "confirmed": confirmed}
+    return out
+
+
+@app.route("/api/joint-schedules", methods=["GET"])
+def joint_list():
+    try:
+        grecs = airtable_get_all(GROUP_API_URL, "TRUE()", G_FIELDS)
+        trecs = airtable_get_all(TASK_API_URL, "NOT({" + FIELD_TASK_GROUP_ID + "}='')", _task_fields())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    by = {}
+    for r in trecs:
+        t = _task_to_dict(r)
+        by.setdefault(t["group_id"], []).append(t)
+    groups = []
+    for r in grecs:
+        g = _group_to_dict(r)
+        ts = by.get(g["id"], [])
+        n, replied, confirmed = _joint_counts(ts)
+        g["counts"] = {"total": n, "replied": replied, "confirmed": confirmed}
+        g["cases"] = [t["case"] for t in sorted(ts, key=lambda x: x["case"])]
+        groups.append(g)
+    groups.sort(key=lambda g: (g["status"] in (GS_DONE, GS_CANCEL), g["title"]))
+    return jsonify({"groups": groups})
+
+
+@app.route("/api/joint-schedules", methods=["POST"])
+def joint_create():
+    """建立聯合排程。body: {vendor, type:[...], cases:[案號...], prefs:[{date, windows:[[a,b],...]}...（1～4 個期望日）],
+    duration_min, gap_min, creator, deadline, note}"""
+    body = request.get_json(force=True) or {}
+    vendor = (body.get("vendor") or "").strip()
+    types = _normalize_type_list(body.get("type"))
+    cases = []
+    for c in body.get("cases") or []:
+        c = (c or "").strip()
+        if c and c not in cases:
+            cases.append(c)
+    prefs_in = []
+    for p in (body.get("prefs") or [])[:4]:
+        try:
+            datetime.strptime((p.get("date") or ""), "%Y-%m-%d")
+        except Exception:
+            continue
+        wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
+        prefs_in.append({"date": p["date"], "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
+    if not vendor or not types or len(cases) < 2 or not prefs_in:
+        return jsonify({"error": "請選廠商、項目，至少兩個案件，並至少設定第一期望日"}), 400
+    try:
+        dur = int(body.get("duration_min") or 0) or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in types) or 60
+        gap = int(body.get("gap_min") if body.get("gap_min") is not None else 30)
+    except (TypeError, ValueError):
+        dur, gap = 60, 30
+    creator = body.get("creator")
+    if isinstance(creator, list):
+        creator = "、".join(str(x).strip() for x in creator if str(x).strip())
+    creator = (creator or "").strip()
+    deadline = _normalize_deadline(body.get("deadline"))
+    title = f"{vendor} {'/'.join(types)} 聯合排程（{len(cases)}案）"
+    try:
+        gresp = requests.post(GROUP_API_URL, headers=airtable_headers(), timeout=20, json={"fields": {
+            G_TITLE: title, G_VENDOR: vendor, G_ITEMS: "、".join(types),
+            G_PREFS: json.dumps(prefs_in, ensure_ascii=False), G_DUR: dur, G_GAP: gap, G_STATUS: GS_COLLECT,
+            G_CREATORS: creator, G_DEADLINE: deadline or "", G_NOTE: (body.get("note") or "").strip()}})
+        if gresp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": gresp.text}), 502
+        gid = gresp.json()["id"]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    failed = []
+    for case_no in cases:
+        try:
+            b = _case_brief(case_no)
+            fields = {
+                FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(types)} 聯合排程", FIELD_TASK_VENDOR: vendor,
+                FIELD_TASK_CASE_NO: case_no, FIELD_TASK_ALIAS: b.get("alias") or "", FIELD_TASK_TYPE: types,
+                FIELD_TASK_CANDIDATE_DATES: ",".join(p["date"] for p in prefs_in),
+                FIELD_TASK_ASSIGNEE: _canon_rep(b.get("rep_name") or ""), FIELD_TASK_STATUS: TASK_STATUS_PENDING,
+                FIELD_TASK_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_CREATOR: creator,
+                FIELD_TASK_OWNER_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_OWNER_MODE: True,
+                FIELD_TASK_DURATION_MIN: dur, FIELD_TASK_GROUP_ID: gid,
+                FIELD_TASK_OWNER_WIN_START: "09:00", FIELD_TASK_OWNER_WIN_END: "17:00",
+            }
+            if b.get("owner_name"):
+                fields[FIELD_TASK_OWNER_NAME] = b["owner_name"]
+            if b.get("owner_phone"):
+                fields[FIELD_TASK_OWNER_PHONE] = b["owner_phone"]
+            if deadline:
+                fields[FIELD_TASK_DEADLINE] = deadline
+            r = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+            if r.status_code >= 400:
+                failed.append(case_no)
+        except Exception as e:
+            print(f"[joint_create] 建立 {case_no} 任務失敗：{e}", flush=True)
+            failed.append(case_no)
+    group = _get_group(gid)
+    return jsonify({"ok": True, "failed": failed, "joint": _joint_view(group, _group_tasks(gid))})
+
+
+@app.route("/api/joint-schedules/<gid>", methods=["GET"])
+def joint_get(gid):
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    tasks = _group_tasks(gid)
+    out = _joint_view(group, tasks)
+    if group["status"] in (GS_PLAN, GS_WAIT_OWNERS, GS_COLLECT):
+        out["suggest"] = _group_plan(group, tasks, request.args.get("date") or None)
+    return jsonify(out)
+
+
+@app.route("/api/joint-schedules/<gid>/plan", methods=["POST"])
+def joint_replan(gid):
+    """依屋主回覆自動排一版（可指定日期）。body: {date}"""
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    body = request.get_json(force=True) or {}
+    return jsonify(_group_plan(group, _group_tasks(gid), (body.get("date") or "").strip() or None))
+
+
+@app.route("/api/joint-schedules/<gid>/confirm", methods=["POST"])
+def joint_confirm(gid):
+    """窗口確認行程。body: {date, items:[{task_id, start, end}]}。
+    每案設成「已選定時間、等屋主確認」，並把確認卡（附 📤 傳給屋主）用機器人給安排人員。屋主按確認才成立預約。"""
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    if group["status"] in (GS_CANCEL, GS_DONE):
+        return jsonify({"error": "這個聯合排程已經結束了"}), 409
+    body = request.get_json(force=True) or {}
+    date = (body.get("date") or "").strip()
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except Exception:
+        return jsonify({"error": "日期格式不對"}), 400
+    tasks = {t["record_id"]: t for t in _group_tasks(gid)}
+    items = []
+    for it in body.get("items") or []:
+        t = tasks.get(it.get("task_id"))
+        if not t or t["status"] == TASK_STATUS_DONE:
+            continue
+        try:
+            s, e = _parse_hhmm(it.get("start")), _parse_hhmm(it.get("end"))
+        except Exception:
+            return jsonify({"error": f"{t['case']} 的時間格式不對"}), 400
+        if e <= s:
+            return jsonify({"error": f"{t['case']} 的結束時間要晚於開始時間"}), 400
+        items.append({"task_id": t["record_id"], "case": t["case"], "alias": t["alias"], "start": _g_fmt(s), "end": _g_fmt(e)})
+    if not items:
+        return jsonify({"error": "沒有可確認的案件"}), 400
+    items.sort(key=lambda x: x["start"])
+    for i in range(len(items) - 1):
+        if items[i]["end"] > items[i + 1]["start"]:
+            return jsonify({"error": f"{items[i]['case']} 和 {items[i + 1]['case']} 的時間重疊了"}), 400
+    for it in items:   # 廠商當天已有的預約
+        try:
+            c = _find_slot_conflict(group["vendor"], date, it["start"], it["end"])
+        except Exception as e:
+            return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+        if c:
+            return jsonify({"error": f"{it['case']} {it['start']}–{it['end']} 跟廠商已有的預約（{c['case']} {c['start_time']}–{c['end_time']}）重疊"}), 409
+    for it in items:
+        t = tasks[it["task_id"]]
+        slot = {"date": date, "start_time": it["start"], "end_time": it["end"]}
+        try:
+            _patch_task(t["record_id"], {FIELD_TASK_CHOSEN_SLOT: json.dumps(slot, ensure_ascii=False),
+                                         FIELD_TASK_STAGE: TASK_STAGE_WAIT_REP, FIELD_TASK_ALT_SLOTS: ""})
+        except Exception as e:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+        t["chosen_slot"], t["stage"] = slot, TASK_STAGE_WAIT_REP
+    try:
+        _patch_group(gid, {G_STATUS: GS_WAIT_OWNERS, G_PLAN: json.dumps({"date": date, "items": items}, ensure_ascii=False)})
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    # 機器人：每案一張確認卡給安排人員（附「傳給屋主」）
+    for it in items:
+        t = tasks[it["task_id"]]
+        slot = t["chosen_slot"]
+        url = _task_share_url(t["record_id"], "gconfirm", "card")
+        _joint_notify(group, _card(
+            "🗓️ 聯合排程｜給屋主的確認卡", "#16A34A", f"{t['case']} {t['alias']}".strip(),
+            subtitle=f"{_wd_label(date)} {slot['start_time']}–{slot['end_time']}",
+            rows=[("屋主", _owner_str(t["owner_name"], t["owner_phone"])), ("聯合排程", group["title"])],
+            note="請把確認卡傳給屋主：屋主按「確認時間沒問題」，預約就成立，系統會通知你",
+            buttons=([("📤 傳確認卡給屋主", url)] if url else []) + [("👀 預覽屋主畫面", _task_owner_link(t))]))
+    group = _get_group(gid)
+    return jsonify({"ok": True, "joint": _joint_view(group, list(tasks.values()))})
+
+
+@app.route("/api/joint-schedules/<gid>/cancel", methods=["POST"])
+def joint_cancel(gid):
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    for t in _group_tasks(gid):
+        if t["status"] != TASK_STATUS_DONE:
+            try:
+                _patch_task(t["record_id"], {FIELD_TASK_STATUS: TASK_STATUS_CANCELLED})
+            except Exception as e:
+                print(f"[joint_cancel] 取消任務失敗：{e}", flush=True)
+    try:
+        _patch_group(gid, {G_STATUS: GS_CANCEL})
+    except Exception as e:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+    return jsonify({"ok": True})
+
+
+def _owner_group_info(task, group):
+    prefs = []
+    for p in group["prefs"]:
+        wins = _g_mins(p["windows"])
+        parts = {"all": _g_wins_text(wins)}
+        for k in ("am", "pm"):
+            iv = _g_avail_intervals(wins, k)
+            if iv:
+                parts[k] = _g_wins_text(iv)
+        prefs.append({"date": p["date"], "parts": parts})
+    reply = task.get("owner_reply")
+    return {"id": group["id"], "status": group["status"], "prefs": prefs, "duration_min": group["duration_min"],
+            "reply": reply, "reply_text": _g_reply_text(group["prefs"], reply),
+            "contact": {"name": (reply or {}).get("name") or task["owner_name"], "phone": (reply or {}).get("phone") or task["owner_phone"]}}
+
+
+@app.route("/api/owner-booking/<otoken>/group-reply", methods=["POST"])
+def owner_group_reply(otoken):
+    """聯合排程：屋主回覆方便的時段。body: {pref:1|2|null, avail:'all'|'am'|'pm', custom:[{date,avail}], owner_name, owner_phone, note}"""
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    if not task["group_id"]:
+        return jsonify({"error": "這個連結不是聯合排程"}), 400
+    group = _get_group(task["group_id"])
+    if not group or group["status"] in (GS_CANCEL, GS_DONE) or task["status"] in (TASK_STATUS_DONE, TASK_STATUS_CANCELLED):
+        return jsonify({"error": "這個安排已經結束了，如有問題請直接聯絡您的業務"}), 409
+    if group["status"] == GS_WAIT_OWNERS and task["stage"] == TASK_STAGE_WAIT_REP:
+        return jsonify({"error": "我們已經幫您排好時間了，請回到連結確認時間"}), 409
+    body = request.get_json(force=True) or {}
+    name, phone, err_msg = _owner_contact(body)
+    if err_msg:
+        return jsonify({"error": err_msg}), 400
+    pref = body.get("pref")
+    avail = body.get("avail") or "all"
+    if pref is not None:
+        if not isinstance(pref, int) or not (1 <= pref <= len(group["prefs"])):
+            return jsonify({"error": "選的期望日不存在"}), 400
+        if avail not in AVAIL_LABEL or not _g_avail_intervals(_g_mins(group["prefs"][pref - 1]["windows"]), avail):
+            return jsonify({"error": "選的時段不存在"}), 400
+    custom, seen = [], set()
+    for c in (body.get("custom") or [])[:10]:
+        d = (c.get("date") or "").strip() if isinstance(c, dict) else ""
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            return jsonify({"error": "日期格式不正確"}), 400
+        if d not in seen:
+            seen.add(d)
+            custom.append({"date": d, "avail": c.get("avail") if c.get("avail") in AVAIL_LABEL else "all"})
+    if pref is None and not custom:
+        return jsonify({"error": "請至少選一個您方便的時段，或提供其他日期"}), 400
+    reply = {"pref": pref, "avail": avail if pref is not None else None, "custom": custom, "name": name, "phone": phone,
+             "note": (body.get("note") or "").strip()[:300], "at": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")}
+    try:
+        _patch_task(r["id"], {FIELD_TASK_OWNER_REPLY: json.dumps(reply, ensure_ascii=False),
+                              FIELD_TASK_OWNER_NAME: name, FIELD_TASK_OWNER_PHONE: phone})
+    except Exception as e:
+        return jsonify({"error": "送出失敗，請稍後再試", "detail": str(e)}), 502
+    task["owner_reply"], task["owner_name"], task["owner_phone"] = reply, name, phone
+    threading.Thread(target=_joint_after_reply, args=(task,), daemon=True).start()
+    return jsonify({"ok": True, "reply_text": _g_reply_text(group["prefs"], reply)})
 
 
 if __name__ == "__main__":
