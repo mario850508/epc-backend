@@ -263,7 +263,7 @@ AUTH_PUBLIC_EXACT = {
 }
 AUTH_MACHINE_EXACT = {
     "/api/pdf-rename/watcher-config", "/api/pdf-rename/watcher-upload", "/api/pdf-rename/watcher-heartbeat",
-    "/api/pdf-rename/confirmed", "/api/pdf-rename/status",
+    "/api/pdf-rename/confirmed", "/api/pdf-rename/status", "/api/pdf-rename/line-originals",
 }
 AUTH_MACHINE_RE = _re.compile(r"^/api/pdf-rename/[^/]+/(archive-claim|archived|file)$")
 MACHINE_HITS = {}
@@ -8792,6 +8792,33 @@ def pdf_rename_watcher_upload():
     return jsonify(r), (200 if r["ok"] else 400)
 
 
+@app.route("/api/pdf-rename/line-originals")
+def pdf_rename_line_originals():
+    """PM 電腦的背景程式用：LINE 機器人直接送進主控台的原始檔清單（這位 PM 的、最近 ?days 天），
+    背景程式會下載一份原檔放到這位 PM 的 LINE 收件資料夾當備份（原檔名，不刪除）。"""
+    pm = (request.args.get("pm") or "").strip()
+    if not pm:
+        return jsonify({"error": "缺少 pm"}), 400
+    days = max(1, min(int(request.args.get("days") or 14), 60))
+    since = (datetime.now(TW_TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        items = _pdf_items_all()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    out = []
+    for x in items:
+        # src_path「LINE/PM-家豪/檔名」＝ LINE 機器人直接送來的；電腦資料夾送上來的是電腦上的路徑，本來就在電腦裡
+        if not (x.get("src_path") or "").startswith("LINE/"):
+            continue
+        if pm not in [t.strip() for t in (x.get("uploader") or "").split("、")]:
+            continue
+        if (x.get("uploaded_at") or "") < since:
+            continue
+        out.append({"id": x["id"], "src_name": x.get("src_name") or "", "uploaded_at": x.get("uploaded_at") or "",
+                    "file_ext": x.get("file_ext") or ".pdf"})
+    return jsonify({"items": out})
+
+
 PDF_ARCHIVE_CLAIMS = {}   # {record_id: (pm, 領取時間)}；gunicorn 單一 worker，記憶體鎖即可
 
 
@@ -8824,7 +8851,7 @@ def pdf_rename_watcher_heartbeat():
         "last_upload": str(body.get("last_upload") or "")[:200], "version": str(body.get("version") or "")[:20],
         "archived_total": int(body.get("archived_total") or 0), "last_archive": str(body.get("last_archive") or "")[:300],
         "archive_error": str(body.get("archive_error") or "")[:300], "case_folders": int(body.get("case_folders") or 0),
-        "archive_only": bool(body.get("archive_only")),
+        "archive_only": bool(body.get("archive_only")), "saved_total": int(body.get("saved_total") or 0),
     }
     return jsonify({"ok": True})
 
