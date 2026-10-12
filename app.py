@@ -413,6 +413,8 @@ FIELD_MS_CASE_LINK = "fldome7Uo2fuK2Ucp"
 FIELD_MS_TYPE = "fldTr1O1foeVmDbnm"
 FIELD_MS_ACTUAL_DATE = "fldWuXRAVhfZJcjXj"
 FIELD_MS_EST_DATE = "fldA9MK2ATP7GrLJC"
+FIELD_MS_STATUS = "fldccCUP6SMs5VfXi"   # 節點狀態：尚未完成／已完成
+MS_STATUS_DONE = "已完成"
 
 MILESTONE_TYPE_SHIP = "大料出貨時間"
 MILESTONE_TYPE_ENTRY = "進場屋主預約"
@@ -8383,21 +8385,28 @@ def _pdf_writeback_msg(case, doc_type, doc_date):
             batch = ms_ids[i:i + 50]
             formula = "AND(OR(" + ",".join(f"RECORD_ID()='{m}'" for m in batch) + \
                       "),{" + FIELD_MS_TYPE + "}='" + milestone.replace("'", "\\'") + "')"
-            found += airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE])
+            found += airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS])
         if found:
             ms_id = found[0]["id"]
             existing = found[0].get("fields", {}).get(FIELD_MS_ACTUAL_DATE)
             if existing == doc_date:
+                # 日期一樣但節點還是「尚未完成」：補成已完成
+                if found[0].get("fields", {}).get(FIELD_MS_STATUS) != MS_STATUS_DONE:
+                    r = requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
+                                       json={"fields": {FIELD_MS_STATUS: MS_STATUS_DONE}}, timeout=30)
+                    if r.status_code >= 400:
+                        raise Exception(r.text)
+                    return f"✓ 進度管理「{milestone}」完成日期已是 {doc_date}，節點改為已完成"
                 return f"✓ 進度管理「{milestone}」完成日期已是 {doc_date}"
             if existing:
                 return f"⚠ 進度管理「{milestone}」已有完成日期 {existing}（文件 {doc_date}），未覆蓋，請人工確認"
         else:
             ms_id = ensure_milestone_record(case["record_id"], milestone)
         r = requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
-                           json={"fields": {FIELD_MS_ACTUAL_DATE: doc_date}}, timeout=30)
+                           json={"fields": {FIELD_MS_ACTUAL_DATE: doc_date, FIELD_MS_STATUS: MS_STATUS_DONE}}, timeout=30)
         if r.status_code >= 400:
             raise Exception(r.text)
-        return f"✓ 已寫入進度管理「{milestone}」完成日期 {doc_date}"
+        return f"✓ 已寫入進度管理「{milestone}」完成日期 {doc_date}（節點已完成）"
     except Exception as e:
         return f"✗ 寫回失敗：{str(e)[:300]}"
 
