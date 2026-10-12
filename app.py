@@ -823,7 +823,7 @@ def _sync_booking_to_case_dates(case_no, slot_type, date):
         else:
             case_record_id = recs[0]["id"]
             if "進場" in types:
-                ms_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_ENTRY)
+                ms_id = find_or_create_milestone_record(case_record_id, case_no, MILESTONE_TYPE_ENTRY)
                 resp = requests.patch(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
                                       json={"fields": {FIELD_MS_ACTUAL_DATE: date}}, timeout=20)
                 if resp.status_code >= 400:
@@ -877,7 +877,7 @@ def _revert_case_dates(case_no, slot_type, date):
                 if patch:
                     app_data_update(existing["id"], patch)
             if "進場" in types:
-                ms_id = ensure_milestone_record(case_record_id, MILESTONE_TYPE_ENTRY)
+                ms_id = find_or_create_milestone_record(case_record_id, case_no, MILESTONE_TYPE_ENTRY)
                 ms = requests.get(f"{MILESTONE_API_URL}/{ms_id}", headers=airtable_headers(),
                                   params={"returnFieldsByFieldId": "true"}, timeout=20)
                 if ms.status_code < 400 and ms.json().get("fields", {}).get(FIELD_MS_ACTUAL_DATE) == date:
@@ -3766,6 +3766,27 @@ def ensure_milestone_record(case_record_id, milestone_type):
     )
     resp.raise_for_status()
     return resp.json()["id"]
+
+
+def find_or_create_milestone_record(case_record_id, case_no, milestone_type):
+    """2026-10-12：先找這個案件已經有的該種類里程碑記錄，沒有才新增。
+    （ensure_milestone_record 只會新增、不會先找——時段預約的「進場」寫回用它，結果每次都多生一筆重複的
+    「進場屋主預約」，日期寫在重複那筆上，案件進場安排／排程判斷讀的是原本那筆，所以看不到日期。）
+    同種類有多筆時，優先用已經有日期的，其次最早建立的。"""
+    esc = (case_no or "").replace("\\", "\\\\").replace("'", "\\'")
+    try:
+        recs = airtable_get_all(
+            MILESTONE_API_URL,
+            f"AND({{{FIELD_MS_TYPE}}}='{milestone_type}',FIND('{esc}',ARRAYJOIN({{{FIELD_MS_CASE_LINK}}}))>0)",
+            [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE],
+        ) if esc else []
+    except Exception as e:
+        print(f"[find_or_create_milestone_record] 查詢失敗，改為新增：{e}", flush=True)
+        recs = []
+    if recs:
+        recs.sort(key=lambda r: (0 if r["fields"].get(FIELD_MS_ACTUAL_DATE) else 1, r.get("createdTime", "")))
+        return recs[0]["id"]
+    return ensure_milestone_record(case_record_id, milestone_type)
 
 
 def fetch_case_snapshot_for_archive(case_record_id):
@@ -9468,6 +9489,21 @@ def health():
     })
 
 
+
+@app.route("/api/debug/find-milestone")
+def debug_find_milestone():
+    """排查用（需要登入或服務金鑰）：查某案號某種類里程碑目前會被選中哪一筆。不會新增任何記錄。"""
+    case_no = (request.args.get("case") or "").strip()
+    mtype = (request.args.get("type") or MILESTONE_TYPE_ENTRY).strip()
+    esc = case_no.replace("\\", "\\\\").replace("'", "\'")
+    recs = airtable_get_all(
+        MILESTONE_API_URL,
+        f"AND({{{FIELD_MS_TYPE}}}='{mtype}',FIND('{esc}',ARRAYJOIN({{{FIELD_MS_CASE_LINK}}}))>0)",
+        [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE],
+    )
+    return jsonify({"count": len(recs), "records": [{"id": r["id"], "actual_date": r["fields"].get(FIELD_MS_ACTUAL_DATE)} for r in recs]})
+
+
 if __name__ == "__main__":
     # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
     # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
@@ -9475,3 +9511,4 @@ if __name__ == "__main__":
     threading.Thread(target=_startup_refresh_all, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
