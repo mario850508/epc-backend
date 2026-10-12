@@ -1909,8 +1909,26 @@ def _opt_window2(body, win1_end):
     return "", ""
 
 
+def _owner_fixed(task):
+    """PM 設了具體預估時間（開始時間＋時長；不是「交由業務／屋主安排」）→ 屋主只能約這一個固定時段（例如掛表一定是 09:00–12:00）。
+    回 (開始分鐘, 結束分鐘)，沒有固定時間回 None。"""
+    st, dur = task.get("est_start"), task.get("duration_min")
+    if not st or not dur:
+        return None
+    try:
+        a = _parse_hhmm(st)
+    except Exception:
+        return None
+    b = min(a + int(dur), 24 * 60 - 1)
+    return (a, b) if b > a else None
+
+
 def _owner_windows(task):
-    """屋主可選的時段清單（1～2 段），例如 [("09:00","12:00"), ("13:00","17:00")]；中間的空檔是工班休息、屋主不能選。"""
+    """屋主可選的時段清單（1～2 段），例如 [("09:00","12:00"), ("13:00","17:00")]；中間的空檔是工班休息、屋主不能選。
+    PM 設了固定預估時間時，只有那一個時段。"""
+    fx = _owner_fixed(task)
+    if fx:
+        return [(f"{fx[0] // 60:02d}:{fx[0] % 60:02d}", f"{fx[1] // 60:02d}:{fx[1] % 60:02d}")]
     a, b = _valid_hhmm(task.get("owner_win_start"), "09:00"), _valid_hhmm(task.get("owner_win_end"), "17:00")
     out = [(a, b)]
     c, d = _valid_hhmm(task.get("owner_win2_start"), ""), _valid_hhmm(task.get("owner_win2_end"), "")
@@ -1951,7 +1969,12 @@ def _owner_slot_from_start(task, date, start):
         return None, "日期或時間格式不正確"
     wins = _owner_windows(task)
     et = st + _owner_duration(task)
-    if st % 60 != 0:   # 屋主只能選整點開始（2026-10-12 使用者要求，半點不好安排）
+    fx = _owner_fixed(task)
+    if fx:
+        if st != fx[0]:
+            return None, f"這個預約的時間固定是 {wins[0][0]}–{wins[0][1]}"
+        et = fx[1]
+    elif st % 60 != 0:   # 屋主只能選整點開始（2026-10-12 使用者要求，半點不好安排）
         return None, "請選整點的開始時間"
     if not any(st >= _parse_hhmm(a) and et <= _parse_hhmm(b) for a, b in wins):
         return None, "請選 " + "、".join(f"{a}–{b}" for a, b in wins) + " 之間的時間"
@@ -2005,6 +2028,7 @@ def owner_booking_get(otoken):
         "duration_label": _owner_multiday_label(task),
         "window_start": ws, "window_end": we,
         "windows": [list(w) for w in _owner_windows(task)],
+        "fixed": bool(_owner_fixed(task)),
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
         "address": _case_address(task["case"]),
@@ -2211,6 +2235,7 @@ def vendor_slot_task_owner_link(record_id):
         "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we, "windows": [list(w) for w in _owner_windows(task)],
+        "fixed": bool(_owner_fixed(task)),
         "assignee": task["assignee"], "status": task["status"],
         "assignee_bound": bool(task["assignee"] and _get_line_binding(task["assignee"])),
         "rep_bind_url": _rep_bind_url(task["assignee"]),
