@@ -1849,6 +1849,8 @@ def _owner_slot_from_start(task, date, start):
         return None, "日期或時間格式不正確"
     ws, we = _owner_window(task)
     et = st + _owner_duration(task)
+    if st % 60 != 0:   # 屋主只能選整點開始（2026-10-12 使用者要求，半點不好安排）
+        return None, "請選整點的開始時間"
     if st < _parse_hhmm(ws) or et > _parse_hhmm(we):
         return None, f"請選 {ws}–{we} 之間的時間"
     return {"date": date, "start_time": f"{st // 60:02d}:{st % 60:02d}", "end_time": f"{et // 60:02d}:{et % 60:02d}"}, None
