@@ -6942,6 +6942,11 @@ PDF_DEFAULT_DOC_TYPES = [
     {"name": "申請案件告知單", "category": "06", "milestone": "", "synonyms": "",
      "keywords": "告知單、申請案件"},
     # ---- 04 電廠設計圖 ----
+    # 「太陽光電工程確認單」（請屋主確認水塔、盤體、電箱位置等，群組常常傳）：文件上沒有日期，用收件日；
+    # 2026-10-12 使用者要求：認得出案場就直接確認、進歸檔，不用在網站上再按確認（auto_archive）
+    {"name": "工程確認單", "category": "04", "milestone": "", "synonyms": "太陽光電工程確認單、工程確認單回簽、工程確認單回傳",
+     "keywords": "工程確認單、所有權人確認、確認後打勾", "text_regex": "工程確認單", "date_mode": "received",
+     "auto_archive": True},
     {"name": "支架拆圖", "category": "04", "milestone": "支架拆圖", "synonyms": "支架拆圖(用印版)、支架拆圖(用印)",
      "keywords": "支架拆圖、傾斜角度、模組傾斜、立柱、檁條", "date_keys": "日期"},
     {"name": "串併圖", "category": "04", "milestone": "串並圖", "synonyms": "串並圖、串並圖(工務版)、串接圖、串並、模組串併圖、串併圖(工務版)、串並圖(EPC版)",
@@ -7043,7 +7048,7 @@ def _tw_now_iso():
     return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
-PDF_LATER_DOC_TYPES = {"換文修約"}   # 第一次存設定之後才加進預設的類型
+PDF_LATER_DOC_TYPES = {"換文修約", "工程確認單"}   # 第一次存設定之後才加進預設的類型
 PDF_RENAMED_DOC_TYPES = {"範本修約": "換文修約"}   # 類型改名：存過的設定跟著改
 PDF_DEFAULT_TYPE_BY_NAME = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
 
@@ -8065,14 +8070,17 @@ def _pdf_rule_doc_type(flat, subject, settings):
     """先用學習模型；沒有模型或判斷不出來時，用關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。
     類型設了 subject_regex（主旨規則）且主旨符合時直接判定，比學習模型優先（給少見、模型沒學過的類型用）。"""
     for t in settings.get("doc_types") or []:
-        rx = (t.get("subject_regex") or "").strip()
-        if rx and subject and t.get("name"):
+        # subject_regex 比對主旨；text_regex 比對文件開頭（沒有主旨的表單，例如工程確認單的標題）
+        for key, hay, where in (("subject_regex", subject, "主旨"), ("text_regex", flat[:1500], "文件")):
+            rx = (t.get(key) or "").strip()
+            if not rx or not hay or not t.get("name"):
+                continue
             try:
-                m = re.search(rx, subject)
+                m = re.search(rx, hay)
             except re.error:
                 continue
             if m:
-                return t["name"], 90, f"主旨有「{m.group(0)}」（{t['name']}的主旨規則）"
+                return t["name"], 90, f"{where}有「{m.group(0)}」（{t['name']}的規則）"
     learned = _pdf_model_doc_type(flat, settings)
     if learned:
         return learned
@@ -8121,6 +8129,9 @@ def _pdf_rule_doc_type(flat, subject, settings):
     return best[1], conf, reason
 
 
+PDF_COUNTY_RE = re.compile(r"(?:臺北|台北|新北|桃園|臺中|台中|臺南|台南|高雄|基隆|新竹|嘉義)[市縣]|(?:苗栗|彰化|南投|雲林|屏東|宜蘭|花蓮|臺東|台東|澎湖|金門|連江)縣")
+
+
 def _pdf_rule_extract(text, settings):
     flat = _pdf_flat(text)
     m = re.search(r"主旨:(.+?)(?:說明:|辦法:|正本:|附件:|$)", flat)
@@ -8132,7 +8143,9 @@ def _pdf_rule_extract(text, settings):
     issuer = m.group(1) if m else ""
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
     rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
-    if rule.get("date_mode") == "stamp":
+    if rule.get("date_mode") == "received":
+        doc_date, date_raw, date_conf = "", "", 0   # 文件上本來就沒有日期，用收件日（_pdf_recognize 補）
+    elif rule.get("date_mode") == "stamp":
         # 只認「審核訖」印章日期；讀不到就留空（之後改用收件日並提醒），不拿圖框的繪圖日期
         st = _pdf_stamp_date(flat)
         doc_date, date_raw, date_conf = (st[0], st[1], 92) if st else ("", "", 0)
@@ -8144,6 +8157,8 @@ def _pdf_rule_extract(text, settings):
         doc_date, date_raw, date_conf = _pdf_rule_date(flat, keys)
     addresses = re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿0-9\-之巷弄段路街村里鄰]{2,30}?號", flat)
     addresses += re.findall(r"[一-鿿]{1,3}[縣市][一-鿿]{1,4}[鄉鎮市區][一-鿿]{1,8}段[0-9\-、]{1,30}地號", flat)
+    # 前面黏到別的字（例如「確認單新竹縣…」）：從縣市名稱開始切
+    addresses = [(m.group(0) + a[m.end():]) if (m := PDF_COUNTY_RE.search(a)) else a for a in addresses]
     ext = {
         "doc_type": doc_type, "doc_type_reason": type_reason, "doc_date": doc_date, "doc_date_raw": date_raw,
         "doc_number": doc_number, "issuer": issuer, "recipient": "", "subject": subject,
@@ -8369,7 +8384,7 @@ def _pdf_recognize(rec):
     if not out["doc_date"]:
         received = (f.get(PDF_F["uploaded_at"]) or rec.get("createdTime") or "")[:10]
         if _pdf_valid_date(received):
-            normal = _pdf_doc_category(out["doc_type"]) == "07"
+            normal = _pdf_doc_category(out["doc_type"]) == "07" or rule.get("date_mode") == "received"
             out["doc_date"] = received
             out["issues"] = [x for x in out["issues"] if x != "找不到發文日期"]
             out["issues"].append(f"文件上沒有日期，先用收件日 {received}" + ("" if normal else "（這類文件通常有日期，可能是沒讀到，請確認）"))
@@ -8418,10 +8433,15 @@ def _pdf_recognize(rec):
     }
     auto = (settings.get("auto_confirm") and case_no and doc_date and doc_type != "其他"
             and confidence >= threshold)
-    if auto:
+    # 設定成「直接歸檔」的類型（例如工程確認單）：案場認得出來（案號信心 ≥ 80）就直接確認，不用人工按
+    type_rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
+    direct = bool(type_rule.get("auto_archive") and case_no and doc_date
+                  and (out.get("conf_parts") or [0])[0] >= 80)
+    if auto or direct:
         fields[PDF_F["status"]] = PDF_ST_CONFIRMED
         fields[PDF_F["confirmed_at"]] = _tw_now_iso()
-        fields[PDF_F["confirmed_by"]] = f"自動確認（信心 {confidence}）"
+        fields[PDF_F["confirmed_by"]] = f"自動確認（信心 {confidence}）" if auto else f"自動確認（{doc_type}直接歸檔）"
+        auto = True
     _pdf_patch(rec["id"], fields)
     if auto and settings.get("writeback"):
         _pdf_writeback(rec["id"], case, doc_type, doc_date, ids)
