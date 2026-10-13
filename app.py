@@ -4564,11 +4564,40 @@ def pending_cases():
     })
 
 
+def _entry_with_order_dates(cases):
+    """2026-10-13：案件進場安排的「模組」日期，優先用訂單表裡確定的「預計到貨時間」（元晶模組訂單，沒取消的）；
+    Airtable 里程碑上的出貨日期只是預估。有用訂單日期時 ship_date 換成訂單的、並帶 ship_date_from_order／ship_date_milestone。"""
+    try:
+        rows = _load_order_snapshots()["rows"]
+    except Exception as e:
+        print(f"[entry-cases] 讀訂單表失敗，沿用里程碑日期：{e}", flush=True)
+        return cases
+    best = {}
+    for r in rows:
+        if r.get("equipment") != "模組" or r.get("status") in ("取消", "可能撤案"):
+            continue
+        d = _parse_arrival_date(r.get("arrival"))
+        if not d:
+            continue
+        key = str(r.get("order_date") or "")
+        cur = best.get(r.get("case_no"))
+        if cur is None or key > cur[0]:
+            best[r.get("case_no")] = (key, d.isoformat())
+    out = []
+    for c in cases:
+        b = best.get(c.get("case"))
+        if b and str(c.get("ship_date") or "")[:10] != b[1]:
+            c = {**c, "ship_date": b[1], "ship_date_milestone": c.get("ship_date"), "ship_date_from_order": True}
+        out.append(c)
+    return out
+
+
 @app.route("/api/entry-cases")
 def entry_cases():
+    entry = _entry_with_order_dates(DATA_CACHE["entry"])
     return jsonify({
-        "count": len(DATA_CACHE["entry"]),
-        "cases": DATA_CACHE["entry"],
+        "count": len(entry),
+        "cases": entry,
         "updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
         "refreshing_started_at": (
