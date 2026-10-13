@@ -7127,7 +7127,8 @@ def _load_mail_configs():
             resp.raise_for_status()
             d = resp.json()
             cases, parsed_at = d.get("cases", {}), d.get("parsed_at", "")
-    _MAIL_CFG_CACHE.update({"at": time.time(), "cases": cases, "parsed_at": parsed_at})
+    # 還沒有資料（例如第一次匯出還沒同步上來）只快取 1 分鐘，資料一上傳就看得到
+    _MAIL_CFG_CACHE.update({"at": time.time() - (540 if not cases else 0), "cases": cases, "parsed_at": parsed_at})
     return _MAIL_CFG_CACHE
 
 
