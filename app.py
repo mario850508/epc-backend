@@ -259,6 +259,7 @@ AUTH_PUBLIC_PREFIXES = ("/api/owner-booking/", "/api/vendor-slots/public-task/",
 AUTH_PUBLIC_EXACT = {
     "/api/login", "/api/auth/status",
     "/api/line/liff-config", "/api/line/bind-rep", "/api/line/bind-scheduler",   # LIFF 綁定頁
+    "/api/line/bind-procurement",
     "/api/site-survey-cancelled-sync", "/api/line/run-job",                      # 自己驗證金鑰
 }
 AUTH_MACHINE_EXACT = {
@@ -587,6 +588,9 @@ FIELD_BIND_NAME = "fldqJBVB9IYxnyWDR"
 FIELD_BIND_UID = "fld21MqIEDGkcJtl8"
 FIELD_BIND_DISPLAY = "fld5ebY8BPab9BotD"
 FIELD_BIND_SCHEDULER = "fldP46k7RInwCYXQV"  # 安排人員（checkbox）
+FIELD_BIND_BUYER = "fldVjHlrbO0SRTXQW"      # 採購（checkbox，2026-10-13）
+FIELD_BIND_DRIVER_NOTIFY = "fldju5cuteZnnsA5Q"  # 收出貨司機通知（checkbox）
+FIELD_BIND_DRIVER_DATE = "fldG7qQ2mINy6oz3h"    # 最後司機通知日（同一天只發一次）
 LINE_BIND_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{LINE_BIND_TABLE_ID}"
 FIELD_TASK_REMINDED = "fldEYiVCaYVUORS9F"  # 已提醒（checkbox）
 FIELD_TASK_EST_START = "fld71d3cCHY4hhzoN"  # 預估開始時間 HH:MM（PM 指派時填，填單頁當預設開始時間）
@@ -6251,6 +6255,57 @@ def line_bind_scheduler():
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/api/line/bind-procurement", methods=["POST"])
+def line_bind_procurement():
+    """採購在 book.html?bind=procurement 輸入名字、用 LINE 登入後呼叫：寫進「業務LINE綁定」並勾「採購」、
+    「收出貨司機通知」（元晶明天到貨司機資訊通知先發給採購測試，2026-10-13）。body: {access_token, name}"""
+    body = request.get_json(force=True) or {}
+    access_token = (body.get("access_token") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not access_token or not name:
+        return jsonify({"error": "缺少名字或 LINE 登入資訊"}), 400
+    try:
+        prof = requests.get("https://api.line.me/v2/profile",
+                            headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+        if prof.status_code >= 400:
+            return jsonify({"error": "LINE 驗證失敗，請重新開啟連結再試一次"}), 400
+        pj = prof.json()
+        user_id, display = pj.get("userId", ""), pj.get("displayName", "")
+        if not user_id:
+            return jsonify({"error": "LINE 驗證失敗"}), 400
+        fields = {FIELD_BIND_NAME: name, FIELD_BIND_UID: user_id, FIELD_BIND_DISPLAY: display,
+                  FIELD_BIND_BUYER: True, FIELD_BIND_DRIVER_NOTIFY: True}
+        existing = _find_line_binding_record(name)
+        if existing:
+            resp = requests.patch(f"{LINE_BIND_API_URL}/{existing['id']}", headers=airtable_headers(),
+                                  json={"fields": fields}, timeout=20)
+        else:
+            resp = requests.post(LINE_BIND_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+        return jsonify({"ok": True, "display_name": display, "name": name})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+def _buyers():
+    recs = airtable_get_all(LINE_BIND_API_URL, "{" + FIELD_BIND_BUYER + "}", [
+        FIELD_BIND_NAME, FIELD_BIND_UID, FIELD_BIND_DISPLAY, FIELD_BIND_DRIVER_NOTIFY, FIELD_BIND_DRIVER_DATE])
+    return [{"id": r["id"], "name": r["fields"].get(FIELD_BIND_NAME, ""), "user_id": r["fields"].get(FIELD_BIND_UID, ""),
+             "display": r["fields"].get(FIELD_BIND_DISPLAY, ""), "notify": bool(r["fields"].get(FIELD_BIND_DRIVER_NOTIFY)),
+             "notify_date": r["fields"].get(FIELD_BIND_DRIVER_DATE, "")} for r in recs]
+
+
+@app.route("/api/line/buyers/<record_id>/notify", methods=["POST"])
+def line_buyer_notify(record_id):
+    on = bool((request.get_json(force=True) or {}).get("on"))
+    resp = requests.patch(f"{LINE_BIND_API_URL}/{record_id}", headers=airtable_headers(),
+                          json={"fields": {FIELD_BIND_DRIVER_NOTIFY: on}}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True, "on": on})
+
+
 @app.route("/api/line/status")
 def line_status():
     """只回報 LINE 提醒設定是否到位（不回傳 token / ID 內容）。"""
@@ -7257,13 +7312,34 @@ def send_driver_requests(force=False, target_date=None):
     today = _tw_now().date()
     target = target_date or (today + timedelta(days=1))
     groups = [g for g in _line_groups() if PURPOSE_DRIVER in g["purposes"]]
-    if not groups:
-        return {"date": target.isoformat(), "sent": [], "note": "還沒有設定要通知的群組"}
+    buyers = [b for b in _buyers() if b["notify"] and b["user_id"]]
+    if not groups and not buyers:
+        return {"date": target.isoformat(), "sent": [], "note": "還沒有設定要通知的群組或採購"}
     cases = _driver_request_cases(target)
-    if not cases:
-        return {"date": target.isoformat(), "sent": [], "note": "明天沒有元晶到貨的訂單，不發送"}
-    card = _driver_request_card(target, cases)
     results = []
+    # 採購（測試期間先發給採購確認內容；沒有到貨訂單也發一句，讓採購知道今天有跑）
+    for b in buyers:
+        if b["notify_date"] == today.isoformat() and not force:
+            results.append({"group": b["name"], "ok": True, "skipped": "今天已發過"})
+            continue
+        if cases:
+            bc = _driver_request_card(target, cases)
+            bc["tag"] = "🚚 明天到貨｜司機資訊請求（採購副本）"
+            bc["note"] = ("【測試中】這張卡片是要發到元晶群組的內容，目前先發給採購確認；確認沒問題後到主控台勾選元晶群組。"
+                          if not groups else "這張卡片已同時發到元晶群組。")
+            ok, err = _line_push_card(bc, to=b["user_id"])
+        else:
+            ok, err = _line_push_text(f"🚚 元晶出貨司機資訊通知（採購副本）\n明天 {_wd_label(target.isoformat())} 沒有元晶到貨的訂單，今天不需要請元晶提供司機資訊。", to=b["user_id"])
+        if ok:
+            try:
+                requests.patch(f"{LINE_BIND_API_URL}/{b['id']}", headers=airtable_headers(),
+                               json={"fields": {FIELD_BIND_DRIVER_DATE: today.isoformat()}}, timeout=20)
+            except Exception as e:
+                print(f"[send_driver_requests] 採購回寫失敗：{e}", flush=True)
+        results.append({"group": b["name"], "ok": ok, "error": "" if ok else err[:200]})
+    if not cases:
+        return {"date": target.isoformat(), "sent": results, "note": "明天沒有元晶到貨的訂單，不發群組"}
+    card = _driver_request_card(target, cases)
     for g in groups:
         if g["notify_date"] == today.isoformat() and not force:
             results.append({"group": g["name"] or g["group_id"], "ok": True, "skipped": "今天已發過"})
@@ -7303,7 +7379,13 @@ def driver_request_preview():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     card = _driver_request_card(target, cases)
+    try:
+        buyers = _buyers()
+    except Exception:
+        buyers = []
     return jsonify({"date": target.isoformat(), "cases": cases, "groups": groups,
+                    "buyers": [{k: b[k] for k in ("id", "name", "display", "notify", "notify_date")} for b in buyers],
+                    "liff_id": os.environ.get("LIFF_ID", "").strip(),
                     "text": _card_plain_text(card) if cases else "", "send_time": "每天 14:00（同一天只發一次）"})
 
 
