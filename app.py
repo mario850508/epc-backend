@@ -6978,6 +6978,56 @@ def procurement_orders():
     return jsonify({"sources": cache["sources"], "counts": counts, "total": len(out), "rows": out[:300]})
 
 
+@app.route("/api/procurement/case-detail")
+def procurement_case_detail():
+    """2026-10-13：訂單查詢點進案件——這案的所有訂單（模組＋變流器，全部狀態）、專案細節裡登記的規格，
+    以及「審訖圖」（沒有才用「系統送審圖」）的檔案，讓窗口一眼比對圖上的資訊跟訂單是否一致。"""
+    case_no = (request.args.get("case") or "").strip()
+    if not case_no:
+        return jsonify({"error": "缺少案號"}), 400
+    try:
+        cache = _load_order_snapshots()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    keys = ("vendor", "equipment", "status", "order_date", "arrival", "shipped_at", "model", "qty", "warranty", "epc",
+            "receiver", "phone", "ship_to", "site_addr", "paid_at", "note", "alias")
+    orders = [{k: r.get(k, "") for k in keys} for r in cache["rows"] if r.get("case_no") == case_no]
+    orders.sort(key=lambda o: (o["equipment"], str(o["order_date"] or "")), reverse=False)
+    spec = {"module": "", "inverter": "", "address": "", "alias": ""}
+    try:
+        sf = get_sales_field_id()
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + case_no.replace("'", chr(92) + "'") + "'",
+                                [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_MODULE_MODEL, FIELD_MODULE_QTY, FIELD_INVERTER, FIELD_INVERTER_QTY])
+        if recs:
+            f = recs[0]["fields"]
+            spec["module"] = format_module(f) or ""
+            spec["inverter"] = format_inverter(f, resolve_inverter_names(f.get(FIELD_INVERTER) or [])) or ""
+            spec["address"] = " ".join((f.get(FIELD_ADDRESS) or "").split())
+            spec["alias"] = f.get(FIELD_ALIAS) or ""
+    except Exception as e:
+        print(f"[case-detail] 查專案細節失敗：{e}", flush=True)
+    if not spec["address"]:
+        spec["address"] = _addr_fallback(case_no)
+    drawing, others = None, []
+    try:
+        formula = ("AND({" + PDF_F["case_no"] + "}='" + case_no.replace("'", chr(92) + "'") + "',OR({" + PDF_F["doc_type"] + "}='審訖圖',{"
+                   + PDF_F["doc_type"] + "}='系統送審圖'),{" + PDF_F["status"] + "}!='" + PDF_ST_FAILED + "',{" + PDF_F["status"] + "}!='"
+                   + PDF_ST_QUEUED + "',{" + PDF_F["status"] + "}!='" + PDF_ST_RUNNING + "')")
+        cands = [_pdf_record_to_dict(r) for r in airtable_get_all(PDF_API_URL, formula, list(PDF_F.values()))]
+        cands.sort(key=lambda x: (x.get("doc_date") or "", x.get("confirmed_at") or ""), reverse=True)
+        # 審訖圖優先，其次系統送審圖；同類型已確認／已歸檔優先於還在待確認
+        cands.sort(key=lambda x: (0 if x["doc_type"] == "審訖圖" else 1, 0 if x["status"] in (PDF_ST_CONFIRMED, PDF_ST_ARCHIVED) else 1))
+        pack = lambda x: {"id": x["id"], "doc_type": x["doc_type"], "doc_date": x["doc_date"], "status": x["status"],
+                          "name": x["final_name"] or x["suggested_name"] or x["src_name"], "ext": x["file_ext"], "file_url": x["file_url"]}
+        if cands:
+            drawing = pack(cands[0])
+            others = [pack(x) for x in cands[1:4]]
+    except Exception as e:
+        print(f"[case-detail] 查審訖圖失敗：{e}", flush=True)
+    return jsonify({"case": case_no, "alias": spec["alias"] or next((o["alias"] for o in orders if o["alias"]), ""),
+                    "spec": spec, "orders": orders, "drawing": drawing, "other_drawings": others})
+
+
 @app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
 def procurement_inverter_cert_rename(record_id):
     """送出改名請求（寫入「改名為」），本機 cert_agent.py 一分鐘內套用到 G 槽。"""
