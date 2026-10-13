@@ -7615,6 +7615,12 @@ PDF_DEFAULT_DOC_TYPES = [
      "keywords": "設備登記、再生能源發電設備登記、准予登記"},
     {"name": "設備登記移轉", "category": "06", "milestone": "移轉設備", "synonyms": "",
      "keywords": "設備登記、移轉、變更登記、讓與"},
+    # 台電「再生能源電能躉購電費通知單」（每月一張），2026-10-13 使用者指定叫「電費單」放 06。
+    # 日期＝計費期間的結束日（使用者習慣：計費期間 115/09/15～115/10/04 → 1151004）；
+    # 寫回「第一張電費單」里程碑只填空白，之後每個月的電費單日期比較晚是正常的，不提醒（milestone_first）
+    {"name": "電費單", "category": "06", "milestone": "第一張電費單", "synonyms": "第一張電費單、電費通知單、躉購電費通知單",
+     "keywords": "電費通知單、躉購電費、計費期間、應付總金額、購電度數", "text_regex": "電費通知單|躉購電費",
+     "date_mode": "bill_period", "milestone_first": True},
     {"name": "電表租約", "category": "06", "milestone": "電表租約", "synonyms": "電表租約(屋主)、電表租約函",
      "keywords": "電表租約、租用電表、電表租用、表租"},
     {"name": "正式售電函", "category": "06", "milestone": "正式售電函", "synonyms": "正式售電",
@@ -7738,7 +7744,7 @@ def _tw_now_iso():
     return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
-PDF_LATER_DOC_TYPES = {"換文修約", "工程確認單"}   # 第一次存設定之後才加進預設的類型
+PDF_LATER_DOC_TYPES = {"換文修約", "工程確認單", "電費單"}   # 第一次存設定之後才加進預設的類型
 PDF_RENAMED_DOC_TYPES = {"範本修約": "換文修約"}   # 類型改名：存過的設定跟著改
 PDF_DEFAULT_TYPE_BY_NAME = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
 
@@ -8833,7 +8839,12 @@ def _pdf_rule_extract(text, settings):
     issuer = m.group(1) if m else ""
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
     rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
-    if rule.get("date_mode") == "received":
+    if rule.get("date_mode") == "bill_period":
+        # 計費期間：115年09月15日～115年10月04日 → 取結束日
+        m = re.search(r"計費期間[^0-9]{0,6}\d{2,3}年\d{1,2}月\d{1,2}日?[^0-9]{1,4}(\d{2,3})年(\d{1,2})月(\d{1,2})日?", flat)
+        d = f"{int(m.group(1)) + 1911:04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else ""
+        doc_date, date_raw, date_conf = (d, m.group(0), 95) if m and _pdf_valid_date(d) else ("", "", 0)
+    elif rule.get("date_mode") == "received":
         doc_date, date_raw, date_conf = "", "", 0   # 文件上本來就沒有日期，用收件日（_pdf_recognize 補）
     elif rule.get("date_mode") == "stamp":
         # 只認「審核訖」印章日期；讀不到就留空（之後改用收件日並提醒），不拿圖框的繪圖日期
@@ -9275,6 +9286,8 @@ def _pdf_writeback_msg(case, doc_type, doc_date):
                     return f"✓ 進度管理「{milestone}」完成日期已是 {doc_date}，節點改為已完成"
                 return f"✓ 進度管理「{milestone}」完成日期已是 {doc_date}"
             if existing:
+                if (rule or {}).get("milestone_first") and existing < doc_date:
+                    return f"—（進度管理「{milestone}」已是 {existing}，這份是之後的{doc_type}，不用寫回）"
                 return f"⚠ 進度管理「{milestone}」已有完成日期 {existing}（文件 {doc_date}），未覆蓋，請人工確認"
         else:
             ms_id = ensure_milestone_record(case["record_id"], milestone)
