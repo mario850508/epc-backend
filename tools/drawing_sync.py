@@ -1,0 +1,140 @@
+# -*- coding: utf-8 -*-
+"""
+把 G 槽各案場的「審訖圖」（06 政府函文及相關文件）和「系統送審圖」（04 電廠設計圖）同步到主控台，
+讓「採購專區 → 訂單查詢」點進案件時可以直接對照圖面。
+
+  py drawing_sync.py "G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠"            # 掃全部
+  py drawing_sync.py "<root>" --case 工程宜蘭9號                                       # 只同步一案
+  py drawing_sync.py "<root>" --dry-run                                                # 只列出會上傳什麼
+
+規則：每案每種類型只留「檔名日期最新」的一份 PDF；超過 5MB（Airtable 上限）的會列在最後面請人工處理；
+已經上傳過且檔名、修改時間都沒變的不重傳。需要環境變數 EPC_SERVICE_KEY（主控台有開登入保護時用）。
+"""
+import argparse
+import base64
+import datetime
+import os
+import re
+import sys
+
+import requests
+
+BACKEND = "https://epc-backend-4aj2.onrender.com"
+MAX_BYTES = 5 * 1024 * 1024
+CASE_RE = re.compile(r"^\d*\s*((?:工程|潤特)[^\d_\s]+\d+號)")
+CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
+DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
+# (類型, 該類型要找的分類資料夾 04/06, 檔名關鍵字)
+KINDS = [("審訖圖", "6", "審訖圖"), ("系統送審圖", "4", "系統送審圖")]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def api(method, path, **kw):
+    headers = dict(kw.pop("headers", None) or {})
+    key = os.environ.get("EPC_SERVICE_KEY", "").strip()
+    if key:
+        headers["X-Service-Key"] = key
+    return requests.request(method, BACKEND + path, headers=headers, timeout=kw.pop("timeout", 120), **kw)
+
+
+def find_cases(root):
+    """回傳 [(案號, 案場資料夾)]，找到案場資料夾就不再往下走。"""
+    out = []
+    for dirpath, dirnames, _ in os.walk(root):
+        for d in list(dirnames):
+            m = CASE_RE.match(d)
+            if m:
+                out.append((m.group(1), os.path.join(dirpath, d)))
+                dirnames.remove(d)
+    return out
+
+
+def pick_latest(case_dir, cat, keyword):
+    """案場資料夾底下的某分類資料夾裡，檔名含 keyword 的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
+    cands = []
+    for d in os.listdir(case_dir):
+        m = CAT_RE.match(d)
+        if not m or m.group(1) != cat:
+            continue
+        folder = os.path.join(case_dir, d)
+        for fn in os.listdir(folder):
+            if keyword in fn and fn.lower().endswith(".pdf") and not fn.startswith("~"):
+                p = os.path.join(folder, fn)
+                dm = DATE_RE.search(fn)
+                doc_date = "-".join(dm.groups()) if dm else ""
+                cands.append((doc_date, os.path.getmtime(p), p, fn))
+    if not cands:
+        return None
+    cands.sort(reverse=True)
+    return cands[0]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("root", nargs="+")
+    ap.add_argument("--case", default="")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        idx = {i["key"]: i for i in api("GET", "/api/procurement/drawings/index").json().get("items", [])}
+    except Exception as e:
+        log(f"讀取主控台已上傳清單失敗：{e}")
+        return 1
+    log(f"主控台已有 {len(idx)} 份圖面")
+    up = skip = fail = 0
+    too_big = []
+    for root in args.root:
+        cases = find_cases(root)
+        log(f"{root}：找到 {len(cases)} 個案場資料夾")
+        for case_no, case_dir in cases:
+            if args.case and args.case != case_no:
+                continue
+            for kind, cat, kw in KINDS:
+                try:
+                    best = pick_latest(case_dir, cat, kw)
+                except OSError as e:
+                    log(f"  ✗ {case_no} {kind} 讀資料夾失敗：{e}")
+                    fail += 1
+                    continue
+                if not best:
+                    continue
+                doc_date, mtime, path, fn = best
+                mt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                old = idx.get(f"{case_no}|{kind}")
+                if old and old.get("filename") == fn and old.get("mtime") == mt:
+                    skip += 1
+                    continue
+                size = os.path.getsize(path)
+                if size > MAX_BYTES:
+                    too_big.append((case_no, kind, fn, round(size / 1048576, 1)))
+                    continue
+                if args.dry_run:
+                    log(f"  ＋ {case_no} {kind}：{fn}（{round(size / 1024)}KB）")
+                    up += 1
+                    continue
+                with open(path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode()
+                try:
+                    r = api("POST", "/api/procurement/drawings/sync", timeout=180, json={
+                        "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
+                    if r.status_code >= 400:
+                        raise Exception(r.text[:200])
+                    log(f"  ✓ {case_no} {kind}：{fn}")
+                    up += 1
+                except Exception as e:
+                    log(f"  ✗ {case_no} {kind}：{fn} 上傳失敗：{e}")
+                    fail += 1
+    log(f"\n完成：上傳 {up}、沒變略過 {skip}、失敗 {fail}")
+    if too_big:
+        log(f"\n超過 5MB 沒上傳（{len(too_big)} 份）：")
+        for c, k, fn, mb in too_big:
+            log(f"  {c} {k}：{fn}（{mb}MB）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

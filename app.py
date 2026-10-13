@@ -6978,6 +6978,79 @@ def procurement_orders():
     return jsonify({"sources": cache["sources"], "counts": counts, "total": len(out), "rows": out[:300]})
 
 
+# ---- 2026-10-13：案場圖面（審訖圖／系統送審圖）——本機 tools/drawing_sync.py 從 G 槽同步上傳，訂單查詢點進案件時比對用 ----
+DRAWING_TABLE_ID = "tblTBVkdkG7hx1zlk"
+DRAWING_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{DRAWING_TABLE_ID}"
+DRAWING_F = {"key": "fldFRnNFLJ0O23ozF", "case_no": "fldDPePQKWpuWUT2t", "kind": "fld3LmClJqCLz4CYT", "filename": "fldGMpjJsHe5devyy",
+             "doc_date": "fldvGRAr2stcMs6Q3", "file": "flddvWz9R8DgZ0r7x", "src_path": "fldZvHi1xnvbQTpel",
+             "mtime": "fld8x8HmjyfsCnko8", "size_kb": "fldyDSeOLze1VoClW"}
+DRAWING_KINDS = ("審訖圖", "系統送審圖")
+
+
+@app.route("/api/procurement/drawings/index")
+def procurement_drawings_index():
+    """本機同步程式用：目前已上傳的圖面（案號＋類型＋檔名＋來源修改時間），沒變的就不重傳。"""
+    try:
+        recs = airtable_get_all(DRAWING_API_URL, None, [DRAWING_F[k] for k in ("key", "case_no", "kind", "filename", "mtime", "doc_date")])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"items": [{"id": r["id"], "key": r["fields"].get(DRAWING_F["key"], ""), "filename": r["fields"].get(DRAWING_F["filename"], ""),
+                               "mtime": r["fields"].get(DRAWING_F["mtime"], ""), "doc_date": r["fields"].get(DRAWING_F["doc_date"], "")} for r in recs]})
+
+
+@app.route("/api/procurement/drawings/sync", methods=["POST"])
+def procurement_drawings_sync():
+    """body: {case_no, kind(審訖圖|系統送審圖), filename, doc_date, src_path, mtime, data(base64)}；同案同類型只留最新一份。"""
+    body = request.get_json(force=True) or {}
+    case_no, kind = (body.get("case_no") or "").strip(), (body.get("kind") or "").strip()
+    if not case_no or kind not in DRAWING_KINDS:
+        return jsonify({"error": "缺少案號或類型不對"}), 400
+    try:
+        data = base64.b64decode(body.get("data") or "")
+    except Exception:
+        return jsonify({"error": "檔案內容不是 base64"}), 400
+    if not data.startswith(b"%PDF"):
+        return jsonify({"error": "不是 PDF"}), 400
+    if len(data) > PDF_MAX_BYTES:
+        return jsonify({"error": "超過 5MB（Airtable 單檔上傳上限）"}), 413
+    filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
+    key = f"{case_no}|{kind}"
+    try:
+        old = airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["key"] + "}='" + key.replace("'", chr(92) + "'") + "'", [DRAWING_F["key"]])
+        resp = requests.post(DRAWING_API_URL, headers=airtable_headers(), json={"fields": {
+            DRAWING_F["key"]: key, DRAWING_F["case_no"]: case_no, DRAWING_F["kind"]: kind, DRAWING_F["filename"]: filename,
+            DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
+            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024)}}, timeout=30)
+        if resp.status_code >= 400:
+            raise Exception(resp.text)
+        rid = resp.json()["id"]
+        try:
+            upload_attachment_to_ops_record(rid, DRAWING_F["file"], base64.b64encode(data).decode(), filename, content_type="application/pdf")
+        except Exception:
+            requests.delete(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+            raise
+        for o in old:   # 新的上傳成功後才刪舊的
+            requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
+        return jsonify({"ok": True, "id": rid, "replaced": len(old)})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+
+
+def _case_drawings_from_sync(case_no):
+    """案場圖面表裡這案的圖面（審訖圖優先），格式同 case-detail 的 drawing。"""
+    recs = airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["case_no"] + "}='" + case_no.replace("'", chr(92) + "'") + "'", list(DRAWING_F.values()))
+    out = []
+    for r in recs:
+        f = r["fields"]
+        att = (f.get(DRAWING_F["file"]) or [{}])[0]
+        if not att.get("url"):
+            continue
+        out.append({"id": r["id"], "doc_type": f.get(DRAWING_F["kind"], ""), "doc_date": f.get(DRAWING_F["doc_date"], ""), "status": "G槽",
+                    "name": f.get(DRAWING_F["filename"], "") or att.get("filename", ""), "ext": "pdf", "file_url": att["url"]})
+    out.sort(key=lambda x: 0 if x["doc_type"] == "審訖圖" else 1)
+    return out
+
+
 @app.route("/api/procurement/case-detail")
 def procurement_case_detail():
     """2026-10-13：訂單查詢點進案件——這案的所有訂單（模組＋變流器，全部狀態）、專案細節裡登記的規格，
@@ -7009,7 +7082,15 @@ def procurement_case_detail():
     if not spec["address"]:
         spec["address"] = _addr_fallback(case_no)
     drawing, others = None, []
+    try:   # 先看 G 槽同步上來的圖面（審訖圖優先、其次系統送審圖）
+        synced = _case_drawings_from_sync(case_no)
+        if synced:
+            drawing, others = synced[0], synced[1:4]
+    except Exception as e:
+        print(f"[case-detail] 查案場圖面失敗：{e}", flush=True)
     try:
+        if drawing:
+            raise StopIteration
         formula = ("AND({" + PDF_F["case_no"] + "}='" + case_no.replace("'", chr(92) + "'") + "',OR({" + PDF_F["doc_type"] + "}='審訖圖',{"
                    + PDF_F["doc_type"] + "}='系統送審圖'),{" + PDF_F["status"] + "}!='" + PDF_ST_FAILED + "',{" + PDF_F["status"] + "}!='"
                    + PDF_ST_QUEUED + "',{" + PDF_F["status"] + "}!='" + PDF_ST_RUNNING + "')")
@@ -7023,7 +7104,8 @@ def procurement_case_detail():
             drawing = pack(cands[0])
             others = [pack(x) for x in cands[1:4]]
     except Exception as e:
-        print(f"[case-detail] 查審訖圖失敗：{e}", flush=True)
+        if not isinstance(e, StopIteration):
+            print(f"[case-detail] 查審訖圖失敗：{e}", flush=True)
     return jsonify({"case": case_no, "alias": spec["alias"] or next((o["alias"] for o in orders if o["alias"]), ""),
                     "spec": spec, "orders": orders, "drawing": drawing, "other_drawings": others})
 
