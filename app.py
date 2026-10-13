@@ -9168,6 +9168,28 @@ def pdf_rename_items():
     return jsonify({"items": items, "archived_days": PDF_ARCHIVED_KEEP_DAYS})
 
 
+@app.route("/api/pdf-rename/history")
+def pdf_rename_history():
+    """2026-10-13：歷史紀錄用——超過 30 天、已不在清單快取裡的「已歸檔」紀錄（輕量欄位，不含辨識全文）。最多 400 筆，新到舊。"""
+    formula = ("AND({" + PDF_F["status"] + "}='" + PDF_ST_ARCHIVED + "',NOT(IS_AFTER({" + PDF_F["confirmed_at"]
+               + "},DATEADD(TODAY(),-" + str(PDF_ARCHIVED_KEEP_DAYS) + ",'days'))))")
+    keys = ["src_name", "case_no", "alias", "doc_type", "doc_date", "final_name", "suggested", "confirmed_at", "confirmed_by", "uploader", "source", "status"]
+    try:
+        recs = airtable_get_all(PDF_API_URL, formula, [PDF_F[k] for k in keys])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    out = []
+    for r in recs:
+        f = r["fields"]
+        g = lambda k: f.get(PDF_F[k])
+        out.append({"id": r["id"], "status": g("status") or "", "src_name": g("src_name") or "", "case_no": g("case_no") or "",
+                    "alias": g("alias") or "", "doc_type": g("doc_type") or "", "doc_date": g("doc_date") or "",
+                    "final_name": g("final_name") or g("suggested") or "", "confirmed_at": g("confirmed_at") or "",
+                    "confirmed_by": g("confirmed_by") or "", "uploader": g("uploader") or "", "source": g("source") or ""})
+    out.sort(key=lambda x: x["confirmed_at"], reverse=True)
+    return jsonify({"items": out[:400], "total": len(out)})
+
+
 @app.route("/api/pdf-rename/<record_id>/info")
 def pdf_rename_info(record_id):
     """單份完整資料（含辨識出的全文），主控台打開確認視窗時用。"""
