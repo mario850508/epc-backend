@@ -6905,6 +6905,79 @@ def procurement_folder_files():
     return jsonify({"files": files, "skipped": skipped, "synced": True})
 
 
+# ---- 訂單查詢（2026-10-13）----
+# 元晶模組／碩天變流器的「需求」Excel 由使用者電腦的 order_sheets.py 解析成 JSON，存在
+# 「採購-訂單快照」（一個廠商一筆、附件 orders_<廠商>.json）。這裡下載附件後在記憶體快取 10 分鐘，
+# 依查詢條件篩選並把同一案同一次下單的多個型號併成一列回傳（碩天已出貨有上千列，不整包丟給前端）。
+ORDER_SNAPSHOT_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tblLbdw9QyiYkAtE1"
+OS_FIELD_VENDOR = "flduZfjG2C6w3plFi"
+OS_FIELD_FILE = "fldjz2rNTY1Y3Zyez"
+_ORDER_CACHE = {"at": 0, "sources": [], "rows": []}
+
+
+def _load_order_snapshots():
+    if time.time() - _ORDER_CACHE["at"] < 600 and _ORDER_CACHE["rows"]:
+        return _ORDER_CACHE
+    records = airtable_get_all(ORDER_SNAPSHOT_API_URL, None, [OS_FIELD_VENDOR, OS_FIELD_FILE])
+    sources, rows = [], []
+    for r in records:
+        att = (r.get("fields", {}).get(OS_FIELD_FILE) or [{}])[0]
+        if not att.get("url"):
+            continue
+        resp = requests.get(att["url"], timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        sources.append({**{k: data.get(k) for k in ("vendor", "equipment", "source_file", "source_modified", "parsed_at")},
+                        "count": len(data.get("rows", []))})
+        rows.extend(data.get("rows", []))
+    _ORDER_CACHE.update({"at": time.time(), "sources": sources, "rows": rows})
+    return _ORDER_CACHE
+
+
+@app.route("/api/procurement/orders")
+def procurement_orders():
+    """q：案號/別名/EPC/型號/簽收人關鍵字；status：已成立/已出貨/取消/可能撤案/all（預設 已成立）；
+    equipment：模組/變流器/all。回傳併成一案一列的結果（最多 300 列）與各狀態筆數。"""
+    try:
+        cache = _load_order_snapshots()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    q = (request.args.get("q") or "").strip().replace("台", "臺")
+    status = request.args.get("status") or "已成立"
+    equipment = request.args.get("equipment") or "all"
+
+    def hit(r):
+        if equipment != "all" and r.get("equipment") != equipment:
+            return False
+        if q:
+            hay = " ".join(str(r.get(k, "")) for k in ("case_no", "alias", "epc", "model", "receiver", "ship_to", "site_addr", "note"))
+            return q in hay.replace("台", "臺")
+        return True
+
+    matched = [r for r in cache["rows"] if hit(r)]
+    counts = {}
+    for r in matched:
+        counts[r.get("status", "")] = counts.get(r.get("status", ""), 0) + 1
+    if status != "all":
+        matched = [r for r in matched if r.get("status") == status]
+
+    groups = {}
+    for r in matched:
+        key = (r.get("vendor"), r.get("case_no"), r.get("status"), str(r.get("order_date", "")), str(r.get("arrival", "")))
+        g = groups.get(key)
+        if g is None:
+            g = groups[key] = {k: r.get(k, "") for k in (
+                "vendor", "equipment", "status", "order_date", "case_no", "alias", "arrival", "shipped_at",
+                "warranty", "ship_to", "site_addr", "epc", "receiver", "phone", "paid_at", "company")}
+            g["items"], g["notes"] = [], []
+        g["items"].append({"model": r.get("model", ""), "qty": r.get("qty", "")})
+        note = str(r.get("note", "") or "").strip()
+        if note and note not in g["notes"]:
+            g["notes"].append(note)
+    out = sorted(groups.values(), key=lambda g: (str(g["order_date"] or ""), g["case_no"] or ""), reverse=True)
+    return jsonify({"sources": cache["sources"], "counts": counts, "total": len(out), "rows": out[:300]})
+
+
 @app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
 def procurement_inverter_cert_rename(record_id):
     """送出改名請求（寫入「改名為」），本機 cert_agent.py 一分鐘內套用到 G 槽。"""
