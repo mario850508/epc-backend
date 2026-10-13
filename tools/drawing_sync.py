@@ -28,6 +28,12 @@ DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
 KINDS = [("審訖圖", "6", "審訖圖"), ("系統送審圖", "4", "系統送審圖")]
 
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
 def log(msg):
     print(msg, flush=True)
 
@@ -60,6 +66,8 @@ def pick_latest(case_dir, cat, keyword):
         if not m or m.group(1) != cat:
             continue
         folder = os.path.join(case_dir, d)
+        if not os.path.isdir(folder):
+            continue
         for fn in os.listdir(folder):
             if keyword in fn and fn.lower().endswith(".pdf") and not fn.startswith("~"):
                 p = os.path.join(folder, fn)
@@ -77,6 +85,8 @@ def main():
     ap.add_argument("root", nargs="+")
     ap.add_argument("--case", default="")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--open-orders", action="store_true",
+                    help="只同步「還沒出貨」(已成立／可能撤案) 訂單的案件，省 Airtable 空間；全部案場約 1.4GB，不建議全傳")
     args = ap.parse_args()
 
     try:
@@ -85,6 +95,15 @@ def main():
         log(f"讀取主控台已上傳清單失敗：{e}")
         return 1
     log(f"主控台已有 {len(idx)} 份圖面")
+    only = set()
+    if args.open_orders:
+        for st in ("已成立", "可能撤案"):
+            try:
+                only |= {r["case_no"] for r in api("GET", "/api/procurement/orders", params={"status": st}).json().get("rows", []) if r.get("case_no")}
+            except Exception as e:
+                log(f"讀取 {st} 訂單失敗：{e}")
+                return 1
+        log(f"還沒出貨的訂單共 {len(only)} 個案件")
     up = skip = fail = 0
     too_big = []
     for root in args.root:
@@ -92,6 +111,8 @@ def main():
         log(f"{root}：找到 {len(cases)} 個案場資料夾")
         for case_no, case_dir in cases:
             if args.case and args.case != case_no:
+                continue
+            if args.open_orders and case_no not in only:
                 continue
             for kind, cat, kw in KINDS:
                 try:
