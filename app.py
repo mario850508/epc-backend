@@ -7107,6 +7107,62 @@ def _case_drawings_from_sync(case_no):
     return out
 
 
+# ---- 工程部「案件配比」信（2026-10-13）----
+# mario.xu 信箱的 Apps Script「案件配比信收集」把信匯出到 G 槽，本機 mail_configs.py 解析成
+# {案號: [信件…]}，存在「採購-案件配比快照」（一筆、附件 JSON）。這裡快取 10 分鐘，給案件視窗跟訂單比對。
+MAIL_CFG_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tbldcBCcDlBtsU5Hl"
+MAIL_CFG_FIELD_FILE = "fldVcqZDEbm7aYAkB"
+_MAIL_CFG_CACHE = {"at": 0, "cases": {}, "parsed_at": ""}
+
+
+def _load_mail_configs():
+    if time.time() - _MAIL_CFG_CACHE["at"] < 600:
+        return _MAIL_CFG_CACHE
+    recs = airtable_get_all(MAIL_CFG_API_URL, None, [MAIL_CFG_FIELD_FILE])
+    cases, parsed_at = {}, ""
+    for r in recs:
+        att = (r.get("fields", {}).get(MAIL_CFG_FIELD_FILE) or [{}])[0]
+        if att.get("url"):
+            resp = requests.get(att["url"], timeout=60)
+            resp.raise_for_status()
+            d = resp.json()
+            cases, parsed_at = d.get("cases", {}), d.get("parsed_at", "")
+    _MAIL_CFG_CACHE.update({"at": time.time(), "cases": cases, "parsed_at": parsed_at})
+    return _MAIL_CFG_CACHE
+
+
+def _norm_model(m):
+    return _re.sub(r"[\s\-_]", "", str(m or "").upper())
+
+
+def _config_check(cfg, orders):
+    """配比信（最新一封）跟訂單比對：每個型號的片數／台數。訂單排除「取消」「可能撤案」。
+    型號比對忽略空白與連字號，並允許前綴相符（信裡常省略 (S)、H6QT 等尾碼）。"""
+    live = [o for o in orders if o.get("status") not in ("取消", "可能撤案")]
+
+    def ordered(model, equipment):
+        nm = _norm_model(model)
+        total = 0
+        for o in live:
+            if o.get("equipment") != equipment:
+                continue
+            om = _norm_model(o.get("model"))
+            if om and nm and (om == nm or om.startswith(nm) or nm.startswith(om)):
+                try:
+                    total += int(float(o.get("qty") or 0))
+                except (TypeError, ValueError):
+                    pass
+        return total
+
+    out = []
+    for kind, equipment in (("modules", "模組"), ("inverters", "變流器")):
+        for it in cfg.get(kind, []):
+            got = ordered(it["model"], equipment)
+            out.append({"equipment": equipment, "model": it["model"], "mail_qty": it["qty"], "order_qty": got,
+                        "ok": got == it["qty"]})
+    return out
+
+
 @app.route("/api/procurement/case-detail")
 def procurement_case_detail():
     """2026-10-13：訂單查詢點進案件——這案的所有訂單（模組＋變流器，全部狀態）、專案細節裡登記的規格，
@@ -7162,8 +7218,19 @@ def procurement_case_detail():
     except Exception as e:
         if not isinstance(e, StopIteration):
             print(f"[case-detail] 查審訖圖失敗：{e}", flush=True)
+    mail_cfgs, cfg_check, mail_parsed_at = [], [], ""
+    try:
+        mc = _load_mail_configs()
+        mail_cfgs = (mc["cases"].get(case_no) or [])[:5]
+        mail_parsed_at = mc["parsed_at"]
+        latest = next((c for c in mail_cfgs if c.get("modules") or c.get("inverters")), None)
+        if latest:
+            cfg_check = _config_check(latest, orders)
+    except Exception as e:
+        print(f"[case-detail] 查案件配比信失敗：{e}", flush=True)
     return jsonify({"case": case_no, "alias": spec["alias"] or next((o["alias"] for o in orders if o["alias"]), ""),
-                    "spec": spec, "orders": orders, "drawing": drawing, "other_drawings": others})
+                    "spec": spec, "orders": orders, "drawing": drawing, "other_drawings": others,
+                    "mail_configs": mail_cfgs, "config_check": cfg_check, "mail_parsed_at": mail_parsed_at})
 
 
 # ===================================================================
