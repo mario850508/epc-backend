@@ -4615,7 +4615,7 @@ def completed_cases():
     自己的狀態，這裡一律回傳全部已進場案件，由前端自行過濾顯示。"""
     return jsonify({
         "count": len(DATA_CACHE["completed"]),
-        "cases": DATA_CACHE["completed"],
+        "cases": _entry_with_order_dates(DATA_CACHE["completed"]),
         "updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
         "refreshing_started_at": (
