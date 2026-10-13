@@ -708,7 +708,7 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
-def _find_slot_conflict(vendor, date, start_time, end_time):
+def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None):
     """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
     資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
     escaped_vendor = vendor.replace("'", "\\'")
@@ -722,6 +722,8 @@ def _find_slot_conflict(vendor, date, start_time, end_time):
         [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
     )
     for r in existing:
+        if ignore_ids and r["id"] in ignore_ids:   # 變更預約時，自己（和同時預約的案件）不算衝突
+            continue
         ef = r["fields"]
         es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
         if not es or not ee:
@@ -10468,6 +10470,127 @@ def vendor_batch_notice():
     return jsonify({"ok": True, "count": len(items), "plain_text": plain,
                     "liff_url": f"https://liff.line.me/{liff_id}?vshare={token}~vb" if liff_id else "",
                     "missing_phone": [it["case"] for it in items if len("".join(c for c in it["owner_phone"] if c.isdigit())) < 8]})
+
+
+# ===================================================================
+# 2026-10-12：變更預約（完成安排）——改屋主資料、日期時間、備註，並可「加入同時預約的案件」。
+# 同時預約的案件（同一個時段一起施作）會跟著改日期時間；新加入的案件會建一筆同時段的預約，
+# 而且如果那個案件在「指派任務」裡還有未完成的任務，會一併標成已完成（併入這筆預約）。
+# ===================================================================
+def _booking_siblings(rec):
+    """跟這筆預約「同時預約」的其他預約記錄（同廠商、同日期、同時段、案號在同時預約案號裡）。"""
+    f = rec.get("fields", {})
+    comps = _clean_companions(f.get(FIELD_SLOT_COMPANIONS) or "", f.get(FIELD_SLOT_CASE_NO, ""))
+    if not comps:
+        return []
+    esc = lambda x: (x or "").replace("'", chr(92) + "'")
+    formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc(f.get(FIELD_SLOT_VENDOR))}',"
+               f"IS_SAME({{{FIELD_SLOT_DATE}}},'{f.get(FIELD_SLOT_DATE)}','day'),"
+               f"{{{FIELD_SLOT_START}}}='{f.get(FIELD_SLOT_START)}',{{{FIELD_SLOT_END}}}='{f.get(FIELD_SLOT_END)}')")
+    recs = airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_KIND, FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END,
+                                                    FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_COMPANIONS])
+    return [r for r in recs if r["id"] != rec["id"] and r["fields"].get(FIELD_SLOT_CASE_NO) in comps]
+
+
+@app.route("/api/vendor-slots/<record_id>", methods=["PATCH"])
+def update_vendor_slot_booking(record_id):
+    """body: {date, start_time, end_time, owner_name, owner_phone, note, add_companions:[案號...]}（都選填，沒帶的不改）"""
+    body = request.get_json(force=True) or {}
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    f = rec.get("fields", {})
+    if f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "這筆已經不是有效的預約（可能已經取消）"}), 409
+    vendor, case_no = f.get(FIELD_SLOT_VENDOR, ""), f.get(FIELD_SLOT_CASE_NO, "")
+    types = f.get(FIELD_SLOT_TYPE) or []
+    date0, start0, end0 = f.get(FIELD_SLOT_DATE, ""), f.get(FIELD_SLOT_START, ""), f.get(FIELD_SLOT_END, "")
+    date = (body.get("date") or date0).strip()
+    start = (body.get("start_time") or start0).strip()
+    end = (body.get("end_time") or end0).strip()
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+        s_m, e_m = _parse_hhmm(start), _parse_hhmm(end)
+    except Exception:
+        return jsonify({"error": "日期或時間格式不對"}), 400
+    if e_m <= s_m:
+        return jsonify({"error": "結束時間要晚於開始時間"}), 400
+    try:
+        siblings = _booking_siblings(rec)
+    except Exception as e:
+        return jsonify({"error": "查詢同時預約的案件失敗", "detail": str(e)}), 502
+    group = [rec] + siblings
+    changed_time = (date, start, end) != (date0, start0, end0)
+    if changed_time:
+        try:
+            conflict = _find_slot_conflict(vendor, date, start, end, ignore_ids={r["id"] for r in group})
+        except Exception as e:
+            return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+        if conflict:
+            return jsonify({"error": "這個時段已經被佔用了", "conflict": conflict}), 409
+    # 新加入的同時預約案件
+    existing_cases = [r["fields"].get(FIELD_SLOT_CASE_NO, "") for r in group]
+    new_cases = [c for c in _clean_companions(body.get("add_companions"), case_no) if c not in existing_cases]
+    all_cases = existing_cases + new_cases
+    title = f"{vendor} {date} {start}-{end} {'/'.join(types)}"
+    for r in group:
+        rf = r["fields"]
+        patch = {FIELD_SLOT_DATE: date, FIELD_SLOT_START: start, FIELD_SLOT_END: end, FIELD_SLOT_TITLE: title}
+        if "owner_name" in body:
+            patch[FIELD_SLOT_OWNER_NAME] = (body.get("owner_name") or "").strip()[:40]
+        if "owner_phone" in body:
+            patch[FIELD_SLOT_OWNER_PHONE] = (body.get("owner_phone") or "").strip()[:40]
+        if r["id"] == rec["id"] and "note" in body:
+            patch[FIELD_SLOT_NOTE] = (body.get("note") or "").strip()[:500]
+        if new_cases:
+            patch[FIELD_SLOT_COMPANIONS] = "、".join(c for c in all_cases if c != rf.get(FIELD_SLOT_CASE_NO, ""))
+        resp = requests.patch(f"{SLOT_API_URL}/{r['id']}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    if date != date0:   # 預計日期欄位跟著改（舊日期清掉、新日期寫入）
+        for r in group:
+            rf = r["fields"]
+            try:
+                _revert_case_dates(rf.get(FIELD_SLOT_CASE_NO, ""), rf.get(FIELD_SLOT_TYPE) or types, date0)
+                _sync_booking_to_case_dates(rf.get(FIELD_SLOT_CASE_NO, ""), rf.get(FIELD_SLOT_TYPE) or types, date)
+            except Exception as e:
+                print(f"[update_vendor_slot_booking] 同步預計日期失敗：{e}", flush=True)
+    merged_tasks = []
+    for cc in new_cases:
+        try:
+            f2 = dict(f)
+            for k in ("createdTime",):
+                f2.pop(k, None)
+            f2.update({FIELD_SLOT_DATE: date, FIELD_SLOT_START: start, FIELD_SLOT_END: end, FIELD_SLOT_TITLE: title,
+                       FIELD_SLOT_CASE_NO: cc, FIELD_SLOT_ALIAS: _case_alias(cc),
+                       FIELD_SLOT_COMPANIONS: "、".join(c for c in all_cases if c != cc)})
+            if "owner_name" in body:
+                f2[FIELD_SLOT_OWNER_NAME] = (body.get("owner_name") or "").strip()[:40]
+            if "owner_phone" in body:
+                f2[FIELD_SLOT_OWNER_PHONE] = (body.get("owner_phone") or "").strip()[:40]
+            for k in (FIELD_SLOT_VENDOR_TOKEN, FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_PM_NOTE, FIELD_SLOT_DAY_REMINDED):
+                f2.pop(k, None)   # 新的一筆：沒通知過、沒有廠商通知 token
+            r2 = requests.post(SLOT_API_URL, headers=airtable_headers(), json={"fields": f2}, timeout=20)
+            if r2.status_code >= 400:
+                print(f"[update_vendor_slot_booking] 新增同時預約 {cc} 失敗：{r2.text[:200]}", flush=True)
+                continue
+            new_id = r2.json()["id"]
+            try:
+                _sync_booking_to_case_dates(cc, types, date)
+            except Exception as e:
+                print(f"[update_vendor_slot_booking] 同步 {cc} 日期失敗：{e}", flush=True)
+            # 這個案件如果還有未完成的指派任務 → 併入這筆預約（標成已完成）
+            esc = cc.replace("'", chr(92) + "'")
+            trs = airtable_get_all(TASK_API_URL, f"AND({{{FIELD_TASK_CASE_NO}}}='{esc}',{{{FIELD_TASK_STATUS}}}='{TASK_STATUS_PENDING}')", _task_fields())
+            for tr in trs:
+                try:
+                    _patch_task(tr["id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: new_id, FIELD_TASK_STAGE: None})
+                    merged_tasks.append(cc)
+                except Exception as e:
+                    print(f"[update_vendor_slot_booking] 標記任務完成失敗：{e}", flush=True)
+        except Exception as e:
+            print(f"[update_vendor_slot_booking] 新增同時預約 {cc} 例外：{e}", flush=True)
+    return jsonify({"ok": True, "updated": len(group), "added": new_cases, "merged_tasks": merged_tasks, "time_changed": changed_time})
 
 
 if __name__ == "__main__":
