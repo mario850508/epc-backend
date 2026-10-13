@@ -264,6 +264,7 @@ AUTH_PUBLIC_EXACT = {
 AUTH_MACHINE_EXACT = {
     "/api/pdf-rename/watcher-config", "/api/pdf-rename/watcher-upload", "/api/pdf-rename/watcher-heartbeat",
     "/api/pdf-rename/confirmed", "/api/pdf-rename/status", "/api/pdf-rename/line-originals",
+    "/api/line/groups/seen",   # line-pdf-collector 回報機器人所在的群組（2026-10-13）
 }
 AUTH_MACHINE_RE = _re.compile(r"^/api/pdf-rename/[^/]+/(archive-claim|archived|file)$")
 MACHINE_HITS = {}
@@ -7108,6 +7109,212 @@ def procurement_case_detail():
             print(f"[case-detail] 查審訖圖失敗：{e}", flush=True)
     return jsonify({"case": case_no, "alias": spec["alias"] or next((o["alias"] for o in orders if o["alias"]), ""),
                     "spec": spec, "orders": orders, "drawing": drawing, "other_drawings": others})
+
+
+# ===================================================================
+# LINE 群組登記＋元晶「明天到貨，請提供貨運司機資訊」自動通知（2026-10-13）
+# ===================================================================
+# 陽光機器人的 webhook 設在 line-pdf-collector（LINE 收件／自動歸檔靠它，不能改指過來），
+# 所以由 collector 在收到任何群組事件（被邀請入群、有人講話）時，把 groupId 回報到
+# POST /api/line/groups/seen，存在 Airtable「LINE群組」。主控台在「訂單查詢」頁設定哪個群組的
+# 「用途」＝元晶出貨司機資訊，每天 14:00（台北）就把元晶訂單表裡「預計到貨時間＝明天」的已成立
+# 訂單整理成一張卡片推到那個群組。同一天只發一次（「最後通知日」），14:30～17:30 是失敗或重啟時的補發。
+LINE_GROUP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tbl92fEY1pDy9u1X2"
+LG_ID = "fldNXUO7tj7A5fljT"
+LG_NAME = "fldQyVtM95KuPAvMI"
+LG_PURPOSE = "fldOWfURYzWCsZaZ8"
+LG_EVENT = "fldrYqxEaBFYfrgkw"
+LG_SEEN = "fldjocN3KmBqcAszt"
+LG_NOTIFY_DATE = "fldC27JCNNBQamjKL"
+LG_NOTIFY_RESULT = "fldTtElh7RMgtWJBs"
+PURPOSE_DRIVER = "元晶出貨司機資訊"
+_LINE_GROUP_SEEN = {}
+_GROUP_ID_RE = _re.compile(r"^C[0-9a-f]{32}$")
+
+
+def _tw_now():
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def _line_group_name(group_id):
+    token, _ = _line_config()
+    if not token:
+        return ""
+    try:
+        r = requests.get(f"https://api.line.me/v2/bot/group/{group_id}/summary",
+                         headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        return r.json().get("groupName", "") if r.status_code < 400 else ""
+    except Exception:
+        return ""
+
+
+def _line_groups():
+    recs = airtable_get_all(LINE_GROUP_API_URL, None, [LG_ID, LG_NAME, LG_PURPOSE, LG_EVENT, LG_SEEN, LG_NOTIFY_DATE, LG_NOTIFY_RESULT])
+    out = []
+    for r in recs:
+        f = r.get("fields", {})
+        out.append({"id": r["id"], "group_id": f.get(LG_ID, ""), "name": f.get(LG_NAME, ""),
+                    "purposes": f.get(LG_PURPOSE) or [], "last_event": f.get(LG_EVENT, ""),
+                    "last_seen": f.get(LG_SEEN, ""), "notify_date": f.get(LG_NOTIFY_DATE, ""),
+                    "notify_result": f.get(LG_NOTIFY_RESULT, "")})
+    return out
+
+
+@app.route("/api/line/groups/seen", methods=["POST"])
+def line_group_seen():
+    body = request.get_json(force=True) or {}
+    gid = (body.get("group_id") or "").strip()
+    event = (body.get("event") or "").strip()[:40]
+    if not _GROUP_ID_RE.match(gid):
+        return jsonify({"ok": False, "error": "不是群組 ID"}), 400
+    now = time.time()
+    if event not in ("join", "leave", "memberJoined") and now - _LINE_GROUP_SEEN.get(gid, 0) < 1800:
+        return jsonify({"ok": True, "skipped": "30 分鐘內回報過"})
+    _LINE_GROUP_SEEN[gid] = now
+    try:
+        existing = airtable_get_all(LINE_GROUP_API_URL, "{" + LG_ID + "}='" + gid + "'", [LG_ID, LG_NAME])
+        fields = {LG_ID: gid, LG_EVENT: event or "message", LG_SEEN: datetime.utcnow().isoformat() + "Z"}
+        name = _line_group_name(gid)
+        if name:
+            fields[LG_NAME] = name
+        if existing:
+            requests.patch(f"{LINE_GROUP_API_URL}/{existing[0]['id']}", headers=airtable_headers(),
+                           json={"fields": fields, "typecast": True}, timeout=20).raise_for_status()
+        else:
+            requests.post(LINE_GROUP_API_URL, headers=airtable_headers(),
+                          json={"fields": fields, "typecast": True}, timeout=20).raise_for_status()
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 502
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/line/groups")
+def line_groups_list():
+    try:
+        groups = _line_groups()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    groups.sort(key=lambda g: g["last_seen"] or "", reverse=True)
+    return jsonify({"groups": groups})
+
+
+@app.route("/api/line/groups/<record_id>/purpose", methods=["POST"])
+def line_group_set_purpose(record_id):
+    body = request.get_json(force=True) or {}
+    purposes = [p for p in (body.get("purposes") or []) if p in (PURPOSE_DRIVER,)]
+    resp = requests.patch(f"{LINE_GROUP_API_URL}/{record_id}", headers=airtable_headers(),
+                          json={"fields": {LG_PURPOSE: purposes}, "typecast": True}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True, "purposes": purposes})
+
+
+def _parse_arrival_date(text):
+    m = _re.search(r"(\d{4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,2})", str(text or ""))
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except ValueError:
+        return None
+
+
+def _driver_request_cases(target_date):
+    """元晶訂單表裡「已成立」且預計到貨時間＝target_date 的訂單，依案號合併。"""
+    cache = _load_order_snapshots()
+    cases = {}
+    for r in cache["rows"]:
+        if r.get("vendor") != "元晶" or r.get("status") != "已成立":
+            continue
+        if _parse_arrival_date(r.get("arrival")) != target_date:
+            continue
+        c = cases.setdefault(r.get("case_no", ""), {
+            "case_no": r.get("case_no", ""), "alias": r.get("alias", ""), "arrival": r.get("arrival", ""),
+            "ship_to": r.get("ship_to", ""), "receiver": r.get("receiver", ""), "phone": r.get("phone", ""),
+            "epc": r.get("epc", ""), "items": []})
+        c["items"].append(f"{r.get('model', '')} × {r.get('qty', '')}")
+    return sorted(cases.values(), key=lambda c: c["case_no"])
+
+
+def _driver_request_card(target_date, cases):
+    label = _wd_label(target_date.isoformat())
+    sections = []
+    for c in cases:
+        lines = ["型號：" + "、".join(c["items"]), f"到貨：{c['arrival']}"]
+        if c["ship_to"]:
+            lines.append(f"出貨地址：{c['ship_to']}")
+        recv = " ".join(x for x in [c["epc"], c["receiver"], c["phone"]] if x and x != "待確認")
+        if recv:
+            lines.append(f"簽收：{recv}")
+        sections.append((f"📦 {c['case_no']} {c['alias']}".strip(), lines))
+    return _card("🚚 明天到貨｜請提供貨運司機資訊", "#7C3AED", f"{label} 到貨，共 {len(cases)} 案",
+                 subtitle="元晶 您好，以下案場明天到貨，麻煩提供貨運司機的姓名、電話與車號（及預計抵達時間），謝謝！",
+                 sections=sections, footer="陽光伏特家 採購通知（系統自動發送）")
+
+
+def send_driver_requests(force=False, target_date=None):
+    """發給「用途」含元晶出貨司機資訊的群組。沒有明天到貨的訂單就不發。回傳每個群組的結果。"""
+    today = _tw_now().date()
+    target = target_date or (today + timedelta(days=1))
+    groups = [g for g in _line_groups() if PURPOSE_DRIVER in g["purposes"]]
+    if not groups:
+        return {"date": target.isoformat(), "sent": [], "note": "還沒有設定要通知的群組"}
+    cases = _driver_request_cases(target)
+    if not cases:
+        return {"date": target.isoformat(), "sent": [], "note": "明天沒有元晶到貨的訂單，不發送"}
+    card = _driver_request_card(target, cases)
+    results = []
+    for g in groups:
+        if g["notify_date"] == today.isoformat() and not force:
+            results.append({"group": g["name"] or g["group_id"], "ok": True, "skipped": "今天已發過"})
+            continue
+        ok, err = _line_push_card(card, to=g["group_id"])
+        msg = (f"{_tw_now():%m/%d %H:%M} 已發送 {len(cases)} 案（{target:%m/%d} 到貨）" if ok else f"發送失敗：{err[:200]}")
+        try:
+            fields = {LG_NOTIFY_RESULT: msg}
+            if ok:
+                fields[LG_NOTIFY_DATE] = today.isoformat()
+            requests.patch(f"{LINE_GROUP_API_URL}/{g['id']}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        except Exception as e:
+            print(f"[send_driver_requests] 回寫失敗：{e}", flush=True)
+        results.append({"group": g["name"] or g["group_id"], "ok": ok, "error": "" if ok else err[:200]})
+    return {"date": target.isoformat(), "cases": len(cases), "sent": results}
+
+
+def _driver_request_job():
+    try:
+        r = send_driver_requests()
+        print(f"[driver_request] {r}", flush=True)
+    except Exception as e:
+        print(f"[driver_request] 失敗：{e}", flush=True)
+
+
+scheduler.add_job(_driver_request_job, CronTrigger(hour="14-17", minute="0,30", timezone="Asia/Taipei"),
+                  id="driver_request", replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
+
+
+@app.route("/api/procurement/driver-request/preview")
+def driver_request_preview():
+    try:
+        d = request.args.get("date")
+        target = datetime.strptime(d, "%Y-%m-%d").date() if d else _tw_now().date() + timedelta(days=1)
+        cases = _driver_request_cases(target)
+        groups = _line_groups()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    card = _driver_request_card(target, cases)
+    return jsonify({"date": target.isoformat(), "cases": cases, "groups": groups,
+                    "text": _card_plain_text(card) if cases else "", "send_time": "每天 14:00（同一天只發一次）"})
+
+
+@app.route("/api/procurement/driver-request/send", methods=["POST"])
+def driver_request_send_now():
+    body = request.get_json(force=True) or {}
+    try:
+        target = datetime.strptime(body["date"], "%Y-%m-%d").date() if body.get("date") else None
+        return jsonify(send_driver_requests(force=True, target_date=target))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/procurement/inverter-certs/<record_id>/rename", methods=["POST"])
