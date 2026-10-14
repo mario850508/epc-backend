@@ -7420,14 +7420,16 @@ def _driver_request_cases(target_date, vendor="元晶"):
     return sorted(cases.values(), key=lambda c: c["case_no"])
 
 
-def _driver_request_card(target_date, cases):
+def _driver_request_card(target_date, cases, include_epc=False):
+    """include_epc：簽收那行要不要寫 EPC 廠商名稱。給元晶的版本（群組／採購轉傳／預覽）不寫，
+    只有採購自己收到的那張寫（2026-10-14 使用者要求）。"""
     label = _wd_label(target_date.isoformat())
     sections = []
     for c in cases:
         lines = ["型號：" + "、".join(c["items"]), f"到貨：{c['arrival']}"]
         if c["ship_to"]:
             lines.append(f"出貨地址：{c['ship_to']}")
-        recv = " ".join(x for x in [c["epc"], c["receiver"], c["phone"]] if x and x != "待確認")
+        recv = " ".join(x for x in [c["epc"] if include_epc else "", c["receiver"], c["phone"]] if x and x != "待確認")
         if recv:
             lines.append(f"簽收：{recv}")
         sections.append((f"📦 {c['case_no']} {c['alias']}".strip(), lines))
@@ -7485,7 +7487,7 @@ def send_driver_requests(force=False, target_date=None):
             continue
         oks, errs = [], []
         if cases:
-            bc = _driver_request_card(target, cases)
+            bc = _driver_request_card(target, cases, include_epc=True)
             bc["tag"] = "🚚 明天到貨｜元晶司機資訊請求（給採購）"
             share = _driver_share_url(target)
             if share:
