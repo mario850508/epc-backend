@@ -7,3 +7,4 @@ reportlab
 Pillow
 anthropic
 pypdf
+openpyxl

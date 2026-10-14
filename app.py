@@ -7543,6 +7543,253 @@ scheduler.add_job(_driver_request_job, CronTrigger(hour="14-17", minute="0,30", 
                   id="driver_request", replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
+# ===================================================================
+# 安排出貨（2026-10-14）：在主控台新下單／排出貨／已出貨，累積成「採購-出貨安排」的待產生變更，
+# 按「產生新 Excel」時拿本機上傳的最新原始訂單 Excel（採購-訂單快照「原始檔」）套用變更，
+# 保留原格式，下載檔名＝今天日期_模組需求_元晶.xlsx／今天日期_逆變器需求_碩天.xlsx。
+# 本機原型與測試：OneDrive\桌面\files\cps_cert_sync\order_excel_edit.py（邏輯相同）。
+# ===================================================================
+SHIP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tblhdTbBK0beIn7dM"
+SHIP_F = {
+    "case_no": "fldaFZn2C95qtqN0x", "vendor": "fldQx9GoldqcGVXjC", "action": "fldxYlKhUfVadV1Xi",
+    "model": "fldVi93BnZmNItRTO", "qty": "fldQP2k3yljNO7Y0r", "alias": "fldoe6lrG4mMvo3J7",
+    "order_date": "fldSrANEHf0re6ubm", "arrival": "fld2DsXMUfonL4rPk", "ship_to": "fldcYJlc4ZSdtkN28",
+    "site_addr": "fld40HZgFjYJAxpwB", "epc": "fldp4ssNqSd8B0BO4", "receiver": "fldcRv4G1Gpri2RmX",
+    "phone": "fldZIYgONbVYWx3JB", "warranty": "fldlBboF8Bdmsa6FW", "shipped_at": "fldbhVGx6XaB2gZj5",
+    "note": "fldrxb9Brb7C4P85O", "status": "fldaW2zuL81hVOYpK", "file": "fldEGMAHhQJZLTbYU",
+    "created": "fldVeGd0kEGxKnFMO",
+}
+OS_FIELD_RAW = "fld6nRwssAS3Ufn1a"   # 採購-訂單快照「原始檔」
+SHIP_SHEETS = {"元晶": {"open": "已成立訂單_綠點能創", "shipped": "已出貨訂單", "suffix": "模組需求_元晶"},
+               "碩天": {"open": "已成立訂單", "shipped": "已出貨訂單", "suffix": "逆變器需求_碩天"}}
+SHIP_ALIASES = {
+    "order_date": ["訂單成立日期", "訂單成立時間"], "company": ["下單公司", "下單公司別"],
+    "case_no": ["案場名", "專案"], "alias": ["案場別名", "專案別名"], "model": ["模組型號", "型號"],
+    "qty": ["數量"], "arrival": ["預計到貨時間", "到貨時間", "預估進場時間", "預計進場時間"],
+    "shipped_at": ["碩天出貨時間"], "warranty": ["加購十年延保"], "ship_to": ["出貨地址"],
+    "site_addr": ["案場地址"], "epc": ["EPC"], "receiver": ["簽收人"], "phone": ["聯絡電話"], "note": ["備註"],
+}
+
+
+def _ship_norm(v):
+    return _re.sub(r"[\s\-_]", "", str(v or "")).upper()
+
+
+def _ship_header(ws):
+    for r in range(1, 11):
+        names = [str(c.value).strip() if c.value is not None else "" for c in ws[r]]
+        if "數量" in names:
+            cols = {}
+            for key, al in SHIP_ALIASES.items():
+                for i, n in enumerate(names):
+                    if n in al and key not in cols:
+                        cols[key] = i + 1
+            if "alias" not in cols and "case_no" in cols:   # 碩天「已出貨訂單」別名欄表頭打錯
+                cols["alias"] = cols["case_no"] + 1
+            return r, cols
+    raise ValueError(f"「{ws.title}」找不到表頭（含「數量」的列）")
+
+
+def _ship_last_row(ws, hrow, col):
+    last = hrow
+    for r in range(hrow + 1, ws.max_row + 1):
+        if ws.cell(r, col).value not in (None, ""):
+            last = r
+    return last
+
+
+def _ship_copy_style(ws, src_row, dst_row):
+    from copy import copy as _cp
+    for c in range(1, ws.max_column + 1):
+        sc = ws.cell(src_row, c)
+        if sc.has_style:
+            ws.cell(dst_row, c)._style = _cp(sc._style)
+    if ws.row_dimensions[src_row].height:
+        ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+
+
+def _ship_match_rows(ws, hrow, cols, case_no, model):
+    out = []
+    for r in range(hrow + 1, _ship_last_row(ws, hrow, cols["case_no"]) + 1):
+        if str(ws.cell(r, cols["case_no"]).value or "").strip() != case_no:
+            continue
+        if model and _ship_norm(ws.cell(r, cols["model"]).value) != _ship_norm(model):
+            continue
+        out.append(r)
+    return out
+
+
+def _order_excel_apply(xlsx_bytes, vendor, edits):
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws_open, ws_ship = wb[SHIP_SHEETS[vendor]["open"]], wb[SHIP_SHEETS[vendor]["shipped"]]
+    h_open, c_open = _ship_header(ws_open)
+    h_ship, c_ship = _ship_header(ws_ship)
+    results = []
+    for e in edits:
+        act, case_no, model = e.get("action"), (e.get("case_no") or "").strip(), (e.get("model") or "").strip()
+        if act == "新下單":
+            last = _ship_last_row(ws_open, h_open, c_open["case_no"])
+            row = last + 1
+            if last > h_open:
+                _ship_copy_style(ws_open, last, row)
+            vals = {"order_date": datetime.strptime(e["order_date"], "%Y-%m-%d") if e.get("order_date") else _tw_now(),
+                    "company": "綠點能創", "case_no": case_no, "alias": e.get("alias", ""),
+                    "arrival": e.get("arrival") or "待確認", "model": model, "qty": e.get("qty"),
+                    "ship_to": e.get("ship_to") or "待確認", "site_addr": e.get("site_addr", ""), "epc": e.get("epc", ""),
+                    "receiver": e.get("receiver") or "待確認", "phone": e.get("phone", ""),
+                    "warranty": e.get("warranty", ""), "note": e.get("note", "")}
+            for k, v in vals.items():
+                if k in c_open and v not in (None, ""):
+                    ws_open.cell(row, c_open[k], v)
+            results.append({"ok": True, "msg": f"新下單 {case_no} {model}×{e.get('qty')} → 「{ws_open.title}」第 {row} 列"})
+        elif act in ("排出貨", "已出貨"):
+            rows = _ship_match_rows(ws_open, h_open, c_open, case_no, model)
+            if not rows:
+                results.append({"ok": False, "msg": f"{act} {case_no} {model}：「{ws_open.title}」找不到這案（這筆沒有套用）"})
+                continue
+            if act == "排出貨":
+                for r in rows:
+                    for k in ("arrival", "ship_to", "receiver", "phone", "note"):
+                        if k in c_open and e.get(k):
+                            ws_open.cell(r, c_open[k], e[k])
+                results.append({"ok": True, "msg": f"排出貨 {case_no} {model or '（全部型號）'}：更新 {len(rows)} 列"})
+            else:
+                for r in rows:
+                    last = _ship_last_row(ws_ship, h_ship, c_ship["case_no"])
+                    dst = last + 1
+                    if last > h_ship:
+                        _ship_copy_style(ws_ship, last, dst)
+                    for k, col in c_ship.items():
+                        if k in c_open:
+                            ws_ship.cell(dst, col, ws_open.cell(r, c_open[k]).value)
+                    if e.get("shipped_at") and "shipped_at" in c_ship:
+                        ws_ship.cell(dst, c_ship["shipped_at"], e["shipped_at"])
+                for r in sorted(rows, reverse=True):
+                    ws_open.delete_rows(r)
+                results.append({"ok": True, "msg": f"已出貨 {case_no} {model or '（全部型號）'}：{len(rows)} 列搬到「{ws_ship.title}」"})
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue(), results
+
+
+def _ship_edits(status="待產生"):
+    formula = "{" + SHIP_F["status"] + "}='" + status + "'" if status else None
+    recs = airtable_get_all(SHIP_API_URL, formula, list(SHIP_F.values()))
+    out = []
+    for r in recs:
+        f = r.get("fields", {})
+        d = {k: f.get(fid, "") for k, fid in SHIP_F.items()}
+        d["id"] = r["id"]
+        out.append(d)
+    out.sort(key=lambda d: d["created"] or "")
+    return out
+
+
+@app.route("/api/procurement/shipping/edits")
+def shipping_edits_list():
+    try:
+        return jsonify({"edits": _ship_edits(request.args.get("status", "待產生"))})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/procurement/shipping/edits", methods=["POST"])
+def shipping_edits_create():
+    """body: {vendor, action, case_no, alias, items:[{model, qty}], order_date, arrival, ship_to, site_addr, epc,
+    receiver, phone, warranty, shipped_at, note}；items 空白＝整案全部型號（排出貨／已出貨用）。"""
+    b = request.get_json(force=True) or {}
+    if b.get("vendor") not in SHIP_SHEETS or b.get("action") not in ("新下單", "排出貨", "已出貨"):
+        return jsonify({"error": "廠商或動作不正確"}), 400
+    if not (b.get("case_no") or "").strip():
+        return jsonify({"error": "請填案號"}), 400
+    items = [it for it in (b.get("items") or []) if (it.get("model") or "").strip()]
+    if b["action"] == "新下單" and not items:
+        return jsonify({"error": "新下單至少要一個型號與數量"}), 400
+    common = {k: (str(b.get(k) or "").strip()) for k in ("case_no", "alias", "order_date", "arrival", "ship_to", "site_addr",
+                                                         "epc", "receiver", "phone", "warranty", "shipped_at", "note")}
+    recs = []
+    for it in (items or [{"model": "", "qty": None}]):
+        f = {SHIP_F["vendor"]: b["vendor"], SHIP_F["action"]: b["action"], SHIP_F["status"]: "待產生",
+             SHIP_F["model"]: it.get("model", "").strip(), SHIP_F["created"]: datetime.utcnow().isoformat() + "Z"}
+        try:
+            if it.get("qty") not in (None, ""):
+                f[SHIP_F["qty"]] = int(float(it["qty"]))
+        except (TypeError, ValueError):
+            return jsonify({"error": f"數量不是數字：{it.get('qty')}"}), 400
+        for k, v in common.items():
+            if v:
+                f[SHIP_F[k]] = v
+        recs.append({"fields": f})
+    for i in range(0, len(recs), 10):
+        resp = requests.post(SHIP_API_URL, headers=airtable_headers(), json={"records": recs[i:i + 10], "typecast": True}, timeout=30)
+        if resp.status_code >= 400:
+            return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True, "count": len(recs)})
+
+
+@app.route("/api/procurement/shipping/edits/<record_id>", methods=["DELETE"])
+def shipping_edits_delete(record_id):
+    resp = requests.delete(f"{SHIP_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": resp.text}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/procurement/shipping/epc-defaults")
+def shipping_epc_defaults():
+    """同一家 EPC 最近一筆訂單的出貨地址／簽收人／電話（排出貨時自動帶入，可再改）。"""
+    epc = (request.args.get("epc") or "").strip()
+    vendor = (request.args.get("vendor") or "").strip()
+    try:
+        rows = _load_order_snapshots()["rows"]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    cands = [r for r in rows if r.get("epc") == epc and (not vendor or r.get("vendor") == vendor)
+             and r.get("receiver") not in ("", "待確認", None) and r.get("ship_to") not in ("", "待確認", None)]
+    cands.sort(key=lambda r: str(r.get("order_date") or ""), reverse=True)
+    if not cands:
+        return jsonify({"found": False})
+    r = cands[0]
+    return jsonify({"found": True, "ship_to": r.get("ship_to", ""), "receiver": r.get("receiver", ""),
+                    "phone": r.get("phone", ""), "from_case": r.get("case_no", "")})
+
+
+@app.route("/api/procurement/shipping/generate", methods=["POST"])
+def shipping_generate():
+    """body: {vendor, preview}。preview=true 只回傳會怎麼改（不標記）；否則回傳新 Excel 並把變更標成「已產生」。"""
+    b = request.get_json(force=True) or {}
+    vendor = b.get("vendor")
+    if vendor not in SHIP_SHEETS:
+        return jsonify({"error": "廠商不正確"}), 400
+    try:
+        edits = [e for e in _ship_edits("待產生") if e["vendor"] == vendor]
+        if not edits:
+            return jsonify({"error": f"{vendor} 沒有待產生的變更"}), 400
+        recs = airtable_get_all(ORDER_SNAPSHOT_API_URL, None, [OS_FIELD_VENDOR, OS_FIELD_RAW])
+        raw = next(((r["fields"].get(OS_FIELD_RAW) or [{}])[0] for r in recs if r["fields"].get(OS_FIELD_VENDOR) == vendor), {})
+        if not raw.get("url"):
+            return jsonify({"error": f"還沒有 {vendor} 的原始 Excel（電腦上的小幫手每 15 分鐘上傳一次）"}), 502
+        resp = requests.get(raw["url"], timeout=120)
+        resp.raise_for_status()
+        data, results = _order_excel_apply(resp.content, vendor, edits)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    fname = f"{_tw_now():%Y%m%d}_{SHIP_SHEETS[vendor]['suffix']}.xlsx"
+    if b.get("preview"):
+        return jsonify({"base_file": raw.get("filename", ""), "file_name": fname, "results": results})
+    for i in range(0, len(edits), 10):
+        try:
+            requests.patch(SHIP_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+                {"id": e["id"], "fields": {SHIP_F["status"]: "已產生", SHIP_F["file"]: fname}} for e in edits[i:i + 10]]})
+        except Exception as ex:
+            print(f"[shipping_generate] 標記已產生失敗：{ex}", flush=True)
+    from urllib.parse import quote as _q
+    return Response(data, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{_q(fname)}",
+                             "X-Base-File": _q(raw.get("filename", "")), "X-Results": _q(json.dumps(results, ensure_ascii=False))})
+
+
 @app.route("/api/procurement/order-calendar")
 def procurement_order_calendar():
     """出貨日曆（2026-10-14）：元晶／碩天訂單裡「預計到貨時間」是明確日期的（已成立＋已出貨，不含取消／可能撤案），
