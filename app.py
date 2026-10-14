@@ -7466,6 +7466,43 @@ scheduler.add_job(_driver_request_job, CronTrigger(hour="14-17", minute="0,30", 
                   id="driver_request", replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
+@app.route("/api/procurement/order-calendar")
+def procurement_order_calendar():
+    """出貨日曆（2026-10-14）：元晶／碩天訂單裡「預計到貨時間」是明確日期的（已成立＋已出貨，不含取消／可能撤案），
+    同一案同一廠商同一天合併成一筆。from/to（YYYY-MM-DD）預設 今天前 45 天 ～ 今天後 400 天。
+    模組廠／變流器廠／EPC 的篩選在前端做，這裡一併回傳可選的值。"""
+    try:
+        cache = _load_order_snapshots()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    today = _tw_now().date()
+    try:
+        d_from = datetime.strptime(request.args["from"], "%Y-%m-%d").date() if request.args.get("from") else today - timedelta(days=45)
+        d_to = datetime.strptime(request.args["to"], "%Y-%m-%d").date() if request.args.get("to") else today + timedelta(days=400)
+    except ValueError:
+        return jsonify({"error": "日期格式要 YYYY-MM-DD"}), 400
+    events = {}
+    for r in cache["rows"]:
+        if r.get("status") not in ("已成立", "已出貨"):
+            continue
+        d = _parse_arrival_date(r.get("arrival"))
+        if not d or d < d_from or d > d_to:
+            continue
+        key = (d.isoformat(), r.get("vendor"), r.get("case_no"), r.get("status"))
+        e = events.get(key)
+        if e is None:
+            e = events[key] = {"date": d.isoformat(), "vendor": r.get("vendor", ""), "equipment": r.get("equipment", ""),
+                               "status": r.get("status", ""), "case_no": r.get("case_no", ""), "alias": r.get("alias", ""),
+                               "epc": r.get("epc", ""), "arrival": r.get("arrival", ""), "receiver": r.get("receiver", ""),
+                               "phone": r.get("phone", ""), "ship_to": r.get("ship_to", ""), "items": []}
+        e["items"].append({"model": r.get("model", ""), "qty": r.get("qty", "")})
+    out = sorted(events.values(), key=lambda e: (e["date"], e["equipment"], e["case_no"]))
+    opts = lambda eq: sorted({e["vendor"] for e in out if e["equipment"] == eq and e["vendor"]})
+    return jsonify({"from": d_from.isoformat(), "to": d_to.isoformat(), "events": out,
+                    "module_vendors": opts("模組"), "inverter_vendors": opts("變流器"),
+                    "epcs": sorted({e["epc"] for e in out if e["epc"]})})
+
+
 @app.route("/api/procurement/driver-request/preview")
 def driver_request_preview():
     try:
