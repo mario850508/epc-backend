@@ -2549,6 +2549,31 @@ def vendor_slot_vendor_notice(record_id):
     })
 
 
+@app.route("/api/vendor-slots/<record_id>/vendor-notified", methods=["POST"])
+def vendor_slot_mark_vendor_notified(record_id):
+    """2026-10-14：不是用 LINE 卡片、而是打電話等方式通知廠商時，窗口手動標記「已通知廠商」。
+    body: {owner_name?, owner_phone?, pm_note?（有帶才一併存）, unmark?: true（取消已通知標記）}"""
+    body = request.get_json(force=True) or {}
+    rec = _get_booking(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    if rec.get("fields", {}).get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "這筆已經不是有效的預約（可能已經取消）"}), 409
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    patch = {FIELD_SLOT_VENDOR_NOTIFIED: None if body.get("unmark") else now}
+    if not body.get("unmark"):
+        if (body.get("owner_name") or "").strip():
+            patch[FIELD_SLOT_OWNER_NAME] = body["owner_name"].strip()[:40]
+        if (body.get("owner_phone") or "").strip():
+            patch[FIELD_SLOT_OWNER_PHONE] = body["owner_phone"].strip()[:40]
+        if (body.get("pm_note") or "").strip():
+            patch[FIELD_SLOT_PM_NOTE] = body["pm_note"].strip()[:500]
+    resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True, "vendor_notified_at": "" if body.get("unmark") else now})
+
+
 @app.route("/api/vendor-slots/<record_id>/rep-notice", methods=["POST"])
 def vendor_slot_rep_notice(record_id):
     """2026-10-10：窗口按「通知業務」。業務有綁 LINE → 機器人直接推卡片；
