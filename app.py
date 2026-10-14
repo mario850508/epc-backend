@@ -7500,7 +7500,7 @@ def procurement_order_calendar():
     opts = lambda eq: sorted({e["vendor"] for e in out if e["equipment"] == eq and e["vendor"]})
     return jsonify({"from": d_from.isoformat(), "to": d_to.isoformat(), "events": out,
                     "module_vendors": opts("模組"), "inverter_vendors": opts("變流器"),
-                    "epcs": sorted({e["epc"] for e in out if e["epc"]})})
+                    "epcs": sorted({e["epc"] for e in out if e["epc"] and e["epc"] not in ("-", "待確認")})})
 
 
 @app.route("/api/procurement/driver-request/preview")
