@@ -2910,6 +2910,13 @@ def vendor_share_get(token):
                 return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "card", "sent_at": ""})
             return jsonify({"kind": "own", "mode": "ginvite", "text": _joint_invite_text(g, t),
                             "title": f"{t['case']} {t['alias']}".strip(), "sent_at": ""})
+        if data.get("dr"):   # 明天到貨：採購把元晶司機資訊請求卡片轉傳到元晶群組（2026-10-14）
+            target = datetime.strptime(data["dr"], "%Y-%m-%d").date()
+            cases = _driver_request_cases(target)
+            if not cases:
+                return jsonify({"error": "這天已經沒有元晶到貨的訂單（可能已改期或出貨）"}), 404
+            card = _driver_request_card(target, cases)
+            return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "card", "sent_at": ""})
         b = _case_brief(data.get("c"))
         if kind == "own":   # 要傳給屋主的文字訊息
             fn = _owner_confirm_msg if data.get("m") == "confirm" else _reminder_owner_msg
@@ -7396,12 +7403,12 @@ def _parse_arrival_date(text):
         return None
 
 
-def _driver_request_cases(target_date):
-    """元晶訂單表裡「已成立」且預計到貨時間＝target_date 的訂單，依案號合併。"""
+def _driver_request_cases(target_date, vendor="元晶"):
+    """訂單表裡「已成立」且預計到貨時間＝target_date 的訂單，依案號合併。vendor：元晶（模組）／碩天（變流器）。"""
     cache = _load_order_snapshots()
     cases = {}
     for r in cache["rows"]:
-        if r.get("vendor") != "元晶" or r.get("status") != "已成立":
+        if r.get("vendor") != vendor or r.get("status") != "已成立":
             continue
         if _parse_arrival_date(r.get("arrival")) != target_date:
             continue
@@ -7429,6 +7436,33 @@ def _driver_request_card(target_date, cases):
                  sections=sections, footer="陽光伏特家 採購通知（系統自動發送）")
 
 
+def _inverter_tomorrow_card(target_date, cases):
+    """碩天變流器明天到貨（只傳給採購，2026-10-14）。"""
+    sections = []
+    for c in cases:
+        lines = ["型號：" + "、".join(c["items"]), f"到貨：{c['arrival']}"]
+        if c["ship_to"]:
+            lines.append(f"出貨地址：{c['ship_to']}")
+        recv = " ".join(x for x in [c["epc"], c["receiver"], c["phone"]] if x and x != "待確認")
+        if recv:
+            lines.append(f"簽收：{recv}")
+        sections.append((f"🔌 {c['case_no']} {c['alias']}".strip(), lines))
+    return _card("🔌 明天到貨｜碩天變流器（給採購）", "#1E70C8",
+                 f"{_wd_label(target_date.isoformat())} 到貨，共 {len(cases)} 案",
+                 subtitle="以下碩天變流器明天到貨，請留意 EPC 簽收。", sections=sections,
+                 footer="陽光伏特家 採購通知（系統自動發送）")
+
+
+def _driver_share_url(target_date):
+    """採購卡片上的「傳送到元晶群組」：開 LIFF 分享頁（shareTargetPicker），由採購本人把元晶卡片傳進元晶群組。
+    簽章 token 7 天有效；分享頁打開時依日期重新產生卡片（vendor_share_get 的 dr 分支）。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id:
+        return ""
+    token = _reminder_token_make({"dr": target_date.isoformat(), "x": int(time.time()) + 7 * 86400})
+    return f"https://liff.line.me/{liff_id}?vshare={token}~card"
+
+
 def send_driver_requests(force=False, target_date=None):
     """發給「用途」含元晶出貨司機資訊的群組。沒有明天到貨的訂單就不發。回傳每個群組的結果。"""
     today = _tw_now().date()
@@ -7438,20 +7472,36 @@ def send_driver_requests(force=False, target_date=None):
     if not groups and not buyers:
         return {"date": target.isoformat(), "sent": [], "note": "還沒有設定要通知的群組或採購"}
     cases = _driver_request_cases(target)
+    inv_cases = []
+    try:
+        inv_cases = _driver_request_cases(target, "碩天")
+    except Exception as e:
+        print(f"[send_driver_requests] 查碩天明天到貨失敗：{e}", flush=True)
     results = []
-    # 採購（測試期間先發給採購確認內容；沒有到貨訂單也發一句，讓採購知道今天有跑）
+    # 採購：元晶卡片（附「傳送到元晶群組」按鈕，採購自己轉傳）＋碩天變流器卡片；都沒有就傳一句，讓採購知道今天有跑
     for b in buyers:
         if b["notify_date"] == today.isoformat() and not force:
             results.append({"group": b["name"], "ok": True, "skipped": "今天已發過"})
             continue
+        oks, errs = [], []
         if cases:
             bc = _driver_request_card(target, cases)
-            bc["tag"] = "🚚 明天到貨｜司機資訊請求（採購副本）"
-            bc["note"] = ("【測試中】這張卡片是要發到元晶群組的內容，目前先發給採購確認；確認沒問題後到主控台勾選元晶群組。"
-                          if not groups else "這張卡片已同時發到元晶群組。")
+            bc["tag"] = "🚚 明天到貨｜元晶司機資訊請求（給採購）"
+            share = _driver_share_url(target)
+            if share:
+                bc["buttons"] = [("📤 傳送到元晶群組", share)]
+                bc["note"] = "按下方「傳送到元晶群組」，選元晶的群組，就會用你的 LINE 把這張卡片傳過去。"
+            elif groups:
+                bc["note"] = "這張卡片已同時發到元晶群組。"
             ok, err = _line_push_card(bc, to=b["user_id"])
-        else:
-            ok, err = _line_push_text(f"🚚 元晶出貨司機資訊通知（採購副本）\n明天 {_wd_label(target.isoformat())} 沒有元晶到貨的訂單，今天不需要請元晶提供司機資訊。", to=b["user_id"])
+            oks.append(ok); errs.append(err)
+        if inv_cases:
+            ok, err = _line_push_card(_inverter_tomorrow_card(target, inv_cases), to=b["user_id"])
+            oks.append(ok); errs.append(err)
+        if not cases and not inv_cases:
+            ok, err = _line_push_text(f"🚚 採購到貨通知\n明天 {_wd_label(target.isoformat())} 沒有元晶模組、碩天變流器到貨的訂單。", to=b["user_id"])
+            oks.append(ok); errs.append(err)
+        ok, err = all(oks), "；".join(e for e in errs if e)
         if ok:
             try:
                 requests.patch(f"{LINE_BIND_API_URL}/{b['id']}", headers=airtable_headers(),
@@ -7542,7 +7592,11 @@ def driver_request_preview():
         buyers = _buyers()
     except Exception:
         buyers = []
-    return jsonify({"date": target.isoformat(), "cases": cases, "groups": groups,
+    try:
+        inv_cases = _driver_request_cases(target, "碩天")
+    except Exception:
+        inv_cases = []
+    return jsonify({"date": target.isoformat(), "cases": cases, "groups": groups, "inverter_cases": inv_cases,
                     "buyers": [{k: b[k] for k in ("id", "name", "display", "notify", "notify_date")} for b in buyers],
                     "liff_id": os.environ.get("LIFF_ID", "").strip(),
                     "text": _card_plain_text(card) if cases else "", "send_time": "每天 14:00（同一天只發一次）"})
