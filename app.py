@@ -9445,6 +9445,47 @@ def _pdf_corrections(pred, final):
     return out
 
 
+PDF_RELEARN_MAX = 40   # 每次重新學習最多補讀幾份（OCR 一份要十幾秒）
+
+
+def _pdf_relearn_fill_text(recs, settings):
+    """已確認／已歸檔、但沒有可學的文字的檔案（多半是辨識失敗後 PM 手動填好確認的）：重新讀一次文字（掃描檔走 OCR），
+    存回 result_json，之後的重新學習就學得到；這種檔案沒有系統的判斷（pred），整份答案都是人給的，標 relearn_manual 加重學。
+    就地更新 recs 裡的 result_json。"""
+    done = 0
+    for r in recs:
+        if done >= PDF_RELEARN_MAX:
+            break
+        g = r.get("fields", {})
+        try:
+            res = json.loads(g.get(PDF_F["result_json"]) or "{}")
+        except ValueError:
+            res = {}
+        if len(_pdf_flat(res.get("text_excerpt") or "")) >= 40 or res.get("relearn_tried"):
+            continue
+        att = (g.get(PDF_F["file"]) or [{}])[0]
+        res["relearn_tried"] = True
+        if not res.get("pred"):
+            res["relearn_manual"] = True
+        try:
+            if att.get("url"):
+                pdf = requests.get(att["url"], timeout=120)
+                pdf.raise_for_status()
+                text, _ = _pdf_get_text(pdf.content, settings, _pdf_ext(att.get("filename") or g.get(PDF_F["src_name"]) or ""))
+                res["text_excerpt"] = (text or "")[:4000]
+        except Exception as e:
+            print(f"[pdf_rename] 重新學習補讀文字失敗（{g.get(PDF_F['src_name'])}）：{e}", flush=True)
+        done += 1
+        raw = json.dumps(res, ensure_ascii=False)[:95000]
+        g[PDF_F["result_json"]] = raw
+        try:
+            _pdf_patch(r["id"], {PDF_F["result_json"]: raw})
+        except Exception as e:
+            print(f"[pdf_rename] 存補讀文字失敗：{e}", flush=True)
+    if done:
+        print(f"[pdf_rename] 重新學習：補讀了 {done} 份沒有文字的已確認檔案（辨識失敗後手動確認的會加重學）", flush=True)
+
+
 def pdf_retrain():
     import pdf_learncore as LC
     if PDF_RETRAIN["running"] or not AIRTABLE_TOKEN:
@@ -9457,7 +9498,9 @@ def pdf_retrain():
         recs = airtable_get_all(PDF_API_URL, "OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',{" + PDF_F["status"]
                                 + "}='" + PDF_ST_ARCHIVED + "')",
                                 [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["case_no"], PDF_F["final_name"],
-                                 PDF_F["result_json"], PDF_F["confirmed_by"], PDF_F["confirmed_at"]])
+                                 PDF_F["result_json"], PDF_F["confirmed_by"], PDF_F["confirmed_at"], PDF_F["file"],
+                                 PDF_F["src_name"]])
+        _pdf_relearn_fill_text(recs, settings)
         docs, fixed_docs, date_ctx, live, learned_alias = [], [], {}, [], {}
         today = _tw_now_iso()[:10]
         corr_today = corr_total = 0
@@ -9479,8 +9522,10 @@ def pdf_retrain():
                 corr_total += 1
                 if (g.get(PDF_F["confirmed_at"]) or "")[:10] == today:
                     corr_today += 1
-            type_fixed = any(c["field"] == "doc_type" for c in corr)
-            date_fixed = any(c["field"] == "doc_date" for c in corr)
+            # 辨識失敗後由 PM 手動填類型／日期確認的：整份都是人給的答案，跟「改過」一樣加重學
+            manual = bool(res.get("relearn_manual") or not pred)
+            type_fixed = manual or any(c["field"] == "doc_type" for c in corr)
+            date_fixed = manual or any(c["field"] == "doc_date" for c in corr)
             if label in allowed and len(LC.flat(text)) >= 40:
                 (fixed_docs if type_fixed else docs).append((label, case_no or r["id"], LC.grams(text)))
                 w = PDF_CORRECTED_WEIGHT if date_fixed else PDF_CONFIRMED_WEIGHT
