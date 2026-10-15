@@ -7736,6 +7736,55 @@ def shipping_edits_delete(record_id):
     return jsonify({"ok": True})
 
 
+_SHIP_CAND_CACHE = {"at": 0, "rows": []}
+
+
+@app.route("/api/procurement/shipping/candidates")
+def shipping_candidates():
+    """安排出貨的案件清單（2026-10-15）：進行中、已取得同意備案、還沒掛表的案件（沿用 compute_case_pool，12 家 EPC），
+    附上元晶模組／碩天變流器訂單狀態（沒有／已成立／已出貨）與有沒有工程部配比信。案件表查詢快取 10 分鐘。"""
+    try:
+        if time.time() - _SHIP_CAND_CACHE["at"] > 600 or request.args.get("refresh"):
+            _SHIP_CAND_CACHE["rows"] = compute_case_pool()
+            _SHIP_CAND_CACHE["at"] = time.time()
+        orders = _load_order_snapshots()["rows"]
+        try:
+            mail_cases = _load_mail_configs()["cases"]
+        except Exception:
+            mail_cases = {}
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+    def order_state(case_no, vendor):
+        sts = {o.get("status") for o in orders if o.get("case_no") == case_no and o.get("vendor") == vendor}
+        if "已成立" in sts:
+            return "已成立"
+        if "已出貨" in sts:
+            return "已出貨"
+        return ""
+
+    out = []
+    for r in _SHIP_CAND_CACHE["rows"]:
+        f = r.get("fields", {})
+        case_no = (f.get(FIELD_CASE_NO) or "").strip()
+        if not case_no:
+            continue
+        agree = f.get(FIELD_AGREE_DATE)
+        agree = agree[0] if isinstance(agree, list) and agree else (agree or "")
+        mc = mail_cases.get(case_no) or []
+        latest = next((c for c in mc if c.get("modules") or c.get("inverters")), None)
+        out.append({
+            "case_no": case_no, "alias": f.get(FIELD_ALIAS) or "", "epc": f.get(FIELD_VENDOR) or "",
+            "agree_date": str(agree)[:10], "address": " ".join((f.get(FIELD_ADDRESS) or "").split()),
+            "module_order": order_state(case_no, "元晶"), "inverter_order": order_state(case_no, "碩天"),
+            "has_mail": bool(latest), "mail_cancelled": bool(mc and mc[0].get("cancelled")),
+            "mail_modules": [f"{x['model']}×{x['qty']}" for x in (latest or {}).get("modules", [])],
+            "mail_inverters": [f"{x['model']}×{x['qty']}" for x in (latest or {}).get("inverters", [])],
+        })
+    out.sort(key=lambda x: (x["agree_date"] or "9999", x["case_no"]))
+    return jsonify({"cases": out, "updated_at": _SHIP_CAND_CACHE["at"]})
+
+
 @app.route("/api/procurement/shipping/epc-defaults")
 def shipping_epc_defaults():
     """同一家 EPC 最近一筆訂單的出貨地址／簽收人／電話（排出貨時自動帶入，可再改）。"""
