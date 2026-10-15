@@ -474,7 +474,7 @@ SURVEY_FIELD_ACTUAL_DATE = "fldvgJUT55WLX4EiW"  # 實際場勘日
 # 直接改「預計場勘日」就好（自動回填本來就只處理「日期已過」的案件，改成未來
 # 日期自然就不會被處理到），只有「有異常但先不改日期」這種情況才需要這個獨立
 # 的勾選欄位。
-SURVEY_FIELD_EXCEPTION = "fldPzjPSpLdpUMJCg"  # 場勘異常
+SURVEY_FIELD_EXCEPTION = "fldxLSuKIDs36TVNr"  # 場勘異常
 SURVEY_FIELD_PROGRESS = "fldmJt64Oy2ama2zS"  # 進度（singleSelect，Fail 代表已經撤案/結束，要排除）
 SURVEY_API_URL = f"https://api.airtable.com/v0/{SURVEY_BASE_ID}/{SURVEY_TABLE_ID}"
 
