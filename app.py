@@ -2058,7 +2058,7 @@ def _owner_slot_from_start(task, date, start):
         if st != fx[0]:
             return None, f"這個預約的時間固定是 {wins[0][0]}–{wins[0][1]}"
         et = fx[1]
-    elif st % 60 != 0:   # 屋主只能選整點開始（2026-10-12 使用者要求，半點不好安排）
+    elif st % 60 != 0 and not any(st == _parse_hhmm(a) for a, _ in wins):   # 屋主只能選整點開始（2026-10-12 使用者要求）；時段本身從半點開始時，時段起點也可選（2026-10-15）
         return None, "請選整點的開始時間"
     if not any(st >= _parse_hhmm(a) and et <= _parse_hhmm(b) for a, b in wins):
         return None, "請選 " + "、".join(f"{a}–{b}" for a, b in wins) + " 之間的時間"
