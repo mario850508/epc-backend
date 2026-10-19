@@ -1206,12 +1206,14 @@ def _json_or_default(raw, default):
 
 
 def _valid_buffer(v):
-    """車程緩衝（分鐘）：0～180 的整數，不合法一律當 0（不留緩衝）。"""
+    """車程緩衝（分鐘）：0～180，進位到 30 的倍數，不合法一律當 0（不留緩衝）。"""
     try:
         n = int(float(v or 0))
     except (TypeError, ValueError):
         return 0
-    return n if 0 < n <= 180 else 0
+    if not 0 < n <= 180:
+        return 0
+    return -(-n // 30) * 30   # 預約時段以 30 分鐘為單位，緩衝一律進位到 30 的倍數（舊的 15／45 分鐘 → 30／60）
 
 
 def _task_to_dict(r):
