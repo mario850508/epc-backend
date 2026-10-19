@@ -4656,6 +4656,10 @@ def sync_ship_dates_from_orders():
         if changed:
             print(f"[ship-sync] 依訂單修正出貨日期 {len(changed)} 筆：{changed}", flush=True)
             threading.Thread(target=refresh_cache, daemon=True).start()
+            try:   # 改完用 LINE 通知使用者核對（之後每次自動修正都會通知）
+                _ship_sync_notice(changed)
+            except Exception as e:
+                print(f"[ship-sync] 推播失敗：{e}", flush=True)
         SHIP_SYNC_LAST.update({"at": datetime.now().isoformat(timespec="seconds"), "changed": changed, "error": None})
     except Exception as e:
         print(f"[ship-sync] 失敗：{e}", flush=True)
@@ -4665,6 +4669,44 @@ def sync_ship_dates_from_orders():
 
 scheduler.add_job(sync_ship_dates_from_orders, CronTrigger(minute=20, timezone="Asia/Taipei"), id="ship_date_sync",
                   replace_existing=True, max_instances=1, coalesce=True)
+
+
+def _ship_sync_notice(changes):
+    """把依訂單修正過的出貨日期用 LINE 卡片通知使用者（預設推個人），讓使用者核對。"""
+    if not changes:
+        return False, "沒有變更"
+    by_case = {}
+    for lst in (DATA_CACHE.get("entry") or [], DATA_CACHE.get("completed") or []):
+        for c in lst:
+            by_case[c.get("case")] = c
+    lines = []
+    for ch in changes:
+        c = by_case.get(ch["case"], {})
+        d = lambda x: _wd_label(str(x)[:10]) if x else "（無）"
+        lines.append(f"• {ch['case']} {c.get('alias', '')}（{c.get('vendor') or '—'}）")
+        lines.append(f"　出貨 {d(ch['from'])} → {d(ch['to'])}")
+        if c.get("entry_date"):
+            lines.append(f"　進場 {d(c.get('entry_date'))}")
+            try:
+                if str(c["entry_date"])[:10] < str(ch["to"])[:10]:
+                    lines.append("　⚠️ 進場日比出貨日早，請確認進場日")
+            except Exception:
+                pass
+    card = _card("📦 出貨日期已依訂單更新", "#1D4ED8", f"共修正 {len(changes)} 案",
+                 "訂單 Excel 的到貨日才是最準的，已同步改到 Airtable「大料出貨時間」並標為已完成",
+                 sections=[("更新內容", lines)],
+                 footer="如果有哪一案不對，到訂單查詢確認該案的訂單日期。",
+                 button=("開啟主控台", _dash_url()))
+    return _line_push_card(card)
+
+
+@app.route("/api/ship-date-sync/notify", methods=["POST"])
+def ship_date_sync_notify():
+    """body: {changes:[{case,from,to}]}；沒帶就用最近一次自動修正的結果。把修正結果用 LINE 推給使用者核對。"""
+    body = request.get_json(silent=True) or {}
+    changes = body.get("changes") or SHIP_SYNC_LAST.get("changed") or []
+    ok, err = _ship_sync_notice(changes)
+    return jsonify({"ok": ok, "error": err, "count": len(changes)}), (200 if ok else 502)
 
 
 @app.route("/api/ship-date-sync", methods=["GET", "POST"])
