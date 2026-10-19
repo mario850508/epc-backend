@@ -6157,14 +6157,30 @@ def _collect_tomorrow_events(tmr):
     for lst in (DATA_CACHE.get("pending") or [], DATA_CACHE.get("entry") or [], DATA_CACHE.get("completed") or []):
         for c in lst:
             case_vendor[c.get("case")] = c.get("vendor") or ""
-    # 出貨日期優先用訂單確定的到貨日（里程碑上的只是預估，會讓還沒到貨的案件被誤報成明天出貨）
+    # 出貨日期優先用訂單確定的到貨日（里程碑上的只是預估，會讓還沒到貨的案件被誤報成明天出貨）。
+    # 模組與變流器分開報：明天進模組就只列模組、明天進變流器就只列變流器（2026-10-19 使用者要求）
     for c in _entry_with_order_dates((DATA_CACHE.get("entry") or []) + (DATA_CACHE.get("completed") or [])):
-        if c.get("ship_date") == tmr and (c["case"], "出貨") not in seen:
-            seen.add((c["case"], "出貨"))
-            extra = "；".join(x for x in [f"模組 {c.get('module')}" if c.get("module") else "",
-                                          f"變流器 {c.get('inverter')}" if c.get("inverter") else ""] if x)
-            events.append({"vendor": c.get("vendor") or "", "kind": "出貨", "time": "", "case": c["case"],
-                           "alias": c.get("alias", ""), "extra": extra})
+        if c.get("ship_date") == tmr and (c["case"], "模組出貨") not in seen:
+            seen.add((c["case"], "模組出貨"))
+            events.append({"vendor": c.get("vendor") or "", "kind": "模組出貨", "time": "", "case": c["case"],
+                           "alias": c.get("alias", ""), "extra": f"模組 {c.get('module')}" if c.get("module") else ""})
+    try:
+        inv = {}
+        for r in _load_order_snapshots()["rows"]:
+            if r.get("equipment") != "變流器" or r.get("status") in ("取消", "可能撤案"):
+                continue
+            d = _parse_arrival_date(r.get("arrival"))
+            if d and d.isoformat() == tmr and r.get("case_no"):
+                e = inv.setdefault(r["case_no"], {"alias": r.get("alias", ""), "epc": r.get("epc", ""), "items": []})
+                e["items"].append(f"{r.get('model', '')} ×{r.get('qty', '')}")
+        for case_no, e in sorted(inv.items()):
+            if (case_no, "變流器出貨") in seen:
+                continue
+            seen.add((case_no, "變流器出貨"))
+            events.append({"vendor": case_vendor.get(case_no, ""), "kind": "變流器出貨", "time": "", "case": case_no,
+                           "alias": e["alias"], "extra": "變流器 " + "、".join(e["items"])})
+    except Exception as ex:
+        print(f"[_collect_tomorrow_events] 讀變流器訂單失敗：{ex}", flush=True)
     for c in DATA_CACHE.get("completed") or []:
         if c.get("entry_date") == tmr and (c["case"], "進場") not in seen:
             seen.add((c["case"], "進場"))
