@@ -255,7 +255,7 @@ DASHBOARD_ORIGINS = [o.strip() for o in os.environ.get(
 CORS(app, origins=DASHBOARD_ORIGINS + [_re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")])
 
 AUTH_TOKEN_DAYS = 30
-AUTH_PUBLIC_PREFIXES = ("/api/owner-booking/", "/api/vendor-slots/public-task/", "/api/vendor-share/")
+AUTH_PUBLIC_PREFIXES = ("/api/owner-booking/", "/api/vendor-slots/public-task/", "/api/vendor-share/", "/api/vendor-portal/")
 AUTH_PUBLIC_EXACT = {
     "/api/login", "/api/auth/status",
     "/api/line/liff-config", "/api/line/bind-rep", "/api/line/bind-scheduler",   # LIFF 綁定頁
@@ -4698,6 +4698,277 @@ def _ship_sync_notice(changes):
                  footer="如果有哪一案不對，到訂單查詢確認該案的訂單日期。",
                  button=("開啟主控台", _dash_url()))
     return _line_push_card(card)
+
+
+# ===================================================================
+# 2026-10-19：廠商預約頁（vendor.html）——廠商自己看「自己的案件」、提出預約申請（場勘／放樣／進場…），
+# 申請進「廠商預約申請」表，PM 在主控台「廠商時段協調 → 廠商申請」轉成指派任務或退回。
+# 每家廠商一條專屬連結（簽章 token，只含廠商名），只能看／送自己廠商的案件；連結本身就是「登入」，不外傳。
+# ===================================================================
+VP_TABLE_ID = "tbloW3e49vdqRPyNq"
+VP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{VP_TABLE_ID}"
+VP_F = {"key": "fldXo3w7bOqOaAgzG", "vendor": "fldjwNbMAjseosMfD", "case_no": "fldLsasSQhNFqZwio", "alias": "fld28F0iIOOGfpTJu",
+        "items": "fldcZdBiOSxqybRQM", "dates": "fld8MyojY9L8UDmmS", "time_pref": "fldfO9kMLVejcD0ku", "note": "fldAkeTqoMJduwZdO",
+        "contact": "fldp6WmjwmZRANjlr", "status": "fldY6g39Cavs223PW", "reply": "fldHnQWMNJmpr2iUj", "task_id": "fldgtaU2fITrdXqOu",
+        "submitted_at": "fldWC6a7xy8IXqiIy", "handled_at": "fldsM4ZiRV0le04XF"}
+VP_ST_WAIT, VP_ST_TASK, VP_ST_REJECT, VP_ST_CANCEL = "待處理", "已轉任務", "已退回", "已取消"
+VP_VENDORS = ["三創", "尚展", "曙光", "光鼎", "宇陽達", "聚曜", "澄品", "大昇", "展亦", "凰太竹", "國欽", "振庭"]
+VP_TYPES = ["場勘", "放樣", "植筋", "進場", "掛表"]
+VP_MAX_PENDING = 30
+
+
+def _vp_secret():
+    return ((os.environ.get("BIZ_SHEET_SYNC_KEY") or "") + "|vendor-portal-v1").encode("utf-8")
+
+
+def _vp_token_make(vendor):
+    payload = _b64(vendor.encode("utf-8"))
+    sig = _b64(hmac.new(_vp_secret(), ("vp." + payload).encode(), hashlib.sha256).digest())[:24]
+    return f"{payload}.{sig}"
+
+
+def _vp_vendor_from_token(token):
+    """驗證廠商連結 token，回傳廠商名；不對回 None。"""
+    try:
+        payload, sig = (token or "").split(".", 1)
+        good = _b64(hmac.new(_vp_secret(), ("vp." + payload).encode(), hashlib.sha256).digest())[:24]
+        if not hmac.compare_digest(sig, good):
+            return None
+        pad = "=" * (-len(payload) % 4)
+        vendor = base64.urlsafe_b64decode(payload + pad).decode("utf-8")
+        return vendor if vendor in VP_VENDORS else None
+    except Exception:
+        return None
+
+
+def _vp_esc(s):
+    return (s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _vp_case_of_vendor(vendor, case_no):
+    """這個案號是不是這家廠商的案件（專案細節 → 業務自治區已公證 → 場勘 base）。回 {case,alias,address} 或 None。"""
+    try:
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + _vp_esc(case_no) + "'",
+                                [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_ADDRESS])
+        for r in recs:
+            f = r["fields"]
+            if (f.get(FIELD_VENDOR) or "") == vendor:
+                return {"case": f.get(FIELD_CASE_NO, ""), "alias": f.get(FIELD_ALIAS, ""), "address": " ".join((f.get(FIELD_ADDRESS) or "").split())}
+    except Exception as e:
+        print(f"[vendor-portal] 查案件失敗：{e}", flush=True)
+    try:
+        _ensure_biz_snapshots_loaded()
+        for c in CERTIFIED_CASE_CACHE.get("cases", []):
+            if c.get("case") == case_no and (c.get("vendor") or "") == vendor:
+                return {"case": case_no, "alias": c.get("alias") or "", "address": ""}
+    except Exception:
+        pass
+    for c in SURVEY_CACHE.get("cases") or []:
+        if c.get("case") == case_no and (c.get("vendor") or "") == vendor:
+            return {"case": case_no, "alias": c.get("alias") or "", "address": " ".join((c.get("address") or "").split())}
+    return None
+
+
+def _vp_request_dict(r):
+    f = r.get("fields", {})
+    g = lambda k: f.get(VP_F[k]) or ""
+    return {"id": r["id"], "vendor": g("vendor"), "case": g("case_no"), "alias": g("alias"),
+            "items": [x for x in g("items").split("、") if x], "dates": [x for x in g("dates").split(",") if x],
+            "time_pref": g("time_pref"), "note": g("note"), "contact": g("contact"), "status": g("status") or VP_ST_WAIT,
+            "reply": g("reply"), "task_id": g("task_id"), "submitted_at": g("submitted_at"), "handled_at": g("handled_at")}
+
+
+def _vp_requests(vendor=None, status=None):
+    parts = []
+    if vendor:
+        parts.append("{" + VP_F["vendor"] + "}='" + _vp_esc(vendor) + "'")
+    if status and status != "all":
+        parts.append("{" + VP_F["status"] + "}='" + _vp_esc(status) + "'")
+    formula = ("AND(" + ",".join(parts) + ")") if parts else None
+    recs = airtable_get_all(VP_API_URL, formula, list(VP_F.values()))
+    out = [_vp_request_dict(r) for r in recs]
+    out.sort(key=lambda x: x["submitted_at"], reverse=True)
+    return out
+
+
+@app.route("/api/vendor-portal/<token>/info")
+def vendor_portal_info(token):
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效，請向陽光伏特家窗口索取新的連結"}), 404
+    try:
+        reqs = _vp_requests(vendor)[:60]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    waiting = {(r["case"], t) for r in reqs if r["status"] == VP_ST_WAIT for t in r["items"]}
+    sugg = {}
+    def add(case_no, alias, address, typ):
+        if not case_no:
+            return
+        e = sugg.setdefault(case_no, {"case": case_no, "alias": alias or "", "address": " ".join((address or "").split()), "types": []})
+        if typ not in e["types"]:
+            e["types"].append(typ)
+        if alias and not e["alias"]:
+            e["alias"] = alias
+    for c in SURVEY_CACHE.get("cases") or []:
+        if (c.get("vendor") or "") == vendor:
+            add(c.get("case"), c.get("alias"), c.get("address"), "場勘")
+    for c in DATA_CACHE.get("entry") or []:
+        if (c.get("vendor") or "") == vendor:
+            add(c.get("case"), c.get("alias"), c.get("address"), "進場")
+    for e in sugg.values():
+        e["pending"] = [t for t in e["types"] if (e["case"], t) in waiting]
+    # 這家廠商已排定的時段（今天起）
+    bookings = []
+    try:
+        formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{_vp_esc(vendor)}',"
+                   f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
+        for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE]):
+            bf = br["fields"]
+            bookings.append({"date": bf.get(FIELD_SLOT_DATE, ""), "start": bf.get(FIELD_SLOT_START, ""), "end": bf.get(FIELD_SLOT_END, ""),
+                             "case": bf.get(FIELD_SLOT_CASE_NO, ""), "alias": bf.get(FIELD_SLOT_ALIAS, ""), "types": bf.get(FIELD_SLOT_TYPE) or []})
+        bookings.sort(key=lambda b: (b["date"], b["start"]))
+    except Exception as e:
+        print(f"[vendor-portal] 查已排定時段失敗：{e}", flush=True)
+    return jsonify({"vendor": vendor, "types": VP_TYPES, "suggestions": sorted(sugg.values(), key=lambda e: e["case"]),
+                    "requests": reqs, "bookings": bookings})
+
+
+@app.route("/api/vendor-portal/<token>/cases")
+def vendor_portal_cases(token):
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"results": []})
+    esc = _vp_esc(q)
+    formula = (f"AND({{{FIELD_VENDOR}}}='{_vp_esc(vendor)}',OR(FIND(LOWER('{esc}'),LOWER({{{FIELD_CASE_NO}}}))>0,"
+               f"FIND(LOWER('{esc}'),LOWER({{{FIELD_ALIAS}}}))>0,FIND(LOWER('{esc}'),LOWER({{{FIELD_ADDRESS}}}))>0))")
+    try:
+        resp = requests.get(CASE_API_URL, headers=airtable_headers(), params={
+            "filterByFormula": formula, "fields[]": [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS], "maxRecords": 12,
+            "returnFieldsByFieldId": "true"}, timeout=15)
+        resp.raise_for_status()
+        return jsonify({"results": [{"case": r["fields"].get(FIELD_CASE_NO, ""), "alias": r["fields"].get(FIELD_ALIAS, ""),
+                                     "address": " ".join((r["fields"].get(FIELD_ADDRESS) or "").split())} for r in resp.json().get("records", [])]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/vendor-portal/<token>/requests", methods=["POST"])
+def vendor_portal_submit(token):
+    """body: {case, items:[場勘…], dates:[YYYY-MM-DD…], time_pref, note, contact}"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    body = request.get_json(silent=True) or {}
+    case_no = (body.get("case") or "").strip()
+    items = [t for t in _normalize_type_list(body.get("items")) if t in VP_TYPES]
+    items = list(dict.fromkeys(items))
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+    dates = []
+    for d in (body.get("dates") or [])[:8]:
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+        except Exception:
+            continue
+        if d >= today and d not in dates:
+            dates.append(d)
+    dates.sort()
+    if not case_no or not items:
+        return jsonify({"error": "請選擇案號，並勾選要預約的項目"}), 400
+    if not dates:
+        return jsonify({"error": "請至少填一個希望的日期（今天以後）"}), 400
+    c = _vp_case_of_vendor(vendor, case_no)
+    if not c:
+        return jsonify({"error": f"找不到「{case_no}」，或這個案號不是{vendor}的案件，請重新搜尋後選擇"}), 403
+    try:
+        waiting = [r for r in _vp_requests(vendor, VP_ST_WAIT)]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if len(waiting) >= VP_MAX_PENDING:
+        return jsonify({"error": "待處理的申請太多了，請等窗口處理後再送"}), 429
+    dup = [r for r in waiting if r["case"] == case_no and set(r["items"]) & set(items)]
+    if dup:
+        return jsonify({"error": f"{case_no} 已經有一筆待處理的{'、'.join(dup[0]['items'])}申請，請等窗口回覆；要修改請先取消那筆再重送"}), 409
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    fields = {VP_F["key"]: f"{vendor} {case_no} {'/'.join(items)}", VP_F["vendor"]: vendor, VP_F["case_no"]: case_no,
+              VP_F["alias"]: c["alias"], VP_F["items"]: "、".join(items), VP_F["dates"]: ",".join(dates),
+              VP_F["time_pref"]: (body.get("time_pref") or "").strip()[:60], VP_F["note"]: (body.get("note") or "").strip()[:800],
+              VP_F["contact"]: (body.get("contact") or "").strip()[:60], VP_F["status"]: VP_ST_WAIT, VP_F["submitted_at"]: now}
+    resp = requests.post(VP_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "儲存失敗，請稍後再試", "detail": resp.text[:200]}), 502
+    try:
+        wd = lambda d: _wd_label(d)
+        card = _card("🏗️ 廠商預約申請", "#7C3AED", f"{vendor}｜{case_no} {c['alias']}".strip(), "",
+                     rows=[("項目", "、".join(items)), ("希望日期", "、".join(wd(d) for d in dates)),
+                           ("希望時段", fields[VP_F["time_pref"]]), ("備註", fields[VP_F["note"]]), ("聯絡人", fields[VP_F["contact"]])],
+                     button=("到主控台處理", _dash_url() + "/#slots-requests"), footer="主控台「廠商時段協調 → 廠商申請」可轉成指派任務或退回。")
+        _line_push_card(card)
+    except Exception as e:
+        print(f"[vendor-portal] 推播 PM 失敗：{e}", flush=True)
+    return jsonify({"ok": True, "id": resp.json().get("id")})
+
+
+@app.route("/api/vendor-portal/<token>/requests/<rid>/cancel", methods=["POST"])
+def vendor_portal_cancel(token, rid):
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    try:
+        r = requests.get(f"{VP_API_URL}/{rid}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=15)
+        if r.status_code >= 400:
+            return jsonify({"error": "找不到這筆申請"}), 404
+        d = _vp_request_dict(r.json())
+        if d["vendor"] != vendor:
+            return jsonify({"error": "找不到這筆申請"}), 404
+        if d["status"] != VP_ST_WAIT:
+            return jsonify({"error": f"這筆已經是「{d['status']}」，不能取消"}), 409
+        requests.patch(f"{VP_API_URL}/{rid}", headers=airtable_headers(), json={"fields": {VP_F["status"]: VP_ST_CANCEL}}, timeout=15)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+# ---- PM（主控台）端 ----
+@app.route("/api/vendor-requests")
+def vendor_requests_list():
+    """?status=待處理（預設）｜已轉任務｜已退回｜已取消｜all"""
+    status = request.args.get("status") or VP_ST_WAIT
+    try:
+        return jsonify({"requests": _vp_requests(None, status)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/vendor-requests/<rid>/status", methods=["POST"])
+def vendor_requests_set_status(rid):
+    """body: {status: 已轉任務|已退回|待處理, note?, task_id?}"""
+    body = request.get_json(silent=True) or {}
+    status = body.get("status")
+    if status not in (VP_ST_TASK, VP_ST_REJECT, VP_ST_WAIT):
+        return jsonify({"error": "狀態不正確"}), 400
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    fields = {VP_F["status"]: status, VP_F["handled_at"]: "" if status == VP_ST_WAIT else now}
+    if "note" in body:
+        fields[VP_F["reply"]] = (body.get("note") or "").strip()[:500]
+    if body.get("task_id"):
+        fields[VP_F["task_id"]] = body["task_id"][:30]
+    resp = requests.patch(f"{VP_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=15)
+    if resp.status_code >= 400:
+        return jsonify({"error": "寫入失敗", "detail": resp.text[:200]}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/vendor-portal-links")
+def vendor_portal_links():
+    """每家廠商的專屬預約連結（給 PM 複製傳給廠商）。"""
+    if not (os.environ.get("BIZ_SHEET_SYNC_KEY") or "").strip():
+        return jsonify({"error": "後端沒有設定 BIZ_SHEET_SYNC_KEY，沒辦法產生安全的廠商連結"}), 500
+    base = _dash_url()
+    return jsonify({"links": [{"vendor": v, "url": f"{base}/vendor.html?v={_vp_token_make(v)}"} for v in VP_VENDORS]})
 
 
 @app.route("/api/ship-date-sync/notify", methods=["POST"])
