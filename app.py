@@ -4624,6 +4624,56 @@ def _entry_with_order_dates(cases):
     return out
 
 
+SHIP_SYNC_LAST = {"at": None, "changed": [], "error": None}
+
+
+def sync_ship_dates_from_orders():
+    """2026-10-19：訂單表（Excel 解析）的「預計到貨時間」才是最準的。案件進場安排裡（出貨已有日期、還沒進場）的案件，
+    如果訂單上確定的到貨日跟 Airtable「進度管理」大料出貨時間那筆的日期不一樣，就把 Airtable 改成訂單的日期，
+    並確認節點狀態＝已完成；改完重新整理快取。每小時一次（也可由 POST /api/ship-date-sync 手動觸發）。"""
+    changed = []
+    try:
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        cases = [c for c in (DATA_CACHE.get("entry") or []) if c.get("ship_milestone_record_id")]
+        cases += [c for c in (DATA_CACHE.get("completed") or [])
+                  if c.get("ship_milestone_record_id") and str(c.get("entry_date") or "")[:10] >= today]   # 已排進場、還沒進場的
+        for c in _entry_with_order_dates(cases):
+            if not c.get("ship_date_from_order"):
+                continue
+            try:   # 安全閥：差超過 120 天多半是訂單對錯案件，不自動改，留給人看
+                if abs((datetime.strptime(c["ship_date"], "%Y-%m-%d") - datetime.strptime(str(c.get("ship_date_milestone") or c["ship_date"])[:10], "%Y-%m-%d")).days) > 120:
+                    print(f"[ship-sync] {c.get('case')} 訂單日期 {c['ship_date']} 與里程碑 {c.get('ship_date_milestone')} 差太多，略過", flush=True)
+                    continue
+            except ValueError:
+                pass
+            fields = {FIELD_MS_ACTUAL_DATE: c["ship_date"], FIELD_MS_STATUS: MS_STATUS_DONE}
+            resp = requests.patch(f"{MILESTONE_API_URL}/{c['ship_milestone_record_id']}", headers=airtable_headers(),
+                                  json={"fields": fields}, timeout=20)
+            if resp.status_code >= 400:
+                raise Exception(f"{c.get('case')}：{resp.text[:200]}")
+            changed.append({"case": c.get("case"), "from": c.get("ship_date_milestone"), "to": c["ship_date"]})
+        if changed:
+            print(f"[ship-sync] 依訂單修正出貨日期 {len(changed)} 筆：{changed}", flush=True)
+            threading.Thread(target=refresh_cache, daemon=True).start()
+        SHIP_SYNC_LAST.update({"at": datetime.now().isoformat(timespec="seconds"), "changed": changed, "error": None})
+    except Exception as e:
+        print(f"[ship-sync] 失敗：{e}", flush=True)
+        SHIP_SYNC_LAST.update({"at": datetime.now().isoformat(timespec="seconds"), "changed": changed, "error": str(e)[:300]})
+    return changed
+
+
+scheduler.add_job(sync_ship_dates_from_orders, CronTrigger(minute=20, timezone="Asia/Taipei"), id="ship_date_sync",
+                  replace_existing=True, max_instances=1, coalesce=True)
+
+
+@app.route("/api/ship-date-sync", methods=["GET", "POST"])
+def ship_date_sync_api():
+    """GET：最近一次依訂單修正出貨日期的結果；POST：立刻跑一次。"""
+    if request.method == "POST":
+        sync_ship_dates_from_orders()
+    return jsonify(SHIP_SYNC_LAST)
+
+
 @app.route("/api/entry-cases")
 def entry_cases():
     entry = _entry_with_order_dates(DATA_CACHE["entry"])
