@@ -4310,6 +4310,7 @@ def compute_pending_and_entry():
             contract_info = contract_map.get(r["id"])
             completed.append({
                 **base,
+                "ship_milestone_record_id": ship_info["milestone_record_id"],
                 "ship_date": ship_info.get("actual_date"),
                 "entry_date": entry_info.get("actual_date"),
                 "meter_milestone_record_id": meter_info["milestone_record_id"] if meter_info else None,
