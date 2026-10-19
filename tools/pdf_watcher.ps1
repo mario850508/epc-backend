@@ -3,7 +3,7 @@
 =====================================================
 跑在每位 PM 自己的電腦上（Windows 內建 PowerShell，不用另外安裝）：
   每分鐘到主控台讀「這位 PM 的 LINE 收件資料夾」設定，資料夾（含子資料夾）裡有新的 PDF、
-  照片（JPG/PNG，主控台會轉成 PDF）、Word／Excel（.docx／.xlsx），
+  Word／Excel（.docx／.xlsx；照片不送，只留在群組），
   就送到主控台的辨識佇列；同一份內容重複下載不會重複辨識（後端比對檔案雜湊）。
   若主控台指定這台電腦負責「自動歸檔」，也會把「已確認」的檔案用確認檔名放進
   「案場資料夾 → 03/04/06/07」，同名檔案不覆蓋；資料夾裡已經有同類型的檔案（例如已有
@@ -26,7 +26,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "1.6"
+$Version = "1.7"
 $Backend = "https://epc-backend-4aj2.onrender.com"
 if ($env:SUNNY_BACKEND) { $Backend = $env:SUNNY_BACKEND }   # 測試用
 if ($env:LOCALAPPDATA) { $AppDir = Join-Path $env:LOCALAPPDATA "SunnyPdfWatcher" }
@@ -215,7 +215,7 @@ function Save-LineOriginals([string]$folder) {
 $caseIndex = @{}          # 案號 → 案場資料夾完整路徑
 $caseIndexAt = [datetime]::MinValue
 $archiveFailedAt = @{}    # 記錄 id → 上次失敗時間（失敗的 30 分鐘後再試）
-$WatchExts = @(".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp", ".docx", ".xlsx")
+$WatchExts = @(".pdf", ".docx", ".xlsx")   # 照片只是群組溝通用，不送辨識、不歸檔（2026-10-19）
 
 function Find-CaseDir($it) {
     # 收購的案場：Airtable 案號是「桃園千塘82號」、G 槽資料夾是「潤特桃園17號」，主控台會給所有可能的案號
