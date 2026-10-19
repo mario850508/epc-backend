@@ -602,6 +602,7 @@ FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝�
 FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
+FIELD_TASK_BUFFER = "fldtVqyV99xZXA8bd"           # 2026-10-19：車程緩衝（分鐘）：兩個預約之間要留的路程時間
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
 TASK_STATUS_DONE = "已完成"
@@ -713,7 +714,7 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
-def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None):
+def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0):
     """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
     資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
     escaped_vendor = vendor.replace("'", "\\'")
@@ -733,15 +734,21 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None):
         es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
         if not es or not ee:
             continue
-        if _slots_overlap(start_time, end_time, es, ee):
-            return {
-                "case": ef.get(FIELD_SLOT_CASE_NO, ""),
-                "alias": ef.get(FIELD_SLOT_ALIAS, ""),
-                "type": ef.get(FIELD_SLOT_TYPE) or [],
-                "start_time": es,
-                "end_time": ee,
-                "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
-            }
+        near = False
+        if not _slots_overlap(start_time, end_time, es, ee):
+            # 車程緩衝：跟別的預約之間至少要隔 buffer_min 分鐘（前後都算）
+            if not (buffer_min and _parse_hhmm(start_time) < _parse_hhmm(ee) + buffer_min and _parse_hhmm(es) < _parse_hhmm(end_time) + buffer_min):
+                continue
+            near = True
+        return {
+            "buffer": near,
+            "case": ef.get(FIELD_SLOT_CASE_NO, ""),
+            "alias": ef.get(FIELD_SLOT_ALIAS, ""),
+            "type": ef.get(FIELD_SLOT_TYPE) or [],
+            "start_time": es,
+            "end_time": ee,
+            "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
+        }
     return None
 
 
@@ -771,7 +778,7 @@ def _case_alias(case_no):
 
 
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None, companions=None):
+                       owner_name=None, owner_phone=None, companions=None, buffer_min=0):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -799,10 +806,12 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
         return None, ({"error": "開始時間要早於結束時間"}, 400)
 
     try:
-        conflict = _find_slot_conflict(vendor, date, start_time, end_time)
+        conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min)
     except Exception as e:
         return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
+        if conflict.get("buffer"):
+            return None, ({"error": f"跟同一天 {conflict['start_time']}–{conflict['end_time']} 的預約太近了，中間要留 {buffer_min} 分鐘的車程時間，請換一個時間", "conflict": conflict}, 409)
         return None, ({"error": "這個時段已經被佔用了", "conflict": conflict}, 409)
 
     try:
@@ -1171,7 +1180,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER,
     ]
 
 
@@ -1194,6 +1203,15 @@ def _json_or_default(raw, default):
         return v if isinstance(v, type(default)) else default
     except Exception:
         return default
+
+
+def _valid_buffer(v):
+    """車程緩衝（分鐘）：0～180 的整數，不合法一律當 0（不留緩衝）。"""
+    try:
+        n = int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+    return n if 0 < n <= 180 else 0
 
 
 def _task_to_dict(r):
@@ -1230,6 +1248,7 @@ def _task_to_dict(r):
         "owner_win2_start": f.get(FIELD_TASK_OWNER_WIN2_START) or "",
         "owner_win2_end": f.get(FIELD_TASK_OWNER_WIN2_END) or "",
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
+        "buffer_min": _valid_buffer(f.get(FIELD_TASK_BUFFER)),
     }
 
 
@@ -1299,6 +1318,8 @@ def create_vendor_slot_task():
         deadline = _normalize_deadline(body.get("deadline"))
         if deadline:
             fields[FIELD_TASK_DEADLINE] = deadline
+        if _valid_buffer(body.get("buffer_min")):
+            fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min"))
         est_start = (body.get("est_start") or "").strip()
         try:
             _parse_hhmm(est_start)
@@ -1371,6 +1392,7 @@ def update_vendor_slot_task(record_id):
     w2s, w2e = _opt_window2(body, fields[FIELD_TASK_OWNER_WIN_END])
     fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = (w2s or None), (w2e or None)
     fields[FIELD_TASK_COMPANIONS] = "、".join(_clean_companions(body.get("companions"), case_no)) or None
+    fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min")) or None
     if "deadline" in body:
         deadline = _normalize_deadline(body.get("deadline"))
         fields[FIELD_TASK_DEADLINE] = deadline
@@ -1631,6 +1653,7 @@ def book_vendor_slot_task(token):
         task["vendor"], date, body.get("start_time"), body.get("end_time"),
         task["case"], task["alias"], task["type"], body.get("registrant"), body.get("note"),
         owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
+        buffer_min=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
@@ -2058,7 +2081,7 @@ def _owner_slot_from_start(task, date, start):
         if st != fx[0]:
             return None, f"這個預約的時間固定是 {wins[0][0]}–{wins[0][1]}"
         et = fx[1]
-    elif st % 60 != 0 and not any(st == _parse_hhmm(a) for a, _ in wins):   # 屋主只能選整點開始（2026-10-12 使用者要求）；時段本身從半點開始時，時段起點也可選（2026-10-15）
+    elif st % (30 if _valid_buffer(task.get("buffer_min")) else 60) != 0 and not any(st == _parse_hhmm(a) for a, _ in wins):   # 屋主只能選整點開始（2026-10-12 使用者要求）；時段本身從半點開始時，時段起點也可選（2026-10-15）
         return None, "請選整點的開始時間"
     if not any(st >= _parse_hhmm(a) and et <= _parse_hhmm(b) for a, b in wins):
         return None, "請選 " + "、".join(f"{a}–{b}" for a, b in wins) + " 之間的時間"
@@ -2134,6 +2157,7 @@ def owner_booking_get(otoken):
         "window_start": ws, "window_end": we,
         "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
+        "buffer_min": _valid_buffer(task.get("buffer_min")),
         "companion_addrs": _owner_companion_addrs(task),
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
@@ -2205,10 +2229,13 @@ def owner_booking_book(otoken):
     record, err = _book_vendor_slot(
         task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
         f"屋主 {name}", db_note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
+        buffer_min=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
         if status == 409:
+            if (err_body.get("conflict") or {}).get("buffer"):
+                return jsonify({"error": "這個時間跟別人的預約太近了（要留車程時間），請換一個時間"}), 409
             return jsonify({"error": "這個時間剛好被別人預約了，請換一個時間"}), 409
         return jsonify(err_body), status
     try:
