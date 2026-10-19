@@ -7613,6 +7613,10 @@ def procurement_case_detail():
     case_no = (request.args.get("case") or "").strip()
     if not case_no:
         return jsonify({"error": "缺少案號"}), 400
+    # 手打的案號常少「號」、多空白或寫成「台」：統一成案件表的寫法（例：潤特桃園86 → 潤特桃園86號）
+    case_no = re.sub(r"\s+", "", case_no).replace("台", "臺")
+    if re.search(r"\d$", case_no):
+        case_no += "號"
     try:
         cache = _load_order_snapshots()
     except Exception as e:
