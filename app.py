@@ -8383,6 +8383,7 @@ PDF_F = {
 PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
 PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
 PDF_MAX_BYTES = 5 * 1024 * 1024   # Airtable uploadAttachment 單檔上限
+PDF_UPLOAD_MAX_BYTES = 30 * 1024 * 1024   # 收件上限：超過 5MB 的 PDF 會在後端縮小後再存（2026-10-19）
 PDF_MAX_ATTEMPTS = 3
 PDF_STALE_MINUTES = 30
 PDF_MODEL = os.environ.get("PDF_RENAME_MODEL", "claude-opus-5-5").strip()
@@ -9370,6 +9371,46 @@ def _pdf_image_to_pdf(data):
             break
     return buf.getvalue()
 
+
+
+def _pdf_shrink(data, limit=None):
+    """2026-10-19：超過 Airtable 5MB 上限的 PDF（多半是整份掃描的審訖圖，常見 6～8MB）→ 把裡面的圖片縮小、降 JPEG 品質，
+    依序嘗試 (長邊 3000px, 品質 80)、(2600, 70)、(2200, 60)、(1800, 50)，一降到上限以下就停。
+    回傳 (bytes, 是否有縮到上限內)。文字層與頁面內容不動（OCR 辨識用得到）。"""
+    from pypdf import PdfReader, PdfWriter
+    from PIL import Image
+    limit = limit or PDF_MAX_BYTES
+    best = data
+    for side, quality in ((3000, 80), (2600, 70), (2200, 60), (1800, 50)):
+        reader = PdfReader(io.BytesIO(data))
+        writer = PdfWriter(clone_from=reader)
+        for page in writer.pages:
+            try:
+                images = list(page.images)
+            except Exception:
+                continue
+            for img in images:
+                try:
+                    pil = img.image
+                    if pil is None:
+                        continue
+                    if pil.mode not in ("RGB", "L"):
+                        pil = pil.convert("RGB")
+                    pil.thumbnail((side, side))
+                    img.replace(pil, quality=quality)
+                except Exception as e:
+                    print(f"[pdf_shrink] 略過一張圖片：{e}", flush=True)
+        try:
+            writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
+        except Exception:
+            pass
+        out = io.BytesIO()
+        writer.write(out)
+        if len(out.getvalue()) < len(best):
+            best = out.getvalue()
+        if len(best) <= limit:
+            return best, True
+    return best, len(best) <= limit
 
 
 def _pdf_text_layer(pdf_bytes):
@@ -10593,8 +10634,15 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
         content_type = PDF_OFFICE_MIME[ext]
     else:
         return {"name": name, "ok": False, "error": "不支援的檔案格式（支援 PDF、照片 JPG/PNG、Word .docx、Excel .xlsx）"}
+    if len(data) > PDF_MAX_BYTES and data.startswith(b"%PDF") and len(data) <= PDF_UPLOAD_MAX_BYTES:
+        try:   # 太大的 PDF 先縮小再存（hash 仍用原檔算，重複檔案照樣擋得到）
+            before = len(data)
+            data, fit = _pdf_shrink(data)
+            print(f"[pdf_rename] {name} 超過 5MB，縮小 {before // 1024}KB → {len(data) // 1024}KB（{'OK' if fit else '還是太大'}）", flush=True)
+        except Exception as e:
+            print(f"[pdf_rename] 縮小 PDF 失敗：{e}", flush=True)
     if len(data) > PDF_MAX_BYTES:
-        return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限）"}
+        return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限），而且自動縮小後還是太大，請先用 PDF 壓縮工具縮小再上傳"}
     try:
         dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'",
                                [PDF_F["status"], PDF_F["src_name"], PDF_F["uploader"]])
@@ -10658,7 +10706,7 @@ def pdf_rename_watcher_config():
         return jsonify({"error": f"主控台還沒設定「{pm}」的 LINE 收件資料夾"}), 404
     arc = _pdf_settings().get("archive") or {}
     return jsonify({"pm": pm, "folder": w.get("folder") or "", "enabled": bool(w.get("enabled", True)),
-                    "interval_sec": 60, "max_mb": PDF_MAX_BYTES // (1024 * 1024),
+                    "interval_sec": 60, "max_mb": PDF_UPLOAD_MAX_BYTES // (1024 * 1024),   # 舊版背景程式用 max_mb 當收件上限；超過 5MB 的由後端縮小
                     "image_max_mb": 20,   # 照片會在後端縮小轉成 PDF，原檔可以比較大
                     # pm 留空＝任何開著的電腦都可以歸檔（大家都存同一個公司雲端），用 archive-claim 避免兩台搶同一份
                     "archive": {"enabled": bool(arc.get("enabled")) and (not arc.get("pm") or arc.get("pm") == pm),
