@@ -10401,6 +10401,9 @@ def pdf_rename_watcher_upload():
     pm = (body.get("pm") or "").strip()
     if not pm:
         return jsonify({"error": "缺少 pm"}), 400
+    # LINE 群組的照片只是溝通用，不辨識、不歸檔（2026-10-19 使用者要求）；回 duplicate 讓舊版背景程式記成處理過、不再重送
+    if _pdf_ext(body.get("filename") or "") in PDF_IMAGE_EXTS:
+        return jsonify({"name": body.get("filename"), "ok": True, "duplicate": True, "skipped": "image"})
     try:
         data = base64.b64decode(body.get("data") or "")
     except Exception:
