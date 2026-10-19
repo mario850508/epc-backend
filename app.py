@@ -6064,7 +6064,8 @@ def _collect_tomorrow_events(tmr):
     for lst in (DATA_CACHE.get("pending") or [], DATA_CACHE.get("entry") or [], DATA_CACHE.get("completed") or []):
         for c in lst:
             case_vendor[c.get("case")] = c.get("vendor") or ""
-    for c in (DATA_CACHE.get("entry") or []) + (DATA_CACHE.get("completed") or []):
+    # 出貨日期優先用訂單確定的到貨日（里程碑上的只是預估，會讓還沒到貨的案件被誤報成明天出貨）
+    for c in _entry_with_order_dates((DATA_CACHE.get("entry") or []) + (DATA_CACHE.get("completed") or [])):
         if c.get("ship_date") == tmr and (c["case"], "出貨") not in seen:
             seen.add((c["case"], "出貨"))
             extra = "；".join(x for x in [f"模組 {c.get('module')}" if c.get("module") else "",
