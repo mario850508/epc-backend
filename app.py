@@ -582,6 +582,7 @@ FIELD_TASK_REP_NOTE = "fldAy7F6ibcZpbwTY"       # 業務回覆備註
 FIELD_TASK_DEADLINE = "fldcNCOuBjyy4lT0E"       # 回覆期限（dateTime，台北時間），2026-10-04 新增
 TASK_STAGE_WAIT_PM = "待窗口確認"
 TASK_STAGE_WAIT_REP = "待業務確認"
+TASK_STAGE_WAIT_EPC = "待廠商重提時間"   # 2026-10-20：屋主「以上時間都不方便」且不可自填 → 由窗口請 EPC 重新提供時間
 # 2026-10-05：業務 LINE 綁定表（姓名 → LINE userId），供回覆期限提醒個別推播
 LINE_BIND_TABLE_ID = "tblkTLFeRSvqsVpBi"
 FIELD_BIND_NAME = "fldqJBVB9IYxnyWDR"
@@ -602,6 +603,7 @@ FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝�
 FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
+FIELD_TASK_NO_ALT = "fldwuPFU4WawJfABl"           # 2026-10-20：屋主不可自填時間（勾選＝以上時間都不行時只能回覆不方便，由窗口請 EPC 重提）
 FIELD_TASK_DAYS = "fld1wr03w7FM9uDrF"             # 2026-10-20：預計施工天數文字（進場給屋主看，例如「4～5 天」）
 FIELD_TASK_BUFFER = "fldtVqyV99xZXA8bd"           # 2026-10-19：車程緩衝（分鐘）：兩個預約之間要留的路程時間
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
@@ -1199,7 +1201,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT,
     ]
 
 
@@ -1271,6 +1273,7 @@ def _task_to_dict(r):
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
         "buffer_min": _valid_buffer(f.get(FIELD_TASK_BUFFER)),
         "days_label": (f.get(FIELD_TASK_DAYS) or "").strip(),
+        "no_alt": bool(f.get(FIELD_TASK_NO_ALT)),
     }
 
 
@@ -1344,6 +1347,8 @@ def create_vendor_slot_task():
             fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min"))
         if (body.get("days_label") or "").strip():
             fields[FIELD_TASK_DAYS] = body["days_label"].strip()[:20]
+        if body.get("no_alt"):
+            fields[FIELD_TASK_NO_ALT] = True
         est_start = (body.get("est_start") or "").strip()
         try:
             _parse_hhmm(est_start)
@@ -1418,6 +1423,10 @@ def update_vendor_slot_task(record_id):
     fields[FIELD_TASK_COMPANIONS] = "、".join(_clean_companions(body.get("companions"), case_no)) or None
     fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min")) or None
     fields[FIELD_TASK_DAYS] = (body.get("days_label") or "").strip()[:20] or None
+    fields[FIELD_TASK_NO_ALT] = bool(body.get("no_alt"))
+    if task["stage"] == TASK_STAGE_WAIT_EPC:   # 窗口改了候選日期＝EPC 重新提供了時間：屋主用同一條連結就能重新選
+        fields[FIELD_TASK_STAGE] = None
+        fields[FIELD_TASK_REP_NOTE] = ""
     if "deadline" in body:
         deadline = _normalize_deadline(body.get("deadline"))
         fields[FIELD_TASK_DEADLINE] = deadline
@@ -1751,8 +1760,11 @@ def _normalize_slot(s):
     return {"date": date, "start_time": f"{st // 60:02d}:{st % 60:02d}", "end_time": f"{et // 60:02d}:{et % 60:02d}"}
 
 
-def _patch_task(record_id, fields):
-    resp = requests.patch(f"{TASK_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+def _patch_task(record_id, fields, typecast=False):
+    payload = {"fields": fields}
+    if typecast:
+        payload["typecast"] = True   # 單選欄位出現新的選項（例如新增的階段）時，讓 Airtable 自動建立
+    resp = requests.patch(f"{TASK_API_URL}/{record_id}", headers=airtable_headers(), json=payload, timeout=20)
     if resp.status_code >= 400:
         raise RuntimeError(resp.text)
     return resp.json()
@@ -2173,11 +2185,14 @@ def owner_booking_get(otoken):
         status = "done"
     elif stage == TASK_STAGE_WAIT_PM:
         status = "wait_pm"
+    elif stage == TASK_STAGE_WAIT_EPC:
+        status = "wait_epc"
     elif stage == TASK_STAGE_WAIT_REP and task["chosen_slot"]:
         status = "wait_confirm"
     else:
         status = "open"
     out = {
+        "no_alt": bool(task.get("no_alt")),
         "items": [OWNER_TYPE_LABELS.get(t, t) for t in task["type"]],
         "candidate_dates": task["candidate_dates"],
         "duration_min": _owner_duration(task),
@@ -2337,6 +2352,41 @@ def owner_booking_propose(otoken):
         note_rep="窗口跟廠商確認後會選一天並決定時間，屋主可以在同一個連結按確認",
     )
     return jsonify({"ok": True, "slots": slots})
+
+
+@app.route("/api/owner-booking/<otoken>/decline", methods=["POST"])
+def owner_booking_decline(otoken):
+    """屋主按「以上時間都不方便」（任務勾了「屋主不可自填時間」）：不收屋主的其他日期，
+    任務進「待廠商重提時間」，通知窗口請 EPC 重新提供可安排的時間。body: {note?, owner_name?, owner_phone?}"""
+    try:
+        r = _owner_find_task(otoken)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not r:
+        return jsonify({"error": "找不到這個預約連結，請直接聯絡您的業務"}), 404
+    task = _task_to_dict(r)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個預約已經取消了，請聯絡窗口或您的業務"}), 409
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個預約已經完成了，如需更改請聯絡您的業務"}), 409
+    body = request.get_json(silent=True) or {}
+    name = (body.get("owner_name") or "").strip()[:30]
+    phone = (body.get("owner_phone") or "").strip()[:30]
+    note = (body.get("note") or "").strip()[:300]
+    who = f"（屋主 {name} {phone}）".replace("  ", " ").replace("（屋主 ）", "") if (name or phone) else ""
+    try:
+        _patch_task(r["id"], {FIELD_TASK_STAGE: TASK_STAGE_WAIT_EPC, FIELD_TASK_ALT_SLOTS: "", FIELD_TASK_CHOSEN_SLOT: "",
+                              FIELD_TASK_REP_NOTE: (who + (note or "以上時間都不方便")).strip()}, typecast=True)
+    except Exception as e:
+        return jsonify({"error": "送出失敗，請稍後再試", "detail": str(e)}), 502
+    _notify_owner_action(
+        task, "🏠 屋主以上時間都不方便｜請 EPC 重新提供時間", "🏠 屋主以上時間都不方便｜給業務", "#DC2626",
+        [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
+         ("候選日期", "、".join(_wd_label(d) for d in task["candidate_dates"][:8]) + ("…" if len(task["candidate_dates"]) > 8 else "")),
+         ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+        note_rep="屋主表示提供的時間都不方便，窗口會請廠商重新提供時間，之後會再通知屋主",
+    )
+    return jsonify({"ok": True})
 
 
 @app.route("/api/owner-booking/<otoken>/confirm", methods=["POST"])
@@ -6118,7 +6168,7 @@ def send_deadline_reminders():
         if f.get(FIELD_TASK_GROUP_ID) and f.get(FIELD_TASK_OWNER_REPLY):
             continue   # 聯合排程：屋主已經回覆了
         # 待窗口確認＝業務已經回傳備選時段，球在窗口手上，不用催業務
-        if f.get(FIELD_TASK_STAGE) == TASK_STAGE_WAIT_PM:
+        if f.get(FIELD_TASK_STAGE) in (TASK_STAGE_WAIT_PM, TASK_STAGE_WAIT_EPC):
             continue
         raw = f.get(FIELD_TASK_DEADLINE)
         if not raw:
