@@ -10180,18 +10180,35 @@ def _pdf_propagate_sibling_date(case_no, doc_type, doc_date):
     try:
         recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc(case_no) + "',{" + PDF_F["status"]
                                 + "}='" + PDF_ST_REVIEW + "',OR(" + ",".join("{" + PDF_F["doc_type"] + "}='" + esc(t) + "'" for t in targets)
-                                + "))", [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["suggested"], PDF_F["final_name"], PDF_F["evidence"]])
+                                + "))", [PDF_F["doc_type"], PDF_F["doc_date"], PDF_F["suggested"], PDF_F["final_name"], PDF_F["evidence"],
+                                         PDF_F["result_json"], PDF_F["confidence"]])
         case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), {"case_no": case_no})
         for r in recs:
             g = r.get("fields", {})
-            if g.get(PDF_F["doc_date"]) == doc_date:
-                continue
-            new_name = _pdf_build_name(settings.get("template"), case, g.get(PDF_F["doc_type"]), doc_date)
-            fields = {PDF_F["doc_date"]: doc_date, PDF_F["suggested"]: new_name,
-                      PDF_F["evidence"]: (g.get(PDF_F["evidence"]) or "") + f"\n日期：已改用同案場{doc_type}的日期 {doc_date}"}
-            if not g.get(PDF_F["final_name"]) or g.get(PDF_F["final_name"]) == g.get(PDF_F["suggested"]):
-                fields[PDF_F["final_name"]] = new_name
-            _pdf_patch(r["id"], fields)
+            fields = {}
+            if g.get(PDF_F["doc_date"]) != doc_date:
+                new_name = _pdf_build_name(settings.get("template"), case, g.get(PDF_F["doc_type"]), doc_date)
+                fields = {PDF_F["doc_date"]: doc_date, PDF_F["suggested"]: new_name,
+                          PDF_F["evidence"]: (g.get(PDF_F["evidence"]) or "") + f"\n日期：已改用同案場{doc_type}的日期 {doc_date}"}
+                if not g.get(PDF_F["final_name"]) or g.get(PDF_F["final_name"]) == g.get(PDF_F["suggested"]):
+                    fields[PDF_F["final_name"]] = new_name
+            # 拿掉「同案場的審訖圖還沒進來，先用收件日」的提醒，日期信心改成跟著審訖圖（兩份常常同一秒進來）
+            try:
+                res = json.loads(g.get(PDF_F["result_json"]) or "{}")
+            except ValueError:
+                res = {}
+            issues = res.get("issues") or []
+            kept = [x for x in issues if not (str(x).startswith(f"同案場的{doc_type}") and "還沒進來" in str(x))]
+            if len(kept) != len(issues):
+                res["issues"] = kept
+                parts = list(res.get("conf_parts") or [])
+                if len(parts) == 3:
+                    parts[2] = 90
+                    res["conf_parts"] = parts
+                    fields[PDF_F["confidence"]] = max(0, min(parts))
+                fields[PDF_F["result_json"]] = json.dumps(res, ensure_ascii=False)[:95000]
+            if fields:
+                _pdf_patch(r["id"], fields)
     except Exception as e:
         print(f"[pdf_rename] 更新同案場日期失敗：{e}", flush=True)
 
