@@ -714,7 +714,23 @@ def create_vendor_slot_windows():
         return jsonify({"error": str(e)}), 502
 
 
-def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0):
+def _crew_groups(types):
+    """2026-10-20：同廠商「場勘」跟「施工類（植筋／放樣／進場／掛表）」是兩批不同的人，同一時段可以各自預約、不算衝突。
+    回傳這筆預約佔用的班別集合；場勘＋植筋一起的預約兩批人都佔用。"""
+    t = set(types or [])
+    groups = set()
+    if "場勘" in t:
+        groups.add("場勘")
+    if t - {"場勘"} or not t:
+        groups.add("施工")
+    return groups
+
+
+def _same_crew(types_a, types_b):
+    return bool(_crew_groups(types_a) & _crew_groups(types_b))
+
+
+def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0, types=None):
     """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
     資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
     escaped_vendor = vendor.replace("'", "\\'")
@@ -734,6 +750,8 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
         es, ee = ef.get(FIELD_SLOT_START), ef.get(FIELD_SLOT_END)
         if not es or not ee:
             continue
+        if types is not None and not _same_crew(types, ef.get(FIELD_SLOT_TYPE) or []):
+            continue   # 場勘跟施工是不同班的人，不互相佔用時段
         near = False
         if not _slots_overlap(start_time, end_time, es, ee):
             # 車程緩衝：跟別的預約之間至少要隔 buffer_min 分鐘（前後都算）
@@ -806,7 +824,7 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
         return None, ({"error": "開始時間要早於結束時間"}, 400)
 
     try:
-        conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min)
+        conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=slot_type)
     except Exception as e:
         return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
@@ -1554,10 +1572,12 @@ def get_vendor_slot_task_by_token(token):
                 f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))"
             )
             busy_records = airtable_get_all(
-                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END],
+                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE],
             )
             for br in busy_records:
                 bf = br["fields"]
+                if not _same_crew(task["type"], bf.get(FIELD_SLOT_TYPE) or []):
+                    continue   # 場勘跟施工是不同班的人，不算佔用
                 if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
                     task["busy_slots"].append({
                         "date": bf[FIELD_SLOT_DATE],
@@ -1831,7 +1851,7 @@ def choose_vendor_slot_alternative(record_id):
     if not slot.get("start_time") or not slot.get("end_time"):
         return jsonify({"error": "這個備選只有日期，請先填開始時間"}), 400
     try:
-        conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"])
+        conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"], types=task["type"])
     except Exception as e:
         return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
     if conflict:
@@ -2055,15 +2075,17 @@ def _owner_window(task):
     return w[0][0], w[-1][1]
 
 
-def _vendor_busy_slots(vendor):
+def _vendor_busy_slots(vendor, types=None):
     if not vendor:
         return []
     esc = vendor.replace("'", chr(92) + "'")
     formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',"
                f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
     out = []
-    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END]):
+    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE]):
         bf = br["fields"]
+        if types is not None and not _same_crew(types, bf.get(FIELD_SLOT_TYPE) or []):
+            continue
         if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
             out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END]})
     return out
@@ -2182,7 +2204,7 @@ def owner_booking_get(otoken):
             pass
     elif status != "done":
         try:
-            out["busy_slots"] = _vendor_busy_slots(task["vendor"])
+            out["busy_slots"] = _vendor_busy_slots(task["vendor"], task["type"])
         except Exception as e:
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
     if task.get("group_id"):
@@ -11778,7 +11800,7 @@ def joint_confirm(gid):
             return jsonify({"error": f"{items[i]['case']} 和 {items[i + 1]['case']} 的時間重疊了"}), 400
     for it in items:   # 廠商當天已有的預約
         try:
-            c = _find_slot_conflict(group["vendor"], date, it["start"], it["end"])
+            c = _find_slot_conflict(group["vendor"], date, it["start"], it["end"], types=tasks[it["task_id"]].get("type") or [])
         except Exception as e:
             return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
         if c:
@@ -12073,7 +12095,7 @@ def update_vendor_slot_booking(record_id):
     changed_time = (date, start, end) != (date0, start0, end0)
     if changed_time:
         try:
-            conflict = _find_slot_conflict(vendor, date, start, end, ignore_ids={r["id"] for r in group})
+            conflict = _find_slot_conflict(vendor, date, start, end, ignore_ids={r["id"] for r in group}, types=types)
         except Exception as e:
             return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
         if conflict:
