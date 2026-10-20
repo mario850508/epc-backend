@@ -10198,7 +10198,8 @@ def _pdf_propagate_sibling_date(case_no, doc_type, doc_date):
             except ValueError:
                 res = {}
             issues = res.get("issues") or []
-            kept = [x for x in issues if not (str(x).startswith(f"同案場的{doc_type}") and "還沒進來" in str(x))]
+            kept = [x for x in issues if not ((str(x).startswith(f"同案場的{doc_type}") and "還沒進來" in str(x))
+                                              or str(x).startswith("文件上沒有日期，先用收件日"))]
             if len(kept) != len(issues):
                 res["issues"] = kept
                 parts = list(res.get("conf_parts") or [])
