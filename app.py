@@ -6011,6 +6011,24 @@ def _line_config():
     )
 
 
+# 2026-10-20：LINE 官方帳號每月免費訊息有上限；用完後所有推播都會被拒（429 "You have reached your monthly limit"），
+# 業務、屋主回覆、提醒、總覽通知全部送不出去卻沒有任何提示。這裡記下最近一次推播結果，供主控台顯示警告。
+LINE_HEALTH = {"quota_exhausted": False, "since": None, "last_error": None, "last_ok": None, "fail_count": 0}
+
+
+def _line_note_result(status_code, text=""):
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    if status_code < 400:
+        LINE_HEALTH.update({"quota_exhausted": False, "since": None, "last_ok": now})
+        return
+    LINE_HEALTH["fail_count"] += 1
+    LINE_HEALTH["last_error"] = f"{status_code} {str(text)[:200]}"
+    if status_code == 429 and "monthly limit" in str(text):
+        if not LINE_HEALTH["quota_exhausted"]:
+            LINE_HEALTH["since"] = now
+        LINE_HEALTH["quota_exhausted"] = True
+
+
 def _line_push_text(text, to=None):
     token, default_target = _line_config()
     target = to or default_target
@@ -6022,6 +6040,7 @@ def _line_push_text(text, to=None):
         json={"to": target, "messages": [{"type": "text", "text": text}]},
         timeout=15,
     )
+    _line_note_result(resp.status_code, resp.text)
     if resp.status_code >= 400:
         return False, f"{resp.status_code} {resp.text}"
     return True, ""
@@ -6131,8 +6150,11 @@ def _line_push_card(card, to=None):
             json={"to": target, "messages": [{"type": "flex", "altText": alt, "contents": _card_to_flex(card)}]},
             timeout=15,
         )
+        _line_note_result(resp.status_code, resp.text)
         if resp.status_code < 400:
             return True, ""
+        if resp.status_code == 429:   # 額度用完：改用純文字也一樣會被拒，不用再試
+            return False, f"{resp.status_code} {resp.text}"
         print(f"[_line_push_card] Flex 失敗，改用純文字：{resp.status_code} {resp.text[:200]}", flush=True)
     except Exception as e:
         print(f"[_line_push_card] Flex 例外，改用純文字：{e}", flush=True)
@@ -6854,6 +6876,26 @@ def line_buyer_notify(record_id):
     return jsonify({"ok": True, "on": on})
 
 
+@app.route("/api/line/quota")
+def line_quota():
+    """LINE 官方帳號本月推播額度與已用量（給主控台顯示「額度用完」警告用）。"""
+    token, _ = _line_config()
+    if not token:
+        return jsonify({"error": "LINE 環境變數未設定"}), 500
+    hd = {"Authorization": f"Bearer {token}"}
+    out = {"health": LINE_HEALTH}
+    try:
+        q = requests.get("https://api.line.me/v2/bot/message/quota", headers=hd, timeout=10).json()
+        u = requests.get("https://api.line.me/v2/bot/message/quota/consumption", headers=hd, timeout=10).json()
+        out.update({"type": q.get("type"), "limit": q.get("value"), "used": u.get("totalUsage")})
+        if out["limit"] is not None and out["used"] is not None:
+            out["exhausted"] = out["used"] >= out["limit"]
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    out["exhausted"] = bool(out.get("exhausted") or LINE_HEALTH.get("quota_exhausted"))
+    return jsonify(out)
+
+
 @app.route("/api/line/status")
 def line_status():
     """只回報 LINE 提醒設定是否到位（不回傳 token / ID 內容）。"""
@@ -6864,6 +6906,7 @@ def line_status():
         "target_kind": {"C": "group", "R": "room", "U": "user"}.get(target[:1], "unknown") if target else None,
         "day_before_last_run": DAY_BEFORE_STATE,
         "digest_last_run": DIGEST_STATE,
+        "push_health": LINE_HEALTH,
         "biz_cache": {
             "certified_cases": len(CERTIFIED_CASE_CACHE.get("cases") or []), "certified_updated": CERTIFIED_CASE_CACHE.get("updated_at"),
             "cancelled_cases": len(CANCELLED_CASE_CACHE.get("case_nos") or []), "cancelled_updated": CANCELLED_CASE_CACHE.get("updated_at"),
