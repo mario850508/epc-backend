@@ -602,6 +602,7 @@ FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝�
 FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
+FIELD_TASK_DAYS = "fld1wr03w7FM9uDrF"             # 2026-10-20：預計施工天數文字（進場給屋主看，例如「4～5 天」）
 FIELD_TASK_BUFFER = "fldtVqyV99xZXA8bd"           # 2026-10-19：車程緩衝（分鐘）：兩個預約之間要留的路程時間
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
@@ -1198,7 +1199,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS,
     ]
 
 
@@ -1269,6 +1270,7 @@ def _task_to_dict(r):
         "owner_win2_end": f.get(FIELD_TASK_OWNER_WIN2_END) or "",
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
         "buffer_min": _valid_buffer(f.get(FIELD_TASK_BUFFER)),
+        "days_label": (f.get(FIELD_TASK_DAYS) or "").strip(),
     }
 
 
@@ -1340,6 +1342,8 @@ def create_vendor_slot_task():
             fields[FIELD_TASK_DEADLINE] = deadline
         if _valid_buffer(body.get("buffer_min")):
             fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min"))
+        if (body.get("days_label") or "").strip():
+            fields[FIELD_TASK_DAYS] = body["days_label"].strip()[:20]
         est_start = (body.get("est_start") or "").strip()
         try:
             _parse_hhmm(est_start)
@@ -1413,6 +1417,7 @@ def update_vendor_slot_task(record_id):
     fields[FIELD_TASK_OWNER_WIN2_START], fields[FIELD_TASK_OWNER_WIN2_END] = (w2s or None), (w2e or None)
     fields[FIELD_TASK_COMPANIONS] = "、".join(_clean_companions(body.get("companions"), case_no)) or None
     fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min")) or None
+    fields[FIELD_TASK_DAYS] = (body.get("days_label") or "").strip()[:20] or None
     if "deadline" in body:
         deadline = _normalize_deadline(body.get("deadline"))
         fields[FIELD_TASK_DEADLINE] = deadline
@@ -2012,7 +2017,7 @@ def _owner_date_only(task):
 def _owner_multiday_label(task):
     for t in task.get("type") or []:
         if t in OWNER_MULTIDAY_LABEL:
-            return OWNER_MULTIDAY_LABEL[t]
+            return (task.get("days_label") or "").strip() or OWNER_MULTIDAY_LABEL[t]   # PM 可以自己填天數（例如 4～5 天）
     return ""
 
 
