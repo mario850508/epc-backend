@@ -2469,6 +2469,7 @@ def vendor_slot_task_owner_link(record_id):
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we, "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
+        "date_only": _owner_date_only(task), "duration_label": _owner_multiday_label(task),
         "assignee": task["assignee"], "status": task["status"],
         "assignee_bound": bool(task["assignee"] and _get_line_binding(task["assignee"])),
         "rep_bind_url": _rep_bind_url(task["assignee"]),
@@ -7004,13 +7005,22 @@ def _owner_invite_text(task, link):
     """跟主控台「🏠 屋主版」訊息一樣的內容：業務轉給屋主、請屋主自己點連結選時間。"""
     fixed = _owner_fixed(task)
     wins = _owner_windows(task)
-    when = (f"預約時間：{wins[0][0]}–{wins[0][1]}（請選好日期，並確認這個時間可以）\n" if fixed
-            else (f"施工約需：{_owner_multiday_label(task)}（請選「開始進場」的日期）\n" if _owner_date_only(task)
-                  else "可選時段：" + "、".join(f"{a}–{b}" for a, b in wins) + "\n"))
+    date_only = _owner_date_only(task)
+    items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in task["type"])
+    # 2026-10-21：只有一個日期、而且沒有時間可挑（固定時間，或進場只選日期）→ 只是請屋主「確認這個時間是否方便」；
+    # 有好幾天（或同一天有時段可挑）才說「選一個您方便的時間」。進場的「大約需要」寫施工天數（例如 3～5 天），不是幾小時。
+    single = len(set(task["candidate_dates"])) == 1 and (bool(fixed) or date_only)
+    need = f"（施工大約需要 {_owner_multiday_label(task)}）" if date_only else f"（大約需要 {_dur_label(_owner_duration(task))}）"
+    if single:
+        ask = f"想請您直接點下面的連結，確認這{'一天' if date_only else '個時間'}是否方便{'進場' if date_only else ''}{need}："
+        when = f"預計日期：{_dates_text(task['candidate_dates'])}\n" + ("" if date_only or not fixed else f"預計時間：{wins[0][0]}–{wins[0][1]}\n")
+    else:
+        ask = f"想請您直接點下面的連結，選一個您方便的{'進場日期' if date_only else '時間'}{need}："
+        when = (f"可選日期：{_dates_text(task['candidate_dates'])}\n"
+                + (f"預約時間：{wins[0][0]}–{wins[0][1]}（請選好日期，並確認這個時間可以）\n" if fixed
+                   else ("" if date_only else "可選時段：" + "、".join(f"{a}–{b}" for a, b in wins) + "\n")))
     return (f"您好，我是陽光伏特家的業務{task.get('assignee') or ''}。\n"
-            f"我們要幫您安排「{'、'.join(OWNER_TYPE_LABELS.get(t, t) for t in task['type'])}」，想請您直接點下面的連結，選一個您方便的時間"
-            + ("" if _owner_date_only(task) else f"（大約需要 {_dur_label(_owner_duration(task))}）") + f"：\n{link}\n\n"
-            f"可選日期：{_dates_text(task['candidate_dates'])}\n{when}"
+            f"我們要幫您安排「{items}」，{ask}\n{link}\n\n{when}"
             "如果不方便操作，直接回覆我就可以了，謝謝您！")
 
 
