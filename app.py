@@ -6938,6 +6938,8 @@ def _card_to_slack(card):
         blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"[:2000]} for k, v in rows[i:i + 10]]})
     for heading, lines in card.get("sections") or []:
         body = "\n".join(x[0] if isinstance(x, (tuple, list)) else x for x in lines)
+        if "可複製" in heading:   # 要複製貼給屋主的訊息：放進程式碼區塊，Slack 上有「複製」按鈕、換行也不會跑掉
+            body = "```" + body.replace("```", "’’’") + "```"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body}"[:3000]}})
     if card.get("note"):
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f":warning: {card['note']}"[:3000]}})
@@ -6983,6 +6985,68 @@ def slack_users_api():
         return jsonify({"configured": True, "users": _slack_users(force=request.args.get("refresh") == "1")})
     except Exception as e:
         return jsonify({"configured": True, "users": [], "error": str(e)[:200]}), 502
+
+
+def _dur_label(min_):
+    m = int(min_ or 0)
+    h, r = divmod(m, 60)
+    return (f"{h} 小時" if h else "") + (f"{r} 分鐘" if r else "") or f"{m} 分鐘"
+
+
+def _dates_text(dates):
+    ds = sorted(set(dates or []))
+    if len(ds) <= 6:
+        return "、".join(_wd_label(d) for d in ds)
+    return f"{_wd_label(ds[0])} ～ {_wd_label(ds[-1])}，共 {len(ds)} 天可選"
+
+
+def _owner_invite_text(task, link):
+    """跟主控台「🏠 屋主版」訊息一樣的內容：業務轉給屋主、請屋主自己點連結選時間。"""
+    fixed = _owner_fixed(task)
+    wins = _owner_windows(task)
+    when = (f"預約時間：{wins[0][0]}–{wins[0][1]}（請選好日期，並確認這個時間可以）\n" if fixed
+            else (f"施工約需：{_owner_multiday_label(task)}（請選「開始進場」的日期）\n" if _owner_date_only(task)
+                  else "可選時段：" + "、".join(f"{a}–{b}" for a, b in wins) + "\n"))
+    return (f"您好，我是陽光伏特家的業務{task.get('assignee') or ''}。\n"
+            f"我們要幫您安排「{'、'.join(OWNER_TYPE_LABELS.get(t, t) for t in task['type'])}」，想請您直接點下面的連結，選一個您方便的時間"
+            + ("" if _owner_date_only(task) else f"（大約需要 {_dur_label(_owner_duration(task))}）") + f"：\n{link}\n\n"
+            f"可選日期：{_dates_text(task['candidate_dates'])}\n{when}"
+            "如果不方便操作，直接回覆我就可以了，謝謝您！")
+
+
+@app.route("/api/slack/task-card", methods=["POST"])
+def slack_task_card():
+    """指派任務（請屋主自己預約）的 Slack 卡片。body: {task_id, to?: Slack user id, preview?: true}。"""
+    body = request.get_json(silent=True) or {}
+    rec = _get_task_by_record_id(body.get("task_id") or "")
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    if not task["owner_token"]:
+        return jsonify({"error": "這個任務還沒有屋主版連結，請先在任務列按「🏠 屋主版」產生"}), 400
+    link = _dash_url() + f"/owner.html?t={task['owner_token']}"
+    text = _owner_invite_text(task, link)
+    dl = ""
+    if task.get("deadline"):
+        try:
+            d = datetime.fromisoformat(task["deadline"].replace("Z", "+00:00")).astimezone(timezone(timedelta(hours=8)))
+            dl = f"{d.month}/{d.day}（週{WEEKDAY_ZH[d.weekday()]}） {d:%H:%M}"
+        except Exception:
+            dl = ""
+    card = _card("🏠 請屋主預約｜給業務", "#F2790C", f"{task['case']} {task['alias']}".strip(),
+                 subtitle=f"負責業務：{task['assignee']}" if task.get("assignee") else "",
+                 rows=[("廠商", task["vendor"]), ("項目", "、".join(task["type"])), ("可選日期", _dates_text(task["candidate_dates"])),
+                       ("屋主回覆期限", dl), ("狀態", {"待窗口確認": "屋主已回覆，待窗口選時間", "待業務確認": "已選好時間，等屋主確認",
+                                                    "待廠商重提時間": "屋主時間都不行，待廠商重提"}.get(task["stage"], "等屋主填預約表"))],
+                 sections=[("傳給屋主的訊息（可複製）", text.split("\n"))],
+                 note="請把下面的訊息複製後，用 LINE 或簡訊傳給屋主，由屋主自己點連結選時間；屋主不會操作的話，直接電話聯絡即可。",
+                 button=("👀 開啟屋主預約頁（預覽，請勿送出）", link))
+    if body.get("preview") or not body.get("to"):
+        return jsonify({"text": _card_plain_text(card), "rep_name": task.get("assignee") or ""})
+    ok, err = _slack_dm(body["to"], card=card)
+    if not ok:
+        return jsonify({"error": f"Slack 傳送失敗：{err}"}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/api/slack/booking-card", methods=["POST"])
