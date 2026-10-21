@@ -12065,7 +12065,7 @@ def joint_create():
     if not isinstance(tiers_in, list):   # 舊格式：prefs 每個日期一組
         tiers_in = [{"days": [p]} for p in (body.get("prefs") or [])[:4] if isinstance(p, dict)]
     for ti, tier in enumerate(tiers_in[:3], 1):
-        for p in ((tier or {}).get("days") or [])[:4]:
+        for p in ((tier or {}).get("days") or [])[:60]:   # 2026-10-21：每一期望的日期數不設實質上限（原本只收 4 天）
             try:
                 datetime.strptime((p.get("date") or ""), "%Y-%m-%d")
             except Exception:
