@@ -8930,6 +8930,7 @@ def _tw_now_iso():
     return datetime.now(TW_TZ).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
+PDF_STAMP_CHECK_TYPES = {"系統送審圖", "單線圖"}   # 跟審訖圖同一份圖面、只差台電審訖印章的類型
 PDF_LATER_DOC_TYPES = {"換文修約", "工程確認單", "電費單"}   # 第一次存設定之後才加進預設的類型
 PDF_RENAMED_DOC_TYPES = {"範本修約": "換文修約"}   # 類型改名：存過的設定跟著改
 PDF_DEFAULT_TYPE_BY_NAME = {t["name"]: t for t in PDF_DEFAULT_DOC_TYPES}
@@ -10262,7 +10263,7 @@ def _pdf_recognize(rec):
     if ext_name in PDF_OFFICE_EXTS:
         engine = "free"   # Word／Excel 直接讀檔案裡的文字（AI 只吃 PDF）
     threshold = int(settings.get("auto_confirm_threshold") or 92)
-    source = ""
+    source, text = "", ""
     if engine == "ai":
         _pdf_step("AI 判讀中")
         out = _pdf_ai_analyze(pdf.content, settings)
@@ -10290,6 +10291,30 @@ def _pdf_recognize(rec):
         out["issues"] = [x for x in out["issues"] if x != "找不到發文日期"]
         out["evidence"] += f"\n日期：{note}（信心 {conf}）"
 
+    # 系統送審圖／單線圖跟審訖圖是同一份圖面，差在有沒有台電「審訖」紅色印章（2026-10-21 使用者：蠻多審訖圖被判成系統送審圖）。
+    # 判成這幾種圖時先找印章：文字裡有就直接用；電子檔的印章常是疊上去的圖片，文字層讀不到 → OCR 一次。原檔名寫審訖圖也算。
+    if out["doc_type"] in PDF_STAMP_CHECK_TYPES and any(t.get("name") == "審訖圖" for t in settings.get("doc_types") or []):
+        st = _pdf_stamp_date(_pdf_flat(text)) if text else None
+        if not st and source == "PDF 文字層" and settings.get("ocr_url"):
+            try:
+                st = _pdf_stamp_date(_pdf_flat(_pdf_ocr(pdf.content, settings["ocr_url"])))
+            except Exception as e:
+                print(f"[pdf_rename] 找審訖印章 OCR 失敗：{e}", flush=True)
+        src_name = f.get(PDF_F["src_name"]) or att.get("filename") or ""
+        by_name = bool(re.search(r"審[核查]?[訖迄讫]", src_name))
+        if st or by_name:
+            old = out["doc_type"]
+            out["doc_type"] = "審訖圖"
+            rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == "審訖圖"), {})
+            why = f"圖上有台電審訖印章「{st[1][:30]}」" if st else f"原檔名寫審訖圖（{src_name[:40]}）"
+            parts = list(out.get("conf_parts") or [out["confidence"]] * 3)
+            parts[1] = 92
+            out["conf_parts"] = parts
+            out["confidence"] = max(0, min(parts))
+            out["evidence"] += f"\n函文類型：原本判成{old}，但{why}，改為審訖圖（信心 92）"
+            out["doc_date"] = ""   # 審訖圖的日期只認印章日期，下面重新設定
+            if st:
+                set_date(st[0], 92, f"審核訖印章「{st[1][:30]}」")
     # 審訖圖的「審核訖」印章常是疊在電子檔上的圖片，文字層讀不到 → 另外 OCR 一次找印章
     if rule.get("date_mode") == "stamp" and not out["doc_date"] and source == "PDF 文字層" and settings.get("ocr_url"):
         try:
