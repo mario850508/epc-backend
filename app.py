@@ -1181,12 +1181,21 @@ def create_vendor_slot_booking():
 
 @app.route("/api/vendor-slots/<record_id>", methods=["DELETE"])
 def delete_vendor_slot(record_id):
-    """刪掉一筆開放時段或已預約記錄（登記錯誤時用）。"""
+    """刪掉一筆開放時段或已預約記錄（登記錯誤時用）。「同時預約」的案件畫面上合成一筆，所以一起刪。"""
     try:
+        sibs = []
+        try:
+            rec = _get_booking(record_id)
+            if rec and rec.get("fields", {}).get(FIELD_SLOT_KIND) == SLOT_KIND_BOOKING:
+                sibs = _booking_siblings(rec)
+        except Exception as e:
+            print(f"[delete_vendor_slot] 查同時預約失敗：{e}", flush=True)
         resp = requests.delete(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), timeout=20)
         if resp.status_code >= 400:
             return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
-        return jsonify({"ok": True})
+        for sb in sibs:
+            requests.delete(f"{SLOT_API_URL}/{sb['id']}", headers=airtable_headers(), timeout=20)
+        return jsonify({"ok": True, "deleted_siblings": len(sibs)})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -2678,6 +2687,12 @@ def vendor_slot_mark_vendor_notified(record_id):
     resp = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    try:   # 「同時預約」的另一案畫面上合成一筆，標記一起套用
+        for sb in _booking_siblings(rec):
+            requests.patch(f"{SLOT_API_URL}/{sb['id']}", headers=airtable_headers(),
+                           json={"fields": {FIELD_SLOT_VENDOR_NOTIFIED: patch[FIELD_SLOT_VENDOR_NOTIFIED]}}, timeout=20)
+    except Exception as e:
+        print(f"[vendor-notified] 同步同時預約失敗：{e}", flush=True)
     return jsonify({"ok": True, "vendor_notified_at": "" if body.get("unmark") else now})
 
 
@@ -3070,6 +3085,11 @@ def vendor_share_sent(token):
                           json={"fields": {FIELD_SLOT_VENDOR_NOTIFIED: now}}, timeout=20)
     if resp.status_code >= 400:
         return jsonify({"error": "寫入失敗", "detail": resp.text}), 502
+    try:   # 「同時預約」的另一案畫面上合成一筆，通知時間一起記
+        for sb in _booking_siblings(rec):
+            requests.patch(f"{SLOT_API_URL}/{sb['id']}", headers=airtable_headers(), json={"fields": {FIELD_SLOT_VENDOR_NOTIFIED: now}}, timeout=20)
+    except Exception as e:
+        print(f"[vendor_share_sent] 記錄同時預約的通知時間失敗：{e}", flush=True)
     return jsonify({"ok": True, "sent_at": now})
 
 
@@ -12309,8 +12329,38 @@ def _vendor_batch_items(booking_ids):
             "owner_phone": (f.get(FIELD_SLOT_OWNER_PHONE) or "").strip(), "note": (f.get(FIELD_SLOT_NOTE) or "").strip(),
             "pm_note": (f.get(FIELD_SLOT_PM_NOTE) or "").strip(), "companions": (f.get(FIELD_SLOT_COMPANIONS) or "").strip(), "fields": f,
         })
+    for it in items:
+        it["ids"] = [it["id"]]
     items.sort(key=lambda x: (x["date"], x["start"]))
-    return items
+    # 2026-10-21：「同時預約」的案件（同一個案場拆成兩案、一次預約）合成一筆：案號用「＋」連起來、別名用「／」連起來
+    merged, used = [], set()
+    for it in items:
+        if it["id"] in used:
+            continue
+        group = [it]
+        comps = {c.strip() for c in re.split(r"[、,，]", it["companions"]) if c.strip()}
+        for other in items:
+            if other is it or other["id"] in used or other["vendor"] != it["vendor"] or other["date"] != it["date"]:
+                continue
+            if other["start"] == it["start"] and other["case"] in comps and other["time_text"] == it["time_text"]:
+                group.append(other)
+        if len(group) > 1:
+            group.sort(key=lambda x: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", x["case"])])
+            main = group[0]
+            main = dict(main)
+            main["case"] = "＋".join(g["case"] for g in group)
+            main["alias"] = "／".join(dict.fromkeys(g["alias"] for g in group if g["alias"]))
+            addrs = list(dict.fromkeys(g["address"] for g in group if g["address"]))
+            main["address"] = "；".join(addrs)
+            main["companions"] = ""
+            main["ids"] = [i for g in group for i in g["ids"]]
+            for g in group:
+                used.add(g["id"])
+            merged.append(main)
+        else:
+            used.add(it["id"])
+            merged.append(it)
+    return merged
 
 
 def _vendor_batch_build(booking_ids, note=""):
@@ -12406,7 +12456,7 @@ def vendor_batch_notice():
     preview, flex, alt, plain, items = built
     if len({it["vendor"] for it in items}) > 1:
         return jsonify({"error": "一次只能通知同一家廠商，請分開勾選"}), 400
-    token = _reminder_token_make({"b": [it["id"] for it in items], "n": (body.get("note") or "").strip()[:300],
+    token = _reminder_token_make({"b": [i for it in items for i in it["ids"]], "n": (body.get("note") or "").strip()[:300],
                                   "x": int(time.time()) + 45 * 86400})
     liff_id = os.environ.get("LIFF_ID", "").strip()
     return jsonify({"ok": True, "count": len(items), "plain_text": plain,
