@@ -6876,6 +6876,140 @@ def line_buyer_notify(record_id):
     return jsonify({"ok": True, "on": on})
 
 
+# ===================================================================
+# 2026-10-21：Slack 通知（使用者：同事多半用 Slack，公司溝通主要在 Slack；要傳 Slack 或 LINE 由使用者每次自己決定）。
+# 用 Slack App 的 Bot Token（環境變數 SLACK_BOT_TOKEN，需要 scope：chat:write、im:write、users:read、users:read.email）
+# 私訊同事個人。目前「完成安排」的「💬 Slack」按鈕可以把「通知業務」那張卡片傳給選定的同事；之後別的卡片也能沿用 _slack_dm。
+# ===================================================================
+SLACK_API = "https://slack.com/api"
+SLACK_USERS_CACHE = {"at": 0, "users": []}
+
+
+def _slack_token():
+    return os.environ.get("SLACK_BOT_TOKEN", "").strip()
+
+
+def _slack_call(method, payload=None, get=False):
+    """呼叫 Slack Web API，回傳 JSON（ok=false 時帶 error）。"""
+    headers = {"Authorization": f"Bearer {_slack_token()}"}
+    if get:
+        r = requests.get(f"{SLACK_API}/{method}", headers=headers, params=payload or {}, timeout=15)
+    else:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        r = requests.post(f"{SLACK_API}/{method}", headers=headers, json=payload or {}, timeout=15)
+    try:
+        return r.json()
+    except ValueError:
+        return {"ok": False, "error": f"http_{r.status_code}"}
+
+
+def _slack_users(force=False):
+    """工作區裡的真人帳號（不含機器人、已停用），快取 10 分鐘。"""
+    if not force and time.time() - SLACK_USERS_CACHE["at"] < 600 and SLACK_USERS_CACHE["users"]:
+        return SLACK_USERS_CACHE["users"]
+    users, cursor = [], ""
+    for _ in range(10):
+        d = _slack_call("users.list", {"limit": 200, **({"cursor": cursor} if cursor else {})}, get=True)
+        if not d.get("ok"):
+            raise RuntimeError(d.get("error") or "users.list 失敗")
+        for m in d.get("members", []):
+            if m.get("deleted") or m.get("is_bot") or m.get("id") == "USLACKBOT":
+                continue
+            prof = m.get("profile", {})
+            users.append({"id": m["id"], "name": prof.get("real_name") or m.get("real_name") or m.get("name") or "",
+                          "display": prof.get("display_name") or "", "email": prof.get("email") or ""})
+        cursor = (d.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    users.sort(key=lambda u: u["name"])
+    SLACK_USERS_CACHE.update({"at": time.time(), "users": users})
+    return users
+
+
+def _card_to_slack(card):
+    """把我們的卡片 dict 轉成 Slack Block Kit（上方標題、欄位、區塊、提醒、連結按鈕）。回傳 (blocks, 純文字備援)。"""
+    blocks = [{"type": "header", "text": {"type": "plain_text", "text": (card.get("tag") or "通知")[:150], "emoji": True}}]
+    head = f"*{card.get('title') or ''}*"
+    if card.get("subtitle"):
+        head += f"\n{card['subtitle']}"
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": head[:3000]}})
+    rows = [(k, v) for k, v in (card.get("rows") or []) if v not in (None, "")]
+    for i in range(0, len(rows), 10):
+        blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"[:2000]} for k, v in rows[i:i + 10]]})
+    for heading, lines in card.get("sections") or []:
+        body = "\n".join(x[0] if isinstance(x, (tuple, list)) else x for x in lines)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body}"[:3000]}})
+    if card.get("note"):
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f":warning: {card['note']}"[:3000]}})
+    buttons = list(card.get("buttons") or [])
+    if card.get("button"):
+        buttons.insert(0, card["button"])
+    elems = []
+    for i, (label, target) in enumerate(buttons):
+        if isinstance(target, str) and target.startswith(("http://", "https://")):   # 剪貼簿、撥號（tel:）這類 Slack 按鈕做不到，略過
+            elems.append({"type": "button", "text": {"type": "plain_text", "text": label[:75], "emoji": True}, "url": target, "action_id": f"btn_{i}"})
+    if elems:
+        blocks.append({"type": "actions", "elements": elems[:25]})
+    if card.get("footer"):
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": card["footer"][:3000]}]})
+    return blocks, _card_plain_text(card)
+
+
+def _slack_dm(user_id, card=None, text=""):
+    """私訊 Slack 使用者。card（我們的卡片 dict）優先，沒有就送純文字。回傳 (ok, 錯誤訊息)。"""
+    if not _slack_token():
+        return False, "後端還沒有設定 SLACK_BOT_TOKEN"
+    opened = _slack_call("conversations.open", {"users": user_id})
+    if not opened.get("ok"):
+        return False, opened.get("error") or "conversations.open 失敗"
+    channel = opened["channel"]["id"]
+    payload = {"channel": channel}
+    if card:
+        payload["blocks"], payload["text"] = _card_to_slack(card)
+    else:
+        payload["text"] = text
+    res = _slack_call("chat.postMessage", payload)
+    if not res.get("ok"):
+        return False, res.get("error") or "chat.postMessage 失敗"
+    return True, ""
+
+
+@app.route("/api/slack/users")
+def slack_users_api():
+    """給前端選收件人：回 {configured, users:[{id,name,display,email}]}。"""
+    if not _slack_token():
+        return jsonify({"configured": False, "users": []})
+    try:
+        return jsonify({"configured": True, "users": _slack_users(force=request.args.get("refresh") == "1")})
+    except Exception as e:
+        return jsonify({"configured": True, "users": [], "error": str(e)[:200]}), 502
+
+
+@app.route("/api/slack/booking-card", methods=["POST"])
+def slack_booking_card():
+    """body: {booking_id, kind: rep-notice, to?: Slack user id, preview?: true}。
+    preview＝只回卡片純文字與負責業務名字（給視窗預覽、猜收件人）；有 to 就私訊送出。"""
+    body = request.get_json(silent=True) or {}
+    rec = _get_booking(body.get("booking_id") or "")
+    if not rec:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    if (body.get("kind") or "rep-notice") != "rep-notice":
+        return jsonify({"error": "目前只支援「通知業務」卡片"}), 400
+    card = _rep_notice_card(rec)
+    _, _, rep_name = _booking_context(rec)
+    if body.get("preview"):
+        return jsonify({"text": _card_plain_text(card), "rep_name": rep_name})
+    if not body.get("to"):
+        return jsonify({"error": "請選擇收件人"}), 400
+    ok, err = _slack_dm(body["to"], card=card)
+    if not ok:
+        hint = {"missing_scope": "Slack App 缺少權限（需要 chat:write、im:write）",
+                "invalid_auth": "SLACK_BOT_TOKEN 不正確", "not_authed": "SLACK_BOT_TOKEN 不正確",
+                "user_not_found": "找不到這位 Slack 使用者", "cannot_dm_bot": "不能私訊機器人"}.get(err, err)
+        return jsonify({"error": f"Slack 傳送失敗：{hint}"}), 502
+    return jsonify({"ok": True})
+
+
 @app.route("/api/line/quota")
 def line_quota():
     """LINE 官方帳號本月推播額度與已用量（給主控台顯示「額度用完」警告用）。"""
