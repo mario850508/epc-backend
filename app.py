@@ -12224,41 +12224,62 @@ def _vendor_batch_build(booking_ids, note=""):
     n = len(items)
     first, last = items[0]["date"], items[-1]["date"]
     span = _wd_label(first) + (f" ～ {_wd_label(last)}" if last != first else "")
+    # 2026-10-21：同一張卡片裡依「項目」分組顯示（場勘／放樣／植筋／進場／掛表各一區），看的人才不會把不同工種混在一起
+    ORDER = ["場勘", "放樣", "植筋", "進場", "掛表"]
+    TINT = {"場勘": ("#0F766E", "#E0F2F1"), "放樣": ("#6D28D9", "#EDE9FE"), "植筋": ("#B45309", "#FEF3C7"),
+            "進場": ("#1D4ED8", "#DBEAFE"), "掛表": ("#15803D", "#DCFCE7")}
+    groups = {}
+    for it in items:
+        groups.setdefault(it["types"] or "其他", []).append(it)
+
+    def _gkey(k):
+        idx = [ORDER.index(t) for t in ORDER if t in k]
+        return (min(idx) if idx else 99, k)
+    summary = "、".join(f"{k} {len(v)} 筆" for k, v in sorted(groups.items(), key=lambda kv: _gkey(kv[0])))
     contents = [{"type": "text", "text": f"{vendor}｜共 {n} 筆", "weight": "bold", "size": "lg", "wrap": True},
                 {"type": "text", "text": span, "size": "sm", "color": "#6B7280", "wrap": True, "margin": "xs"}]
-    plain = [f"📋 施工排程通知｜給廠商", f"{vendor}｜共 {n} 筆", span, ""]
-    prows = []
-    for i, it in enumerate(items, 1):
-        head = f"{i}. {it['when']}"   # when 已含時間（進場是「預計施工 3～5 天」）
-        contents.append({"type": "separator", "margin": "lg"})
-        contents.append({"type": "text", "text": head, "weight": "bold", "size": "md", "color": "#2563EB", "wrap": True, "margin": "md"})
-        contents.append({"type": "text", "text": f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else ""),
-                         "size": "sm", "wrap": True, "margin": "xs"})
-        lines = [f"{head}", f"{it['case']} {it['alias']}".strip() + (f"｜{it['types']}" if it["types"] else "")]
-        for label, val in (("同時施作", it["companions"]), ("地址", it["address"]), ("屋主", _owner_str(it["owner_name"], it["owner_phone"])),
-                           ("現場備註", it["note"]), ("陽光備註", it["pm_note"])):
-            if val:
-                contents.append({"type": "box", "layout": "baseline", "margin": "xs", "spacing": "sm", "contents": [
-                    {"type": "text", "text": label, "size": "xs", "color": "#6B7280", "flex": 2},
-                    {"type": "text", "text": val, "size": "xs", "color": "#1B2333", "wrap": True, "flex": 6}]})
-                lines.append(f"{label}：{val}")
-        if it["coords"]:
-            lines.append(f"座標：{it['coords']}")
-        btns = []
-        dial = "".join(c for c in it["owner_phone"] if c.isdigit() or c == "+")
-        if len(dial) >= 8:
-            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                         "action": {"type": "uri", "label": "📞 撥號給屋主", "uri": "tel:" + dial}})
-        if it["coords"]:
-            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                         "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["coords"])}})
-        elif it["address"]:
-            btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                         "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["address"])}})
-        if btns:
-            contents.append({"type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md", "contents": btns})
-        plain += lines + [""]
-        prows.append((head, f"{it['case']} {it['alias']}｜屋主 {_owner_str(it['owner_name'], it['owner_phone'])}".strip()))
+    if len(groups) > 1:
+        contents.append({"type": "text", "text": summary, "size": "xs", "color": "#6B7280", "wrap": True, "margin": "xs"})
+    plain = [f"📋 施工排程通知｜給廠商", f"{vendor}｜共 {n} 筆", span] + ([summary] if len(groups) > 1 else []) + [""]
+    psections = []
+    for gname, gitems in sorted(groups.items(), key=lambda kv: _gkey(kv[0])):
+        main_type = next((t for t in ORDER if t in gname), "")
+        fg, bg = TINT.get(main_type, ("#374151", "#F3F4F6"))
+        contents.append({"type": "box", "layout": "vertical", "margin": "xl", "backgroundColor": bg, "cornerRadius": "8px", "paddingAll": "8px",
+                         "contents": [{"type": "text", "text": f"【{gname}】共 {len(gitems)} 筆", "weight": "bold", "size": "md", "color": fg}]})
+        plain += [f"━━ 【{gname}】共 {len(gitems)} 筆 ━━", ""]
+        plines = []
+        for i, it in enumerate(gitems, 1):
+            head = f"{i}. {it['when']}"   # when 已含時間（進場是「預計施工 3～5 天」）
+            contents.append({"type": "separator", "margin": "lg"})
+            contents.append({"type": "text", "text": head, "weight": "bold", "size": "md", "color": "#2563EB", "wrap": True, "margin": "md"})
+            contents.append({"type": "text", "text": f"{it['case']} {it['alias']}".strip(), "size": "sm", "wrap": True, "margin": "xs"})
+            lines = [f"{head}", f"{it['case']} {it['alias']}".strip()]
+            for label, val in (("同時施作", it["companions"]), ("地址", it["address"]), ("屋主", _owner_str(it["owner_name"], it["owner_phone"])),
+                               ("現場備註", it["note"]), ("陽光備註", it["pm_note"])):
+                if val:
+                    contents.append({"type": "box", "layout": "baseline", "margin": "xs", "spacing": "sm", "contents": [
+                        {"type": "text", "text": label, "size": "xs", "color": "#6B7280", "flex": 2},
+                        {"type": "text", "text": val, "size": "xs", "color": "#1B2333", "wrap": True, "flex": 6}]})
+                    lines.append(f"{label}：{val}")
+            if it["coords"]:
+                lines.append(f"座標：{it['coords']}")
+            btns = []
+            dial = "".join(c for c in it["owner_phone"] if c.isdigit() or c == "+")
+            if len(dial) >= 8:
+                btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                             "action": {"type": "uri", "label": "📞 撥號給屋主", "uri": "tel:" + dial}})
+            if it["coords"]:
+                btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                             "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["coords"])}})
+            elif it["address"]:
+                btns.append({"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                             "action": {"type": "uri", "label": "📍 地圖", "uri": "https://www.google.com/maps/search/?api=1&query=" + quote(it["address"])}})
+            if btns:
+                contents.append({"type": "box", "layout": "horizontal", "spacing": "sm", "margin": "md", "contents": btns})
+            plain += lines + [""]
+            plines.append(f"{head}｜{it['case']} {it['alias']}｜屋主 {_owner_str(it['owner_name'], it['owner_phone'])}".strip())
+        psections.append((f"【{gname}】共 {len(gitems)} 筆", plines))
     if (note or "").strip():
         contents.append({"type": "separator", "margin": "lg"})
         contents.append({"type": "text", "text": "備註：" + note.strip(), "size": "sm", "wrap": True, "color": "#B45309", "weight": "bold", "margin": "md"})
@@ -12268,7 +12289,7 @@ def _vendor_batch_build(booking_ids, note=""):
                        "contents": [{"type": "text", "text": "📋 施工排程通知｜給廠商", "color": "#FFFFFF", "weight": "bold", "size": "sm"}]},
             "body": {"type": "box", "layout": "vertical", "paddingAll": "14px", "contents": contents}}
     alt = (f"施工排程通知｜{vendor} 共{n}筆：" + "；".join(f"{it['when']} {it['case']}" for it in items))[:390]
-    preview = _card("📋 施工排程通知｜給廠商（一起通知）", "#2563EB", f"{vendor}｜共 {n} 筆", subtitle=span, rows=prows,
+    preview = _card("📋 施工排程通知｜給廠商（一起通知）", "#2563EB", f"{vendor}｜共 {n} 筆", subtitle=span, sections=psections,
                     note=("備註：" + note.strip()) if (note or "").strip() else "")
     return preview, flex, alt, "\n".join(plain).strip(), items
 
