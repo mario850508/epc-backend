@@ -603,6 +603,7 @@ FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝�
 FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
+FIELD_TASK_ORDER = "fldmvbYaBaYUzr9La"            # 2026-10-21：聯合排程回覆批次（1＝先回覆；2＝等第 1 批都回覆後，只能從共同方便的日期選）
 FIELD_TASK_CLUSTER = "fldlNIwfs0ZePjPtG"          # 2026-10-21：聯合排程的「同排住戶組」（任一戶方便開門即可；同時預約欄位列出其他戶）
 FIELD_TASK_NO_ALT = "fldwuPFU4WawJfABl"           # 2026-10-20：屋主不可自填時間（勾選＝以上時間都不行時只能回覆不方便，由窗口請 EPC 重提）
 FIELD_TASK_DAYS = "fld1wr03w7FM9uDrF"             # 2026-10-20：預計施工天數文字（進場給屋主看，例如「4～5 天」）
@@ -1211,7 +1212,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT, FIELD_TASK_CLUSTER,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT, FIELD_TASK_CLUSTER, FIELD_TASK_ORDER,
     ]
 
 
@@ -1285,6 +1286,7 @@ def _task_to_dict(r):
         "days_label": (f.get(FIELD_TASK_DAYS) or "").strip(),
         "no_alt": bool(f.get(FIELD_TASK_NO_ALT)),
         "cluster": bool(f.get(FIELD_TASK_CLUSTER)),
+        "order": int(f.get(FIELD_TASK_ORDER) or 1),
     }
 
 
@@ -2242,12 +2244,20 @@ def owner_booking_get(otoken):
     if task.get("group_id"):
         g = _get_group(task["group_id"])
         if g:
-            out["group"] = _owner_group_info(task, g)
+            gate, eff = _g_gate(task, g)
+            out["group"] = _owner_group_info(task, g, eff if gate == "open" and int(task.get("order") or 1) > 1 else None)
             out["duration_min"] = g["duration_min"]
             if g["status"] == GS_CANCEL:
                 out["status"] = "cancelled"
             elif out["status"] == "open":
-                out["status"] = "g_replied" if task.get("owner_reply") else "g_open"
+                if task.get("owner_reply"):
+                    out["status"] = "g_replied"
+                elif gate == "wait":
+                    out["status"] = "g_wait"
+                elif gate == "none":
+                    out["status"] = "g_none"
+                else:
+                    out["status"] = "g_open"
     return jsonify(out)
 
 
@@ -11936,6 +11946,27 @@ def _joint_after_reply(task):
     n, replied, _ = _joint_counts(tasks)
     reply = next((t for t in tasks if t["record_id"] == task["record_id"]), task).get("owner_reply")
     open_url = f"{_dash_url()}/#joint={group['id']}"
+    try:   # 分批回覆：這一批全部回覆完 → 通知安排人員「下一批可以邀請了」（附共同方便的日期）
+        cur = int(task.get("order") or 1)
+        same = [t for t in tasks if int(t.get("order") or 1) == cur and t["status"] != TASK_STATUS_CANCELLED]
+        if all(t.get("owner_reply") or t["record_id"] == task["record_id"] or t["status"] == TASK_STATUS_DONE for t in same):
+            later = sorted({int(t.get("order") or 1) for t in tasks if int(t.get("order") or 1) > cur})
+            if later:
+                nxt = [t for t in tasks if int(t.get("order") or 1) == later[0]]
+                gate, eff = _g_gate(nxt[0], group, tasks)
+                names = "、".join(t["case"] + ("＋" + "＋".join(t["companions"]) if t.get("companions") else "") for t in nxt)
+                if gate == "open":
+                    _joint_notify(group, _card(f"🧩 聯合排程｜第 {later[0]} 批可以邀請了", "#7C3AED", group["title"],
+                                               rows=[("第 %d 批" % later[0], names), ("共同方便的日期", "、".join(_wd_label(p["date"]) for p in eff))],
+                                               note="請把邀請連結傳給這幾位屋主；他們只會看到上面這幾天可以選",
+                                               button=("開啟聯合排程", open_url)))
+                else:
+                    _joint_notify(group, _card(f"🧩 聯合排程｜第 {later[0]} 批沒有共同日期", "#DC2626", group["title"],
+                                               rows=[("第 %d 批" % later[0], names)],
+                                               note="前面幾批屋主選的日期沒有交集，請聯絡屋主或廠商調整",
+                                               button=("開啟聯合排程", open_url)))
+    except Exception as e:
+        print(f"[_joint_after_reply] 下一批通知失敗：{e}", flush=True)
     if replied >= n and not group["notified_replied"]:
         try:
             _patch_group(group["id"], {G_STATUS: GS_PLAN, G_N_REPLIED: True})
@@ -11982,9 +12013,13 @@ def _joint_after_confirm(task):
             rows=[("聯合排程", group["title"])], button=("開啟主控台", f"{_dash_url()}/#joint={group['id']}")))
 
 
-def _joint_task_status(group, t):
+def _joint_task_status(group, t, gate=None):
     if t["status"] == TASK_STATUS_DONE:
         return "已確認"
+    if gate == "wait" and not t.get("owner_reply"):
+        return "等前一批回覆（尚未開放）"
+    if gate == "none" and not t.get("owner_reply"):
+        return "前一批沒有共同日期，需要處理"
     if t["status"] == TASK_STATUS_CANCELLED:
         return "已取消"
     if t["stage"] == TASK_STAGE_WAIT_PM:
@@ -11996,11 +12031,14 @@ def _joint_task_status(group, t):
 
 def _joint_view(group, tasks):
     out = dict(group)
+    gates = {t["record_id"]: _g_gate(t, group, tasks) for t in tasks}
     out["tasks"] = [{
         "task_id": t["record_id"], "case": t["case"], "alias": t["alias"], "assignee": t["assignee"],
-        "companions": t.get("companions") or [], "cluster": bool(t.get("cluster")),
+        "companions": t.get("companions") or [], "cluster": bool(t.get("cluster")), "order": int(t.get("order") or 1),
+        "gate": gates[t["record_id"]][0],
+        "open_dates": [p["date"] for p in gates[t["record_id"]][1]] if int(t.get("order") or 1) > 1 else [],
         "owner_name": t["owner_name"], "owner_phone": t["owner_phone"],
-        "status_text": _joint_task_status(group, t), "reply": t.get("owner_reply"),
+        "status_text": _joint_task_status(group, t, gates[t["record_id"]][0]), "reply": t.get("owner_reply"),
         "reply_text": _g_reply_text(group["prefs"], t.get("owner_reply")), "chosen_slot": t.get("chosen_slot"),
         "alt_slots": t["alt_slots"] if t["stage"] == TASK_STAGE_WAIT_PM else [],
         "owner_link": _task_owner_link(t) if t["owner_token"] else "",
@@ -12075,6 +12113,14 @@ def joint_create():
             wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
             prefs_in.append({"date": p["date"], "tier": ti,
                              "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
+    orders = {}
+    for k, v in (body.get("orders") or {}).items():
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= 5:
+            orders[str(k).strip()] = n
     if not vendor or not types or len(cases) + len(clusters) < 2 or not prefs_in:
         return jsonify({"error": "請選廠商、項目，至少兩個案件（同排住戶組算一個），並至少設定第一期望日"}), 400
     try:
@@ -12113,6 +12159,9 @@ def joint_create():
                 FIELD_TASK_DURATION_MIN: dur, FIELD_TASK_GROUP_ID: gid,
                 FIELD_TASK_OWNER_WIN_START: "09:00", FIELD_TASK_OWNER_WIN_END: "17:00",
             }
+            order_n = orders.get(case_no) or max([orders.get(m, 1) for m in (cluster_members or [])] or [1])
+            if order_n > 1:
+                fields[FIELD_TASK_ORDER] = order_n
             if cluster_members:   # 同排住戶組：主案放這個任務，其他戶放同時預約；屋主資料不預填（要看哪一戶回覆）
                 fields[FIELD_TASK_COMPANIONS] = "、".join(cluster_members[1:])
                 fields[FIELD_TASK_CLUSTER] = True
@@ -12241,9 +12290,27 @@ def joint_cancel(gid):
     return jsonify({"ok": True})
 
 
-def _owner_group_info(task, group):
+def _g_gate(task, group, tasks=None):
+    """聯合排程「分批回覆」：第 N 批（N>1）要等前面各批都回覆後才開放，而且只能從前面各批「共同方便」的日期裡選
+    （所有單位最後要排在同一天，所以取交集）。回傳 (狀態, 這個單位能選的期望日清單)；狀態：open／wait（前面還沒回覆完）／none（沒有共同日期）。"""
+    order = int(task.get("order") or 1)
+    if order <= 1:
+        return "open", group["prefs"]
+    tasks = tasks if tasks is not None else _group_tasks(group["id"])
+    prev = [t for t in tasks if int(t.get("order") or 1) < order and t["status"] != TASK_STATUS_CANCELLED]
+    if not prev:
+        return "open", group["prefs"]
+    if any(not (t.get("owner_reply") or t["status"] == TASK_STATUS_DONE) for t in prev):
+        return "wait", []
+    sets = [{pk["date"] for pk in _g_picks(t.get("owner_reply"))} for t in prev]
+    allowed = set.intersection(*sets) if sets else set()
+    prefs = [dict(p, tier=1) for p in group["prefs"] if p["date"] in allowed]   # 全部併成同一組期望，屋主一次選
+    return ("open" if prefs else "none"), prefs
+
+
+def _owner_group_info(task, group, prefs_override=None):
     prefs = []
-    for p in group["prefs"]:
+    for p in (prefs_override if prefs_override is not None else group["prefs"]):
         wins = _g_mins(p["windows"])
         parts = {"all": _g_wins_text(wins)}
         for k in ("am", "pm"):
@@ -12280,7 +12347,12 @@ def owner_group_reply(otoken):
     name, phone, err_msg = _owner_contact(body)
     if err_msg:
         return jsonify({"error": err_msg}), 400
-    by_date = {p["date"]: p for p in group["prefs"]}
+    gate, eff_prefs = _g_gate(task, group)
+    if gate == "wait":
+        return jsonify({"error": "還在確認同一區其他住戶的日期，確認好後會通知您"}), 409
+    if gate == "none":
+        return jsonify({"error": "目前沒有大家都方便的日期，我們會再跟您聯絡"}), 409
+    by_date = {p["date"]: p for p in eff_prefs}
     picks, seen_d = [], set()
     tier = body.get("tier")
     for x in (body.get("picks") or [])[:10]:
