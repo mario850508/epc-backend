@@ -603,6 +603,7 @@ FIELD_TASK_GROUP_ID = "fldoOj81eUEAkgShZ"          # 聯合排程ID（空白＝�
 FIELD_TASK_OWNER_REPLY = "fldDqVYWH3ZoRYAfB"       # 屋主回覆JSON（聯合排程）
 FIELD_TASK_OWNER_WIN2_START = "fldf1HVmH6cK3VmAZ"  # 2026-10-12：第二個可選時段開始（例如下午 13:00；空白＝只有一個時段，中間是工班休息、屋主不能選）
 FIELD_TASK_OWNER_WIN2_END = "fldidGyTsAHovnogX"    # 第二個可選時段結束
+FIELD_TASK_CLUSTER = "fldlNIwfs0ZePjPtG"          # 2026-10-21：聯合排程的「同排住戶組」（任一戶方便開門即可；同時預約欄位列出其他戶）
 FIELD_TASK_NO_ALT = "fldwuPFU4WawJfABl"           # 2026-10-20：屋主不可自填時間（勾選＝以上時間都不行時只能回覆不方便，由窗口請 EPC 重提）
 FIELD_TASK_DAYS = "fld1wr03w7FM9uDrF"             # 2026-10-20：預計施工天數文字（進場給屋主看，例如「4～5 天」）
 FIELD_TASK_BUFFER = "fldtVqyV99xZXA8bd"           # 2026-10-19：車程緩衝（分鐘）：兩個預約之間要留的路程時間
@@ -1210,7 +1211,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT, FIELD_TASK_CLUSTER,
     ]
 
 
@@ -1283,6 +1284,7 @@ def _task_to_dict(r):
         "buffer_min": _valid_buffer(f.get(FIELD_TASK_BUFFER)),
         "days_label": (f.get(FIELD_TASK_DAYS) or "").strip(),
         "no_alt": bool(f.get(FIELD_TASK_NO_ALT)),
+        "cluster": bool(f.get(FIELD_TASK_CLUSTER)),
     }
 
 
@@ -2211,7 +2213,8 @@ def owner_booking_get(otoken):
         "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
         "buffer_min": _valid_buffer(task.get("buffer_min")),
-        "companion_addrs": _owner_companion_addrs(task),
+        "companion_addrs": [] if task.get("cluster") else _owner_companion_addrs(task),
+        "cluster": bool(task.get("cluster")), "cluster_count": len(task.get("companions") or []) + 1 if task.get("cluster") else 0,
         "rep_name": task["assignee"],
         # 2026-10-08：使用者要求顯示施工地址，讓屋主確認是自己的案子
         "address": _case_address(task["case"]),
@@ -11893,9 +11896,11 @@ def _joint_invite_text(group, task):
     first = [p["date"] for p in group["prefs"] if p["tier"] == min(q["tier"] for q in group["prefs"])] if group["prefs"] else []
     dates = "、".join(_wd_label(d) for d in first)
     items = "、".join(OWNER_TYPE_LABELS.get(t, t) for t in group["type"])
+    cluster = (f"您這一排（共 {len(task.get('companions') or []) + 1} 戶）只需要其中一戶方便開門就可以，請由方便的住戶填寫，填好後其他戶不用再填。\n"
+               if task.get("cluster") else "")
     return (f"{(task.get('owner_name') or '屋主')} 您好，我們要為您安排「{items}」。廠商預計在 {dates} 到現場，"
             f"想先請您點下面的連結，告訴我們哪些日期、哪個時段您方便（我們會把同一區的案子排在同一天，排好後再請您確認時間）：\n"
-            f"{_task_owner_link(task)}\n—陽光伏特家")
+            f"{cluster}{_task_owner_link(task)}\n—陽光伏特家")
 
 
 def _joint_owner_card(task, slot):
@@ -11993,6 +11998,7 @@ def _joint_view(group, tasks):
     out = dict(group)
     out["tasks"] = [{
         "task_id": t["record_id"], "case": t["case"], "alias": t["alias"], "assignee": t["assignee"],
+        "companions": t.get("companions") or [], "cluster": bool(t.get("cluster")),
         "owner_name": t["owner_name"], "owner_phone": t["owner_phone"],
         "status_text": _joint_task_status(group, t), "reply": t.get("owner_reply"),
         "reply_text": _g_reply_text(group["prefs"], t.get("owner_reply")), "chosen_slot": t.get("chosen_slot"),
@@ -12043,6 +12049,17 @@ def joint_create():
         c = (c or "").strip()
         if c and c not in cases:
             cases.append(c)
+    # 2026-10-21：同排住戶組——同一排幾戶，只要其中一戶方便開門就可以，所以整組算「一個單位」（一個任務，其他戶放在同時預約）
+    clusters = []
+    for cl in body.get("clusters") or []:
+        members = []
+        for c in (cl or []):
+            c = (c or "").strip()
+            if c and c not in members and c not in cases and not any(c in x for x in clusters):
+                members.append(c)
+        if len(members) >= 2:
+            members.sort(key=lambda x: [int(t) if t.isdigit() else t for t in _re.split(r"(\d+)", x)])
+            clusters.append(members)
     prefs_in = []
     tiers_in = body.get("tiers")
     if not isinstance(tiers_in, list):   # 舊格式：prefs 每個日期一組
@@ -12058,8 +12075,8 @@ def joint_create():
             wm = _g_mins([(w[0], w[1]) for w in (p.get("windows") or []) if isinstance(w, (list, tuple)) and len(w) == 2])
             prefs_in.append({"date": p["date"], "tier": ti,
                              "windows": [[_g_fmt(a), _g_fmt(b)] for a, b in wm] or [["09:00", "17:00"]]})
-    if not vendor or not types or len(cases) < 2 or not prefs_in:
-        return jsonify({"error": "請選廠商、項目，至少兩個案件，並至少設定第一期望日"}), 400
+    if not vendor or not types or len(cases) + len(clusters) < 2 or not prefs_in:
+        return jsonify({"error": "請選廠商、項目，至少兩個案件（同排住戶組算一個），並至少設定第一期望日"}), 400
     try:
         dur = int(body.get("duration_min") or 0) or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in types) or 60
         gap = int(body.get("gap_min") if body.get("gap_min") is not None else 30)
@@ -12070,7 +12087,7 @@ def joint_create():
         creator = "、".join(str(x).strip() for x in creator if str(x).strip())
     creator = (creator or "").strip()
     deadline = _normalize_deadline(body.get("deadline"))
-    title = f"{vendor} {'/'.join(types)} 聯合排程（{len(cases)}案）"
+    title = f"{vendor} {'/'.join(types)} 聯合排程（{len(cases) + sum(len(c) for c in clusters)}案）"
     try:
         gresp = requests.post(GROUP_API_URL, headers=airtable_headers(), timeout=20, json={"fields": {
             G_TITLE: title, G_VENDOR: vendor, G_ITEMS: "、".join(types),
@@ -12082,7 +12099,8 @@ def joint_create():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     failed = []
-    for case_no in cases:
+    for case_no in cases + [cl[0] for cl in clusters]:
+        cluster_members = next((cl for cl in clusters if cl[0] == case_no), None)
         try:
             b = _case_brief(case_no)
             fields = {
@@ -12095,9 +12113,12 @@ def joint_create():
                 FIELD_TASK_DURATION_MIN: dur, FIELD_TASK_GROUP_ID: gid,
                 FIELD_TASK_OWNER_WIN_START: "09:00", FIELD_TASK_OWNER_WIN_END: "17:00",
             }
-            if b.get("owner_name"):
+            if cluster_members:   # 同排住戶組：主案放這個任務，其他戶放同時預約；屋主資料不預填（要看哪一戶回覆）
+                fields[FIELD_TASK_COMPANIONS] = "、".join(cluster_members[1:])
+                fields[FIELD_TASK_CLUSTER] = True
+            elif b.get("owner_name"):
                 fields[FIELD_TASK_OWNER_NAME] = b["owner_name"]
-            if b.get("owner_phone"):
+            if b.get("owner_phone") and not cluster_members:
                 fields[FIELD_TASK_OWNER_PHONE] = b["owner_phone"]
             if deadline:
                 fields[FIELD_TASK_DEADLINE] = deadline
