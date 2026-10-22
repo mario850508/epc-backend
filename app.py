@@ -7100,6 +7100,52 @@ def slack_task_card():
     return jsonify({"ok": True})
 
 
+@app.route("/api/slack/joint-card", methods=["POST"])
+def slack_joint_card():
+    """聯合排程裡每一案的 Slack 卡片（給業務轉傳屋主）。body: {task_id, kind: invite|confirm, to?: Slack user id, preview?: true}
+    invite＝邀請屋主回覆方便的日期與時段；confirm＝排好時間後請屋主確認。卡片裡有可複製的屋主訊息。"""
+    body = request.get_json(silent=True) or {}
+    rec = _get_task_by_record_id(body.get("task_id") or "")
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    group = _get_group(task["group_id"]) if task.get("group_id") else None
+    if not group:
+        return jsonify({"error": "這個任務不在聯合排程裡"}), 400
+    kind = body.get("kind") or "invite"
+    link = _task_owner_link(task)
+    names = task["case"] + ("＋" + "＋".join(task["companions"]) if task.get("companions") else "")
+    if kind == "confirm":
+        slot = task.get("chosen_slot")
+        if not slot:
+            return jsonify({"error": "這一案還沒有排好時間"}), 400
+        when = f"{_wd_label(slot['date'])} {slot['start_time']}–{slot['end_time']}"
+        text = (f"{(task.get('owner_name') or '屋主')} 您好，我們依您回覆的時段，幫您安排在 {when}。\n"
+                f"請點下面的連結確認這個時間是否可以配合：\n{link}&go=confirm\n—陽光伏特家")
+        card = _card("🧩 聯合排程｜確認時間｜給業務", "#16A34A", f"{names} {task['alias']}".strip(),
+                     subtitle=f"負責業務：{task['assignee']}" if task.get("assignee") else "",
+                     rows=[("廠商", group["vendor"]), ("項目", "、".join(group["type"])), ("排定時間", when)],
+                     sections=[("傳給屋主的確認訊息（可複製）", text.split("\n"))],
+                     note="請把下面的訊息複製後，用 LINE 或簡訊傳給屋主，由屋主按連結確認時間。",
+                     button=("👀 開啟屋主確認頁（預覽，請勿送出）", link + "&go=confirm"))
+    else:
+        text = _joint_invite_text(group, task)
+        first = [p["date"] for p in group["prefs"] if p["tier"] == min(q["tier"] for q in group["prefs"])] if group["prefs"] else []
+        card = _card("🧩 聯合排程｜邀請屋主｜給業務", "#7C3AED", f"{names} {task['alias']}".strip(),
+                     subtitle=f"負責業務：{task['assignee']}" if task.get("assignee") else "",
+                     rows=[("廠商", group["vendor"]), ("項目", "、".join(group["type"])), ("第一期望日", _dates_text(first)),
+                           ("聯合排程", group["title"])],
+                     sections=[("傳給屋主的邀請訊息（可複製）", text.split("\n"))],
+                     note="請把下面的訊息複製後，用 LINE 或簡訊傳給屋主，由屋主自己點連結回覆方便的日期與時段。",
+                     button=("👀 開啟屋主頁（預覽，請勿送出）", link))
+    if body.get("preview") or not body.get("to"):
+        return jsonify({"text": _card_plain_text(card), "rep_name": task.get("assignee") or ""})
+    ok, err = _slack_dm(body["to"], card=card)
+    if not ok:
+        return jsonify({"error": f"Slack 傳送失敗：{err}"}), 502
+    return jsonify({"ok": True})
+
+
 @app.route("/api/slack/booking-card", methods=["POST"])
 def slack_booking_card():
     """body: {booking_id, kind: rep-notice, to?: Slack user id, preview?: true}。
