@@ -1733,6 +1733,48 @@ def book_vendor_slot_task(token):
     return jsonify({"ok": True, "record": record})
 
 
+@app.route("/api/vendor-slots/tasks/<record_id>/complete", methods=["POST"])
+def complete_vendor_slot_task(record_id):
+    """2026-10-22 窗口直接完成預約：已經跟屋主（或廠商）約好了，不用再等屋主／業務填預約表。
+    body: {date, start_time, end_time, owner_name, owner_phone, note, registrant?}。進場這類整天項目不用填時間（自動用整天）。
+    照一般預約寫入（同樣擋同廠商同班別的時段衝突、帶同時預約的案件、同步預計日期），再把任務標成已完成。"""
+    rec = _get_task_by_record_id(record_id)
+    if not rec:
+        return jsonify({"error": "找不到這個任務"}), 404
+    task = _task_to_dict(rec)
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個任務已經取消了"}), 409
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個任務已經完成預約了"}), 409
+    body = request.get_json(force=True) or {}
+    date = (body.get("date") or "").strip()
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except Exception:
+        return jsonify({"error": "請選擇預約日期"}), 400
+    start, end = (body.get("start_time") or "").strip(), (body.get("end_time") or "").strip()
+    if _owner_date_only(task) and not (start and end):
+        start, end = _owner_window(task)
+    registrant = (body.get("registrant") or "").strip() or "窗口代登"
+    owner_name = (body.get("owner_name") or task.get("owner_name") or "").strip()
+    owner_phone = (body.get("owner_phone") or task.get("owner_phone") or "").strip()
+    db_note = (body.get("note") or "").strip()
+    if _owner_date_only(task):
+        db_note = db_note + (("　" if db_note else "") + f"［預計施工 {_owner_multiday_label(task)}］")
+    record, err = _book_vendor_slot(
+        task["vendor"], date, start, end, task["case"], task["alias"], task["type"], registrant, db_note,
+        owner_name=owner_name, owner_phone=owner_phone, companions=task.get("companions"),
+    )
+    if err:
+        err_body, status = err
+        return jsonify(err_body), status
+    try:
+        _patch_task(record_id, {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
+    except Exception as e:
+        print(f"[complete_vendor_slot_task] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+    return jsonify({"ok": True, "record": record})
+
+
 @app.route("/api/vendor-slots/public-task/<token>/owner-share")
 def public_task_owner_share(token):
     """book.html 預約完成後的「📤 傳確認預約給屋主」：回傳 LIFF 分享連結（訊息範本由後端組）。"""
