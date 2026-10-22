@@ -7,7 +7,7 @@
   py drawing_sync.py "G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠"            # 掃全部
   py drawing_sync.py "<root>" --case 工程宜蘭9號                                       # 只同步一案
   py drawing_sync.py "<root>" --dry-run                                                # 只列出會上傳什麼
-  py drawing_sync.py "<root>" --contracts-only                                         # 只同步台電契約／細部協商（全部案場，檔案小）
+  py drawing_sync.py "<root>\\06 潤特綠能" "<root>\\07 陽光工程" --contracts-only           # 只同步台電契約／細部協商（全部案場，檔案小）
 
 規則：每案每種類型只留「檔名日期最新」的一份 PDF；超過 5MB（Airtable 上限）的會列在最後面請人工處理；
 已經上傳過且檔名、修改時間都沒變的不重傳。需要環境變數 EPC_SERVICE_KEY（主控台有開登入保護時用）。
@@ -28,8 +28,9 @@ CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
 DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
 # (類型, 該類型要找的分類資料夾 04/06, 檔名關鍵字（任一）, 檔名不能有的字)
 KINDS = [("審訖圖", "6", ("審訖圖",), ()), ("系統送審圖", "4", ("系統送審圖",), ()),
-         ("台電契約", "6", ("台電契約", "購售契約", "購售電契約"), ("契約函", "契約函文", "租約", "修約")),
-         ("細部協商", "6", ("細部協商", "細協"), ("補件",))]
+         # 台電契約／細部協商：整個案場資料夾（含子資料夾）都找，不限 06（cat=None）
+         ("台電契約", None, ("台電契約", "購售契約", "購售電契約"), ("契約函", "契約函文", "租約", "修約")),
+         ("細部協商", None, ("細部協商", "細協"), ("補件",))]
 
 
 try:
@@ -65,13 +66,15 @@ def find_cases(root):
 def pick_latest(case_dir, cat, keywords, excludes=()):
     """案場資料夾底下的某分類資料夾裡，檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
     cands = []
-    for d in os.listdir(case_dir):
-        m = CAT_RE.match(d)
-        if not m or m.group(1) != cat:
-            continue
-        folder = os.path.join(case_dir, d)
-        if not os.path.isdir(folder):
-            continue
+    if cat is None:
+        folders = [dp for dp, _, _ in os.walk(case_dir)]
+    else:
+        folders = []
+        for d in os.listdir(case_dir):
+            m = CAT_RE.match(d)
+            if m and m.group(1) == cat and os.path.isdir(os.path.join(case_dir, d)):
+                folders.append(os.path.join(case_dir, d))
+    for folder in folders:
         for fn in os.listdir(folder):
             if (any(k in fn for k in keywords) and not any(x in fn for x in excludes)
                     and fn.lower().endswith(".pdf") and not fn.startswith("~")):
