@@ -2,10 +2,12 @@
 """
 把 G 槽各案場的「審訖圖」（06 政府函文及相關文件）和「系統送審圖」（04 電廠設計圖）同步到主控台，
 讓「採購專區 → 訂單查詢」點進案件時可以直接對照圖面。
+2026-10-22 起也同步 06 裡的「台電契約」「細部協商」：主控台上傳時讀出總裝置容量，給「掛表資訊確認」的容量確認用。
 
   py drawing_sync.py "G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠"            # 掃全部
   py drawing_sync.py "<root>" --case 工程宜蘭9號                                       # 只同步一案
   py drawing_sync.py "<root>" --dry-run                                                # 只列出會上傳什麼
+  py drawing_sync.py "<root>" --contracts-only                                         # 只同步台電契約／細部協商（全部案場，檔案小）
 
 規則：每案每種類型只留「檔名日期最新」的一份 PDF；超過 5MB（Airtable 上限）的會列在最後面請人工處理；
 已經上傳過且檔名、修改時間都沒變的不重傳。需要環境變數 EPC_SERVICE_KEY（主控台有開登入保護時用）。
@@ -24,8 +26,10 @@ MAX_BYTES = 5 * 1024 * 1024
 CASE_RE = re.compile(r"^\d*\s*((?:工程|潤特)[^\d_\s]+\d+號)")
 CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
 DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
-# (類型, 該類型要找的分類資料夾 04/06, 檔名關鍵字)
-KINDS = [("審訖圖", "6", "審訖圖"), ("系統送審圖", "4", "系統送審圖")]
+# (類型, 該類型要找的分類資料夾 04/06, 檔名關鍵字（任一）, 檔名不能有的字)
+KINDS = [("審訖圖", "6", ("審訖圖",), ()), ("系統送審圖", "4", ("系統送審圖",), ()),
+         ("台電契約", "6", ("台電契約", "購售契約", "購售電契約"), ("契約函", "契約函文", "租約", "修約")),
+         ("細部協商", "6", ("細部協商", "細協"), ("補件",))]
 
 
 try:
@@ -58,8 +62,8 @@ def find_cases(root):
     return out
 
 
-def pick_latest(case_dir, cat, keyword):
-    """案場資料夾底下的某分類資料夾裡，檔名含 keyword 的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
+def pick_latest(case_dir, cat, keywords, excludes=()):
+    """案場資料夾底下的某分類資料夾裡，檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
     cands = []
     for d in os.listdir(case_dir):
         m = CAT_RE.match(d)
@@ -69,7 +73,8 @@ def pick_latest(case_dir, cat, keyword):
         if not os.path.isdir(folder):
             continue
         for fn in os.listdir(folder):
-            if keyword in fn and fn.lower().endswith(".pdf") and not fn.startswith("~"):
+            if (any(k in fn for k in keywords) and not any(x in fn for x in excludes)
+                    and fn.lower().endswith(".pdf") and not fn.startswith("~")):
                 p = os.path.join(folder, fn)
                 dm = DATE_RE.search(fn)
                 doc_date = "-".join(dm.groups()) if dm else ""
@@ -87,7 +92,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--open-orders", action="store_true",
                     help="只同步「還沒出貨」(已成立／可能撤案) 訂單的案件，省 Airtable 空間；全部案場約 1.4GB，不建議全傳")
+    ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商（掛表資訊確認的容量用）")
     args = ap.parse_args()
+    kinds = [k for k in KINDS if k[0] in ("台電契約", "細部協商")] if args.contracts_only else KINDS
 
     try:
         idx = {i["key"]: i for i in api("GET", "/api/procurement/drawings/index").json().get("items", [])}
@@ -114,9 +121,9 @@ def main():
                 continue
             if args.open_orders and case_no not in only:
                 continue
-            for kind, cat, kw in KINDS:
+            for kind, cat, kw, ex in kinds:
                 try:
-                    best = pick_latest(case_dir, cat, kw)
+                    best = pick_latest(case_dir, cat, kw, ex)
                 except OSError as e:
                     log(f"  ✗ {case_no} {kind} 讀資料夾失敗：{e}")
                     fail += 1
@@ -144,7 +151,8 @@ def main():
                         "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
                     if r.status_code >= 400:
                         raise Exception(r.text[:200])
-                    log(f"  ✓ {case_no} {kind}：{fn}")
+                    cap = r.json().get("capacity") if kind in ("台電契約", "細部協商") else None
+                    log(f"  ✓ {case_no} {kind}：{fn}" + (f"（容量 {cap} kW）" if cap else (f"（{r.json().get('capacity_src')}）" if kind in ("台電契約", "細部協商") else "")))
                     up += 1
                 except Exception as e:
                     log(f"  ✗ {case_no} {kind}：{fn} 上傳失敗：{e}")
