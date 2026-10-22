@@ -12686,6 +12686,152 @@ def update_vendor_slot_booking(record_id):
     return jsonify({"ok": True, "updated": len(group), "added": new_cases, "merged_tasks": merged_tasks, "time_changed": changed_time})
 
 
+# ===================================================================
+# 掛表資訊確認（2026-10-22）
+# 取代 Google 試算表「7月掛錶案件異動」：每月把當月掛表的案件列出來（掛表日期＝「進度管理」
+# 掛表里程碑的實際日期），對照「專案細節」的系統容量／工程合約電價，人工填「容量確認」「電價確認」；
+# 另外記當月撤案案件＋案件狀況說明。案件資料即時讀 Airtable，人工確認的部分存「掛表資訊確認」表。
+# ===================================================================
+MC_TABLE_ID = "tblLm4MbcByd2VrV8"
+MC_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MC_TABLE_ID}"
+MC_F = {
+    "title": "fld1feoQ62Rh0xN1C", "month": "fldJs8klE8wAv2a5K", "case_no": "fldYQFqzWYgrx9v3w",
+    "kind": "fldHCbkDCWzORvcdn", "cap": "fld6DBxXOtGjpgOY0", "price": "fldDCajFNnCigrBSA",
+    "note": "fldfQdH0MeAzRKxe6", "by": "fldJ21B5ihKRzGlv5", "updated": "fldi0oJSb7m9Tx4s1",
+}
+MC_KINDS = ("掛表", "撤案")
+FIELD_SYSTEM_CAPACITY = "fldQwb2qdQiYN3fIi"   # 專案細節「系統容量」(kW)
+FIELD_CONTRACT_PRICE = "fldzJoM0X3Gcnfq3z"    # 專案細節 工程合約電價（有些案件沒填）
+
+
+def _mc_case_info(formula_parts):
+    """formula_parts: OR 條件清單（RECORD_ID() 或案號），分批查專案細節，回傳 {record_id: info}。"""
+    out = {}
+    fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_SYSTEM_CAPACITY, FIELD_CONTRACT_PRICE, FIELD_CLOSE_STATUS]
+    for i in range(0, len(formula_parts), 40):
+        for r in airtable_get_all(CASE_API_URL, "OR(" + ",".join(formula_parts[i:i + 40]) + ")", fields):
+            f = r.get("fields", {})
+            out[r["id"]] = {
+                "record_id": r["id"], "case_no": f.get(FIELD_CASE_NO, ""), "alias": f.get(FIELD_ALIAS, ""),
+                "vendor": f.get(FIELD_VENDOR) or "", "capacity": f.get(FIELD_SYSTEM_CAPACITY),
+                "price": f.get(FIELD_CONTRACT_PRICE), "close_status": f.get(FIELD_CLOSE_STATUS) or "",
+            }
+    return out
+
+
+@app.route("/api/meter-check", methods=["GET"])
+def get_meter_check():
+    """?month=YYYY-MM → 當月掛表案件（依掛表日期排序）＋人工確認值、當月撤案案件。"""
+    month = (request.args.get("month") or "").strip()
+    if not _re.fullmatch(r"\d{4}-\d{2}", month):
+        return jsonify({"error": "month 格式要是 YYYY-MM"}), 400
+    try:
+        ms = airtable_get_all(
+            MILESTONE_API_URL,
+            f"AND({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_METER}',DATETIME_FORMAT({{{FIELD_MS_ACTUAL_DATE}}},'YYYY-MM')='{month}')",
+            [FIELD_MS_CASE_LINK, FIELD_MS_ACTUAL_DATE],
+        )
+        meter_date = {}   # case record id → 掛表日期（同案有重複里程碑時取最晚那筆）
+        for r in ms:
+            f = r.get("fields", {})
+            d = f.get(FIELD_MS_ACTUAL_DATE) or ""
+            for cid in f.get(FIELD_MS_CASE_LINK) or []:
+                if d > meter_date.get(cid, ""):
+                    meter_date[cid] = d
+        cases = _mc_case_info([f"RECORD_ID()='{cid}'" for cid in meter_date])
+
+        checks = airtable_get_all(MC_API_URL, f"{{{MC_F['month']}}}='{month}'", list(MC_F.values()))
+        chk = {}
+        for r in checks:
+            f = r.get("fields", {})
+            chk[(f.get(MC_F["kind"]), f.get(MC_F["case_no"]))] = {
+                "check_id": r["id"], "cap_confirm": f.get(MC_F["cap"]), "price_confirm": f.get(MC_F["price"]),
+                "note": f.get(MC_F["note"]) or "", "by": f.get(MC_F["by"]) or "", "updated": f.get(MC_F["updated"]) or "",
+            }
+
+        rows = []
+        for cid, c in cases.items():
+            rows.append({**c, "meter_date": meter_date.get(cid, ""),
+                         **chk.get(("掛表", c["case_no"]), {"check_id": None, "cap_confirm": None, "price_confirm": None,
+                                                           "note": "", "by": "", "updated": ""})})
+        rows.sort(key=lambda x: (x["meter_date"], x["case_no"]))
+
+        w_keys = [k[1] for k in chk if k[0] == "撤案" and k[1]]
+        w_info = {}
+        if w_keys:
+            for c in _mc_case_info(["{" + FIELD_CASE_NO + "}='" + n.replace("'", chr(92) + "'") + "'" for n in w_keys]).values():
+                w_info[c["case_no"]] = c
+        withdrawn = []
+        for n in w_keys:
+            c = w_info.get(n, {"record_id": None, "case_no": n, "alias": "", "vendor": "", "capacity": None, "price": None, "close_status": ""})
+            withdrawn.append({**c, **chk[("撤案", n)]})
+        withdrawn.sort(key=lambda x: (x["note"], x["case_no"]))
+        return jsonify({"month": month, "cases": rows, "withdrawn": withdrawn})
+    except Exception as e:
+        print(f"[get_meter_check] {month} 失敗：{e}", flush=True)
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/meter-check", methods=["POST"])
+def upsert_meter_check():
+    """body: {month, case_no, kind（掛表/撤案）, cap_confirm?, price_confirm?, note?, by?}
+    同月同案同類型只有一筆；有帶的欄位才更新，帶 null／空字串＝清空。"""
+    b = request.get_json(silent=True) or {}
+    month = (b.get("month") or "").strip()
+    case_no = (b.get("case_no") or "").strip()
+    kind = (b.get("kind") or "掛表").strip()
+    if not _re.fullmatch(r"\d{4}-\d{2}", month) or not case_no or kind not in MC_KINDS:
+        return jsonify({"error": "缺少 month／case_no，或 kind 不正確"}), 400
+
+    def num(v):
+        if v is None or str(v).strip() == "":
+            return None
+        return float(v)
+
+    fields = {MC_F["updated"]: _tw_now().strftime("%Y-%m-%d %H:%M")}
+    try:
+        if "cap_confirm" in b:
+            fields[MC_F["cap"]] = num(b.get("cap_confirm"))
+        if "price_confirm" in b:
+            fields[MC_F["price"]] = num(b.get("price_confirm"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "容量／電價要是數字"}), 400
+    if "note" in b:
+        fields[MC_F["note"]] = (b.get("note") or "").strip()
+    if b.get("by"):
+        fields[MC_F["by"]] = str(b["by"]).strip()[:40]
+    try:
+        esc = case_no.replace("'", chr(92) + "'")
+        found = airtable_get_all(
+            MC_API_URL,
+            f"AND({{{MC_F['month']}}}='{month}',{{{MC_F['case_no']}}}='{esc}',{{{MC_F['kind']}}}='{kind}')",
+            [MC_F["case_no"]],
+        )
+        if found:
+            rid = found[0]["id"]
+            resp = requests.patch(f"{MC_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        else:
+            fields.update({MC_F["title"]: f"{month} {kind} {case_no}", MC_F["month"]: month,
+                           MC_F["case_no"]: case_no, MC_F["kind"]: kind})
+            resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        resp.raise_for_status()
+        return jsonify({"ok": True, "check_id": resp.json()["id"]})
+    except Exception as e:
+        print(f"[upsert_meter_check] {month} {case_no} 失敗：{e}", flush=True)
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/meter-check/<record_id>", methods=["DELETE"])
+def delete_meter_check(record_id):
+    if not _re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
+        return jsonify({"error": "record_id 不正確"}), 400
+    try:
+        requests.delete(f"{MC_API_URL}/{record_id}", headers=airtable_headers(), timeout=20).raise_for_status()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
 if __name__ == "__main__":
     # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
     # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
