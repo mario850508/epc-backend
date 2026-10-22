@@ -12125,7 +12125,8 @@ def joint_list():
         g["counts"] = {"total": n, "replied": replied, "confirmed": confirmed}
         g["cases"] = [t["case"] for t in sorted(ts, key=lambda x: x["case"])]
         groups.append(g)
-    groups.sort(key=lambda g: (g["status"] in (GS_DONE, GS_CANCEL), g["title"]))
+    groups = [g for g in groups if g["status"] != GS_CANCEL]   # 已取消的不顯示（取消現在是直接刪除，舊資料也一併隱藏）
+    groups.sort(key=lambda g: (g["status"] == GS_DONE, g["title"]))
     return jsonify({"groups": groups})
 
 
@@ -12438,16 +12439,18 @@ def joint_cancel(gid):
     group = _get_group(gid)
     if not group:
         return jsonify({"error": "找不到這個聯合排程"}), 404
+    # 2026-10-22：取消＝直接移除，不留「已取消」的聯合排程。還沒確認的任務刪掉；已經成立預約的任務留著，只是脫離聯合排程。
     for t in _group_tasks(gid):
-        if t["status"] != TASK_STATUS_DONE:
-            try:
-                _patch_task(t["record_id"], {FIELD_TASK_STATUS: TASK_STATUS_CANCELLED})
-            except Exception as e:
-                print(f"[joint_cancel] 取消任務失敗：{e}", flush=True)
-    try:
-        _patch_group(gid, {G_STATUS: GS_CANCEL})
-    except Exception as e:
-        return jsonify({"error": "Airtable 寫入失敗", "detail": str(e)}), 502
+        try:
+            if t["status"] == TASK_STATUS_DONE:
+                _patch_task(t["record_id"], {FIELD_TASK_GROUP_ID: ""})
+            else:
+                requests.delete(f"{TASK_API_URL}/{t['record_id']}", headers=airtable_headers(), timeout=20)
+        except Exception as e:
+            print(f"[joint_cancel] 處理任務失敗：{e}", flush=True)
+    resp = requests.delete(f"{GROUP_API_URL}/{gid}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text[:200]}), 502
     return jsonify({"ok": True})
 
 
