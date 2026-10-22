@@ -4671,11 +4671,10 @@ scheduler.add_job(refresh_model_options_cache, CronTrigger(hour="0,6,12,18", min
 
 
 def sync_milestone_done():
-    """進度管理：完成日期已經到了（今天或以前）但節點還是「尚未完成」的，改成「已完成」。
-    有日期就算完成；日期在未來的（預定出貨、預約進場）等那天到了再改。每小時跑一次，人工在 Airtable 填的日期也會跟上。"""
-    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
-    formula = ("AND({" + FIELD_MS_ACTUAL_DATE + "}!='',NOT(IS_AFTER({" + FIELD_MS_ACTUAL_DATE + "},'" + today + "')),{"
-               + FIELD_MS_STATUS + "}!='" + MS_STATUS_DONE + "')")
+    """進度管理：只要「完成日期」欄有填日期（不管是今天、過去或未來），節點狀態就改成「已完成」。
+    2026-10-22 使用者要求：Airtable 上日期一更新，狀態就要直接變已完成（以前日期在未來的要等那天到了才改）。
+    每 10 分鐘跑一次，人工在 Airtable 填的日期也會跟上。"""
+    formula = "AND({" + FIELD_MS_ACTUAL_DATE + "}!='',{" + FIELD_MS_STATUS + "}!='" + MS_STATUS_DONE + "')"
     try:
         recs = airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS])
         for i in range(0, len(recs), 10):
@@ -4685,11 +4684,13 @@ def sync_milestone_done():
                 raise Exception(r.text[:300])
         if recs:
             print(f"[milestone] 有完成日期的節點改為已完成：{len(recs)} 筆", flush=True)
+        return len(recs)
     except Exception as e:
         print(f"[milestone] 同步已完成失敗：{e}", flush=True)
+        return -1
 
 
-scheduler.add_job(sync_milestone_done, CronTrigger(minute=7, timezone="Asia/Taipei"), id="milestone_done",
+scheduler.add_job(sync_milestone_done, CronTrigger(minute="*/10", timezone="Asia/Taipei"), id="milestone_done",
                   replace_existing=True, max_instances=1, coalesce=True)
 # 注意（2026-08-30 修改十三）：這裡刻意不呼叫 scheduler.start()。
 # 實際啟動移到 gunicorn.conf.py 的 post_fork() hook 裡呼叫，確保排程是在
@@ -5118,6 +5119,13 @@ def ship_date_sync_notify():
     changes = body.get("changes") or SHIP_SYNC_LAST.get("changed") or []
     ok, err = _ship_sync_notice(changes)
     return jsonify({"ok": ok, "error": err, "count": len(changes)}), (200 if ok else 502)
+
+
+@app.route("/api/milestone-done-sync", methods=["POST"])
+def milestone_done_sync_api():
+    """手動立刻跑一次：把有日期但狀態還是「尚未完成」的進度節點改成已完成，回傳改了幾筆。"""
+    n = sync_milestone_done()
+    return jsonify({"ok": n >= 0, "updated": n})
 
 
 @app.route("/api/ship-date-sync", methods=["GET", "POST"])
