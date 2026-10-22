@@ -12129,13 +12129,8 @@ def joint_list():
     return jsonify({"groups": groups})
 
 
-@app.route("/api/joint-schedules", methods=["POST"])
-def joint_create():
-    """建立聯合排程。body: {vendor, type:[...], cases:[案號...], prefs:[{date, windows:[[a,b],...]}...（1～4 個期望日）],
-    duration_min, gap_min, creator, deadline, note}"""
-    body = request.get_json(force=True) or {}
-    vendor = (body.get("vendor") or "").strip()
-    types = _normalize_type_list(body.get("type"))
+def _joint_parse(body, vendor, types):
+    """建立／編輯聯合排程共用：整理 body 成 {cases, clusters, prefs, orders, dur, gap, creator, deadline}；有錯回 (None, 錯誤訊息)。"""
     cases = []
     for c in body.get("cases") or []:
         c = (c or "").strip()
@@ -12176,7 +12171,7 @@ def joint_create():
         if 1 <= n <= 5:
             orders[str(k).strip()] = n
     if not vendor or not types or len(cases) + len(clusters) < 2 or not prefs_in:
-        return jsonify({"error": "請選廠商、項目，至少兩個案件（同排住戶組算一個），並至少設定第一期望日"}), 400
+        return None, "請選廠商、項目，至少兩個案件（同排住戶組算一個），並至少設定第一期望日"
     try:
         dur = int(body.get("duration_min") or 0) or sum(OWNER_TYPE_DEFAULT_MIN.get(t, 60) for t in types) or 60
         gap = int(body.get("gap_min") if body.get("gap_min") is not None else 30)
@@ -12185,47 +12180,73 @@ def joint_create():
     creator = body.get("creator")
     if isinstance(creator, list):
         creator = "、".join(str(x).strip() for x in creator if str(x).strip())
-    creator = (creator or "").strip()
-    deadline = _normalize_deadline(body.get("deadline"))
-    title = f"{vendor} {'/'.join(types)} 聯合排程（{len(cases) + sum(len(c) for c in clusters)}案）"
+    return {"cases": cases, "clusters": clusters, "prefs": prefs_in, "orders": orders, "dur": dur, "gap": gap,
+            "creator": (creator or "").strip(), "deadline": _normalize_deadline(body.get("deadline")),
+            "note": (body.get("note") or "").strip()}, None
+
+
+def _joint_units(P):
+    """[(主案號, 同排成員 list 或 None)]；獨立案件在前、同排組在後。"""
+    return [(c, None) for c in P["cases"]] + [(cl[0], cl) for cl in P["clusters"]]
+
+
+def _joint_task_fields(P, vendor, types, gid, case_no, cluster_members):
+    """聯合排程裡每個單位（任務）要寫進任務表的欄位。"""
+    b = _case_brief(case_no)
+    fields = {
+        FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(types)} 聯合排程", FIELD_TASK_VENDOR: vendor,
+        FIELD_TASK_CASE_NO: case_no, FIELD_TASK_ALIAS: b.get("alias") or "", FIELD_TASK_TYPE: types,
+        FIELD_TASK_CANDIDATE_DATES: ",".join(p["date"] for p in P["prefs"]),
+        FIELD_TASK_ASSIGNEE: _canon_rep(b.get("rep_name") or ""), FIELD_TASK_STATUS: TASK_STATUS_PENDING,
+        FIELD_TASK_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_CREATOR: P["creator"],
+        FIELD_TASK_OWNER_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_OWNER_MODE: True,
+        FIELD_TASK_DURATION_MIN: P["dur"], FIELD_TASK_GROUP_ID: gid,
+        FIELD_TASK_OWNER_WIN_START: "09:00", FIELD_TASK_OWNER_WIN_END: "17:00",
+    }
+    order_n = P["orders"].get(case_no) or max([P["orders"].get(m, 1) for m in (cluster_members or [])] or [1])
+    if order_n > 1:
+        fields[FIELD_TASK_ORDER] = order_n
+    if cluster_members:   # 同排住戶組：主案放這個任務，其他戶放同時預約；屋主資料不預填（要看哪一戶回覆）
+        fields[FIELD_TASK_COMPANIONS] = "、".join(cluster_members[1:])
+        fields[FIELD_TASK_CLUSTER] = True
+    elif b.get("owner_name"):
+        fields[FIELD_TASK_OWNER_NAME] = b["owner_name"]
+    if b.get("owner_phone") and not cluster_members:
+        fields[FIELD_TASK_OWNER_PHONE] = b["owner_phone"]
+    if P["deadline"]:
+        fields[FIELD_TASK_DEADLINE] = P["deadline"]
+    return fields
+
+
+def _joint_title(vendor, types, P):
+    return f"{vendor} {'/'.join(types)} 聯合排程（{len(P['cases']) + sum(len(c) for c in P['clusters'])}案）"
+
+
+@app.route("/api/joint-schedules", methods=["POST"])
+def joint_create():
+    """建立聯合排程。body: {vendor, type:[...], cases:[獨立案號...], clusters:[[同排案號...]...], orders:{案號:批次},
+    tiers:[{days:[{date, windows}]}], duration_min, gap_min, creator, deadline, note}"""
+    body = request.get_json(force=True) or {}
+    vendor = (body.get("vendor") or "").strip()
+    types = _normalize_type_list(body.get("type"))
+    P, err = _joint_parse(body, vendor, types)
+    if err:
+        return jsonify({"error": err}), 400
     try:
         gresp = requests.post(GROUP_API_URL, headers=airtable_headers(), timeout=20, json={"fields": {
-            G_TITLE: title, G_VENDOR: vendor, G_ITEMS: "、".join(types),
-            G_PREFS: json.dumps(prefs_in, ensure_ascii=False), G_DUR: dur, G_GAP: gap, G_STATUS: GS_COLLECT,
-            G_CREATORS: creator, G_DEADLINE: deadline or "", G_NOTE: (body.get("note") or "").strip()}})
+            G_TITLE: _joint_title(vendor, types, P), G_VENDOR: vendor, G_ITEMS: "、".join(types),
+            G_PREFS: json.dumps(P["prefs"], ensure_ascii=False), G_DUR: P["dur"], G_GAP: P["gap"], G_STATUS: GS_COLLECT,
+            G_CREATORS: P["creator"], G_DEADLINE: P["deadline"] or "", G_NOTE: P["note"]}})
         if gresp.status_code >= 400:
             return jsonify({"error": "Airtable 寫入失敗", "detail": gresp.text}), 502
         gid = gresp.json()["id"]
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     failed = []
-    for case_no in cases + [cl[0] for cl in clusters]:
-        cluster_members = next((cl for cl in clusters if cl[0] == case_no), None)
+    for case_no, members in _joint_units(P):
         try:
-            b = _case_brief(case_no)
-            fields = {
-                FIELD_TASK_TITLE: f"{vendor} {case_no} {'/'.join(types)} 聯合排程", FIELD_TASK_VENDOR: vendor,
-                FIELD_TASK_CASE_NO: case_no, FIELD_TASK_ALIAS: b.get("alias") or "", FIELD_TASK_TYPE: types,
-                FIELD_TASK_CANDIDATE_DATES: ",".join(p["date"] for p in prefs_in),
-                FIELD_TASK_ASSIGNEE: _canon_rep(b.get("rep_name") or ""), FIELD_TASK_STATUS: TASK_STATUS_PENDING,
-                FIELD_TASK_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_CREATOR: creator,
-                FIELD_TASK_OWNER_TOKEN: secrets.token_urlsafe(16), FIELD_TASK_OWNER_MODE: True,
-                FIELD_TASK_DURATION_MIN: dur, FIELD_TASK_GROUP_ID: gid,
-                FIELD_TASK_OWNER_WIN_START: "09:00", FIELD_TASK_OWNER_WIN_END: "17:00",
-            }
-            order_n = orders.get(case_no) or max([orders.get(m, 1) for m in (cluster_members or [])] or [1])
-            if order_n > 1:
-                fields[FIELD_TASK_ORDER] = order_n
-            if cluster_members:   # 同排住戶組：主案放這個任務，其他戶放同時預約；屋主資料不預填（要看哪一戶回覆）
-                fields[FIELD_TASK_COMPANIONS] = "、".join(cluster_members[1:])
-                fields[FIELD_TASK_CLUSTER] = True
-            elif b.get("owner_name"):
-                fields[FIELD_TASK_OWNER_NAME] = b["owner_name"]
-            if b.get("owner_phone") and not cluster_members:
-                fields[FIELD_TASK_OWNER_PHONE] = b["owner_phone"]
-            if deadline:
-                fields[FIELD_TASK_DEADLINE] = deadline
-            r = requests.post(TASK_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+            r = requests.post(TASK_API_URL, headers=airtable_headers(), timeout=20,
+                              json={"fields": _joint_task_fields(P, vendor, types, gid, case_no, members)})
             if r.status_code >= 400:
                 failed.append(case_no)
         except Exception as e:
@@ -12233,6 +12254,92 @@ def joint_create():
             failed.append(case_no)
     group = _get_group(gid)
     return jsonify({"ok": True, "failed": failed, "joint": _joint_view(group, _group_tasks(gid))})
+
+
+@app.route("/api/joint-schedules/<gid>", methods=["PATCH"])
+def joint_update(gid):
+    """2026-10-22 編輯聯合排程：可改案件單位（增減案件、同排組、回覆批次）、期望日與時段、每案時間／緩衝、期限、安排人員。
+    廠商與項目不能改。已排好時間、等屋主確認中（或已完成／取消）不能編輯；已有確認預約的案件不能移除。
+    保留各單位原本的屋主連結與回覆；期望日被拿掉時，選了那些日期的回覆會作廢（屋主要重新回覆）。"""
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    if group["status"] in (GS_CANCEL, GS_DONE):
+        return jsonify({"error": "這個聯合排程已經結束了，不能編輯"}), 409
+    if group["status"] == GS_WAIT_OWNERS:
+        return jsonify({"error": "已經排好時間、正在等屋主確認，不能編輯。如要修改，請先取消這個聯合排程再重建"}), 409
+    body = request.get_json(force=True) or {}
+    vendor, types = group["vendor"], group["type"]
+    P, err = _joint_parse(body, vendor, types)
+    if err:
+        return jsonify({"error": err}), 400
+    tasks = _group_tasks(gid)
+    existing = {t["case"]: t for t in tasks if t["status"] != TASK_STATUS_CANCELLED}
+    units = _joint_units(P)
+    primaries = {c for c, _ in units}
+    removed = [t for c, t in existing.items() if c not in primaries]
+    blocked = [t["case"] for t in removed if t["status"] == TASK_STATUS_DONE]
+    if blocked:
+        return jsonify({"error": "這些案件已經有確認的預約，不能從聯合排程移除：" + "、".join(blocked) + "（請先到「完成安排」取消預約）"}), 409
+    old_dates = {p["date"] for p in group["prefs"]}
+    gone_dates = old_dates - {p["date"] for p in P["prefs"]}
+    for t in removed:
+        requests.delete(f"{TASK_API_URL}/{t['record_id']}", headers=airtable_headers(), timeout=20)
+    failed, cleared = [], []
+    for case_no, members in units:
+        t = existing.get(case_no)
+        try:
+            if t is None:
+                r = requests.post(TASK_API_URL, headers=airtable_headers(), timeout=20,
+                                  json={"fields": _joint_task_fields(P, vendor, types, gid, case_no, members)})
+                if r.status_code >= 400:
+                    failed.append(case_no)
+                continue
+            if t["status"] == TASK_STATUS_DONE:
+                continue
+            f = {FIELD_TASK_CANDIDATE_DATES: ",".join(p["date"] for p in P["prefs"]), FIELD_TASK_DURATION_MIN: P["dur"],
+                 FIELD_TASK_CREATOR: P["creator"], FIELD_TASK_DEADLINE: P["deadline"] or None,
+                 FIELD_TASK_COMPANIONS: "、".join(members[1:]) if members else None, FIELD_TASK_CLUSTER: bool(members)}
+            order_n = P["orders"].get(case_no) or max([P["orders"].get(m, 1) for m in (members or [])] or [1])
+            f[FIELD_TASK_ORDER] = order_n if order_n > 1 else None
+            rp = t.get("owner_reply") or {}
+            if rp and any(pk["date"] in gone_dates for pk in _g_picks(rp)):
+                f[FIELD_TASK_OWNER_REPLY] = ""   # 選的日期被拿掉了：回覆作廢，請屋主重新回覆
+                cleared.append(case_no)
+            _patch_task(t["record_id"], f)
+        except Exception as e:
+            print(f"[joint_update] 更新 {case_no} 失敗：{e}", flush=True)
+            failed.append(case_no)
+    new_tasks = _group_tasks(gid)
+    all_replied = bool(new_tasks) and all(t.get("owner_reply") for t in new_tasks)
+    try:
+        _patch_group(gid, {G_TITLE: _joint_title(vendor, types, P), G_PREFS: json.dumps(P["prefs"], ensure_ascii=False),
+                           G_DUR: P["dur"], G_GAP: P["gap"], G_CREATORS: P["creator"], G_DEADLINE: P["deadline"] or "",
+                           G_NOTE: P["note"], G_PLAN: "", G_STATUS: GS_PLAN if all_replied else GS_COLLECT,
+                           G_N_REPLIED: all_replied and bool(group.get("notified_replied")), G_N_CONFIRMED: False})
+    except Exception as e:
+        return jsonify({"error": "更新聯合排程失敗", "detail": str(e)}), 502
+    group = _get_group(gid)
+    return jsonify({"ok": True, "failed": failed, "cleared": cleared, "removed": [t["case"] for t in removed],
+                    "joint": _joint_view(group, new_tasks)})
+
+
+@app.route("/api/joint-schedules/<gid>", methods=["DELETE"])
+def joint_delete(gid):
+    """2026-10-22 刪除聯合排程（連同底下還沒成立預約的任務）。已經有確認預約的不能刪，請先取消預約。"""
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    tasks = _group_tasks(gid)
+    done = [t["case"] for t in tasks if t["status"] == TASK_STATUS_DONE]
+    if done:
+        return jsonify({"error": "這些案件已經有確認的預約：" + "、".join(done) + "。請先到「完成安排」取消預約，或改用「取消這個聯合排程」"}), 409
+    for t in tasks:
+        requests.delete(f"{TASK_API_URL}/{t['record_id']}", headers=airtable_headers(), timeout=20)
+    resp = requests.delete(f"{GROUP_API_URL}/{gid}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text[:200]}), 502
+    return jsonify({"ok": True, "deleted_tasks": len(tasks)})
 
 
 @app.route("/api/joint-schedules/<gid>", methods=["GET"])
