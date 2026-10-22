@@ -12707,7 +12707,8 @@ FIELD_CONTRACT_PRICE = "fldzJoM0X3Gcnfq3z"    # 專案細節 工程合約電價�
 def _mc_case_info(formula_parts):
     """formula_parts: OR 條件清單（RECORD_ID() 或案號），分批查專案細節，回傳 {record_id: info}。"""
     out = {}
-    fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_SYSTEM_CAPACITY, FIELD_CONTRACT_PRICE, FIELD_CLOSE_STATUS]
+    fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_SYSTEM_CAPACITY, FIELD_CONTRACT_PRICE, FIELD_CLOSE_STATUS,
+              FIELD_AGREE_DATE]
     for i in range(0, len(formula_parts), 40):
         for r in airtable_get_all(CASE_API_URL, "OR(" + ",".join(formula_parts[i:i + 40]) + ")", fields):
             f = r.get("fields", {})
@@ -12715,6 +12716,8 @@ def _mc_case_info(formula_parts):
                 "record_id": r["id"], "case_no": f.get(FIELD_CASE_NO, ""), "alias": f.get(FIELD_ALIAS, ""),
                 "vendor": f.get(FIELD_VENDOR) or "", "capacity": f.get(FIELD_SYSTEM_CAPACITY),
                 "price": f.get(FIELD_CONTRACT_PRICE), "close_status": f.get(FIELD_CLOSE_STATUS) or "",
+                # 同意備案日期（lookup，可能多筆）：掛表在同備 4 個月內，電價用同備當時那一期（前端判斷）
+                "agree_date": max([d for d in (f.get(FIELD_AGREE_DATE) or []) if isinstance(d, str)] or [""])[:10],
             }
     return out
 
@@ -12763,7 +12766,8 @@ def get_meter_check():
                 w_info[c["case_no"]] = c
         withdrawn = []
         for n in w_keys:
-            c = w_info.get(n, {"record_id": None, "case_no": n, "alias": "", "vendor": "", "capacity": None, "price": None, "close_status": ""})
+            c = w_info.get(n, {"record_id": None, "case_no": n, "alias": "", "vendor": "", "capacity": None, "price": None,
+                               "close_status": "", "agree_date": ""})
             withdrawn.append({**c, **chk[("撤案", n)]})
         withdrawn.sort(key=lambda x: (x["note"], x["case_no"]))
         return jsonify({"month": month, "cases": rows, "withdrawn": withdrawn})
