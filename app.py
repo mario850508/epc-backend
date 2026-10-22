@@ -12708,7 +12708,11 @@ def _mc_case_info(formula_parts):
     """formula_parts: OR 條件清單（RECORD_ID() 或案號），分批查專案細節，回傳 {record_id: info}。"""
     out = {}
     fields = [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_SYSTEM_CAPACITY, FIELD_CONTRACT_PRICE, FIELD_CLOSE_STATUS,
-              FIELD_AGREE_DATE]
+              FIELD_AGREE_DATE, FIELD_ADDRESS]
+    try:
+        _ensure_biz_snapshots_loaded()
+    except Exception:
+        pass
     for i in range(0, len(formula_parts), 40):
         for r in airtable_get_all(CASE_API_URL, "OR(" + ",".join(formula_parts[i:i + 40]) + ")", fields):
             f = r.get("fields", {})
@@ -12719,6 +12723,10 @@ def _mc_case_info(formula_parts):
                 # 同意備案日期（lookup，可能多筆）：掛表在同備 4 個月內，電價用同備當時那一期（前端判斷）
                 "agree_date": max([d for d in (f.get(FIELD_AGREE_DATE) or []) if isinstance(d, str)] or [""])[:10],
             }
+            # 地址（案號看不出縣市時，前端用地址判斷電價北／南）：業務自治區 A01資訊（使用者指定優先）→ Airtable → 場勘快取
+            cn, al = out[r["id"]]["case_no"], out[r["id"]]["alias"]
+            addr = CASE_ADDR_CACHE.get(cn) or (CASE_ADDR_CACHE.get(al) if al else "") or f.get(FIELD_ADDRESS) or _addr_fallback(cn)
+            out[r["id"]]["address"] = " ".join((addr or "").split())
     return out
 
 
@@ -12767,7 +12775,7 @@ def get_meter_check():
         withdrawn = []
         for n in w_keys:
             c = w_info.get(n, {"record_id": None, "case_no": n, "alias": "", "vendor": "", "capacity": None, "price": None,
-                               "close_status": "", "agree_date": ""})
+                               "close_status": "", "agree_date": "", "address": ""})
             withdrawn.append({**c, **chk[("撤案", n)]})
         withdrawn.sort(key=lambda x: (x["note"], x["case_no"]))
         return jsonify({"month": month, "cases": rows, "withdrawn": withdrawn})
