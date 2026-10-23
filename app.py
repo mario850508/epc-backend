@@ -4755,6 +4755,11 @@ def _startup_refresh_all():
     直接 `python app.py` 執行時），確保一定是在真正服務請求的 process 裡執行。"""
     refresh_cache()
     refresh_model_options_cache()
+    try:   # 2026-10-23：重啟會丟掉背景讀取中的契約 → 開機後把還沒讀到數字的契約重讀一次
+        n = _reparse_unread_contracts()
+        print(f"[startup] 重讀還沒讀到數字的契約 {n} 份", flush=True)
+    except Exception as e:
+        print(f"[startup] 重讀契約失敗：{e}", flush=True)
     refresh_survey_cache()
 
 
@@ -8050,7 +8055,9 @@ def _contract_capacity(text, kind):
     t = re.sub(r"(?<=\d),(?=\d{3})", "", t)                # 1,000 → 1000
     unit = r"\s*(?:\(\s*峰\s*\))?\s*(?:瓩|[kK][wW]p?)"
     pats = ([r"合計總裝置容量\s*為?\s*" + _CAP_NUM + unit, r"總購售電容量\s*為?\s*" + _CAP_NUM + unit]
-            if kind == "台電契約" else []) + [r"總裝置容量\s*[為:]?\s*" + _CAP_NUM + unit]
+            if kind == "台電契約" else []) + [r"總裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
+            # 台電契約移轉函：「(電號:…)裝置容量為19.68kWp之再生能源發電系統」
+            r"裝置容量\s*[為:]?\s*" + _CAP_NUM + unit]
     for p in pats:
         ms = list(re.finditer(p, t))
         if ms:
@@ -8061,7 +8068,7 @@ def _contract_capacity(text, kind):
                 continue
             if 0 < v < 100000:
                 return v, " ".join(m.group(0).split())[:80]
-    return None, "文件裡找不到「總裝置容量」"
+    return None, "文件裡找不到「裝置容量」"
 
 
 def _doc_pdf_text(data, need):
@@ -8204,6 +8211,39 @@ def _pdf_first_pages(data, n):
     except Exception as e:
         print(f"[pdf_first_pages] {e}", flush=True)
         return data
+
+
+def _reparse_unread_contracts(limit=300):
+    """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的（讀不到、或重啟時卡在讀取中）。
+    用存著的附件（大檔是前 6 頁）。回傳排進背景的筆數。"""
+    kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
+    recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())",
+                            [DRAWING_F[k] for k in ("kind", "file", "cap_src")])
+    todo = []
+    for r in recs[:limit]:
+        f = r["fields"]
+        att = (f.get(DRAWING_F["file"]) or [{}])[0]
+        if att.get("url"):
+            todo.append((r["id"], f.get(DRAWING_F["kind"]), att["url"]))
+
+    def run():
+        for rid, kind, url in todo:
+            try:
+                data = requests.get(url, timeout=120).content
+                _drawing_parse_job(rid, kind, data)
+            except Exception as e:
+                print(f"[reparse_unread_contracts] {rid} 失敗：{e}", flush=True)
+    threading.Thread(target=run, daemon=True).start()
+    return len(todo)
+
+
+@app.route("/api/procurement/drawings/reparse", methods=["POST"])
+def procurement_drawings_reparse():
+    """掛表資訊確認頁「🔁 重讀讀不到的文件」。"""
+    try:
+        return jsonify({"ok": True, "queued": _reparse_unread_contracts()})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
 
 
 def _drawing_parse_job(rid, kind, data, note=""):
