@@ -4975,7 +4975,7 @@ def _vp_requests(vendor=None, status=None):
 
 
 VP_STAGES = ["場勘", "放樣", "進場"]
-_VP_STAGE_CACHE = {"ts": 0.0, "bingo": set(), "pool": {}}
+_VP_STAGE_CACHE = {"ts": 0.0, "bingo": set(), "entered": set(), "pool": {}}
 _VP_STAGE_TTL = 600
 
 
@@ -4992,6 +4992,11 @@ def _vp_stage_cases(vendor):
                                 f"AND({{{FIELD_MS_TYPE}}}='併聯審查',NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK()))",
                                 [FIELD_MS_PROJECT_NAME])
         c["bingo"] = {r["fields"].get(FIELD_MS_PROJECT_NAME) for r in recs if r["fields"].get(FIELD_MS_PROJECT_NAME)}
+        # 進場里程碑已有完成日期 → 已進場，不再列（直接查，不靠重啟後會是空的 DATA_CACHE）
+        recs = airtable_get_all(MILESTONE_API_URL,
+                                f"AND({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}',NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK()))",
+                                [FIELD_MS_PROJECT_NAME])
+        c["entered"] = {r["fields"].get(FIELD_MS_PROJECT_NAME) for r in recs if r["fields"].get(FIELD_MS_PROJECT_NAME)}
         c["pool"] = {}
         c["ts"] = now
     if vendor not in c["pool"]:
@@ -5002,7 +5007,7 @@ def _vp_stage_cases(vendor):
                                              [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_AGREE_DATE])
     _ensure_biz_snapshots_loaded()
     cancelled = CANCELLED_CASE_CACHE["case_nos"]
-    entered = {x.get("case") for x in DATA_CACHE.get("completed") or []}
+    entered = c["entered"]
     out = []
     for r in c["pool"][vendor]:
         f = r["fields"]
@@ -5029,6 +5034,18 @@ def vendor_portal_info(token):
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     waiting = {(r["case"], t) for r in reqs if r["status"] == VP_ST_WAIT for t in r["items"]}
+    # 重啟後場勘快取是空的：先補載一次（背景已在跑就最多等 25 秒），不然「場勘」區會暫時消失
+    if SURVEY_CACHE["updated_at"] is None:
+        try:
+            if SURVEY_CACHE["refreshing"]:
+                for _ in range(25):
+                    if SURVEY_CACHE["updated_at"] is not None or not SURVEY_CACHE["refreshing"]:
+                        break
+                    time.sleep(1)
+            else:
+                refresh_survey_cache()
+        except Exception as e:
+            print(f"[vendor-portal] 補載場勘快取失敗：{e}", flush=True)
     sugg = {}
     def add(case_no, alias, address, stage, types, sel):
         if not case_no or case_no in sugg:
