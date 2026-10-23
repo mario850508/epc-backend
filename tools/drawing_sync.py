@@ -27,6 +27,9 @@ CASE_RE = re.compile(r"^\d*\s*((?:工程|潤特)[^\d_\s]+\d+號)")
 CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
 DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
 # (類型, 該類型要找的分類資料夾 04/06, 檔名關鍵字（任一）, 檔名不能有的字)
+# 沒指定資料夾時用這兩個（台電契約／細協都放這裡；排程用 sunny_contract_sync.bat，不用在 .bat 裡寫中文路徑）
+DEFAULT_ROOTS = [r"G:\共用雲端硬碟\永續電力處\02 專案\01 已上架電廠\06 潤特綠能",
+                 r"G:\共用雲端硬碟\永續電力處\02 專案\01 已上架電廠\07 陽光工程"]
 KINDS = [("審訖圖", "6", ("審訖圖",), ()), ("系統送審圖", "4", ("系統送審圖",), ()),
          # 台電契約／細部協商：整個案場資料夾（含子資料夾）都找，不限 06（cat=None）
          ("台電契約", None, ("台電契約", "購售契約", "購售電契約"), ("契約函", "契約函文", "租約", "修約")),
@@ -90,13 +93,15 @@ def pick_latest(case_dir, cat, keywords, excludes=()):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("root", nargs="+")
+    ap.add_argument("root", nargs="*", help="案場根資料夾；不給就用 DEFAULT_ROOTS")
     ap.add_argument("--case", default="")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--open-orders", action="store_true",
                     help="只同步「還沒出貨」(已成立／可能撤案) 訂單的案件，省 Airtable 空間；全部案場約 1.4GB，不建議全傳")
     ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商（掛表資訊確認的容量用）")
     args = ap.parse_args()
+    args.root = args.root or DEFAULT_ROOTS
+    log(datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + " 開始同步")
     kinds = [k for k in KINDS if k[0] in ("台電契約", "細部協商")] if args.contracts_only else KINDS
 
     try:
