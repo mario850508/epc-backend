@@ -4995,7 +4995,8 @@ def _vp_stage_cases(vendor):
         c["pool"] = {}
         c["ts"] = now
     if vendor not in c["pool"]:
-        formula = (f"AND({{{FIELD_CLOSE_STATUS}}}='進行中',{{{FIELD_HANG_METER_DATE}}}='',"
+        # 狀態選項「TRUE」跟「進行中」同色，實際是進行中的案件（例：工程桃園61號），一併納入
+        formula = (f"AND(OR({{{FIELD_CLOSE_STATUS}}}='進行中',{{{FIELD_CLOSE_STATUS}}}='TRUE'),{{{FIELD_HANG_METER_DATE}}}='',"
                    f"{{{FIELD_VENDOR}}}='{_vp_esc(vendor)}')")
         c["pool"][vendor] = airtable_get_all(CASE_API_URL, formula,
                                              [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_AGREE_DATE])
