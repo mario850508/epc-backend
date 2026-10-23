@@ -22,7 +22,7 @@ import sys
 import requests
 
 BACKEND = "https://epc-backend-4aj2.onrender.com"
-MAX_BYTES = 5 * 1024 * 1024
+MAX_BYTES = 30 * 1024 * 1024   # 2026-10-23：台電契約常 10～22MB，主控台收 30MB，超過 5MB 的由主控台只存前 6 頁
 CASE_RE = re.compile(r"^\d*\s*((?:工程|潤特)[^\d_\s]+\d+號)")
 CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
 DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
@@ -158,16 +158,12 @@ def main():
                 with open(path, "rb") as f:
                     data = base64.b64encode(f.read()).decode()
                 try:
-                    r = api("POST", "/api/procurement/drawings/sync", timeout=180, json={
+                    r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
                         "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
                     if r.status_code >= 400:
                         raise Exception(r.text[:200])
                     j = r.json()
-                    info = ""
-                    if kind == "工程合約":
-                        info = f"（容量 {j.get('capacity')} kW、電價 {j.get('price')}、單價 {j.get('unit_price')}）" if j.get("capacity") or j.get("price") else f"（{j.get('capacity_src')}）"
-                    elif kind in CONTRACT_KINDS:
-                        info = f"（容量 {j.get('capacity')} kW）" if j.get("capacity") else f"（{j.get('capacity_src')}）"
+                    info = ("（容量／電價主控台背景讀取中）" if j.get("parsing") else "") + (j.get("note") or "")
                     log(f"  ✓ {case_no} {kind}：{fn}{info}")
                     up += 1
                 except Exception as e:
@@ -175,7 +171,7 @@ def main():
                     fail += 1
     log(f"\n完成：上傳 {up}、沒變略過 {skip}、失敗 {fail}")
     if too_big:
-        log(f"\n超過 5MB 沒上傳（{len(too_big)} 份）：")
+        log(f"\n超過 30MB 沒上傳（{len(too_big)} 份）：")
         for c, k, fn, mb in too_big:
             log(f"  {c} {k}：{fn}（{mb}MB）")
     return 0

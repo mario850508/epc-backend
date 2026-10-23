@@ -8131,7 +8131,9 @@ def procurement_drawings_index():
 
 @app.route("/api/procurement/drawings/sync", methods=["POST"])
 def procurement_drawings_sync():
-    """body: {case_no, kind(審訖圖|系統送審圖), filename, doc_date, src_path, mtime, data(base64)}；同案同類型只留最新一份。"""
+    """body: {case_no, kind(DRAWING_KINDS), filename, doc_date, src_path, mtime, data(base64)}；同案同類型只留最新一份。
+    2026-10-23：台電契約常常 10～22MB → 收到 30MB；超過 5MB 的只存前 6 頁當附件（不夠小再縮）。
+    台電契約／細協／工程合約的容量、電價改在背景讀（OCR 要 10～40 秒，不能卡住請求），讀完寫回這筆。"""
     body = request.get_json(force=True) or {}
     case_no, kind = (body.get("case_no") or "").strip(), (body.get("kind") or "").strip()
     if not case_no or kind not in DRAWING_KINDS:
@@ -8142,41 +8144,86 @@ def procurement_drawings_sync():
         return jsonify({"error": "檔案內容不是 base64"}), 400
     if not data.startswith(b"%PDF"):
         return jsonify({"error": "不是 PDF"}), 400
-    if len(data) > PDF_MAX_BYTES:
-        return jsonify({"error": "超過 5MB（Airtable 單檔上傳上限）"}), 413
+    if len(data) > PDF_UPLOAD_MAX_BYTES:
+        return jsonify({"error": "超過 30MB"}), 413
     filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
     key = f"{case_no}|{kind}"
-    cap = cap_src = None
-    extra = {}
-    if kind in CONTRACT_KINDS:
-        cap, cap_src, text = _contract_capacity_from_pdf(data, kind)
-        extra = {DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: cap_src, DRAWING_F["text"]: text[:3000]}
-    elif kind == ENG_KIND:
-        text, err = _doc_pdf_text(data, "躉購電價")
-        ev = _eng_contract_values(text) if text.strip() else {"cap": None, "price": None, "unit_price": None, "src": err or "PDF 裡沒有文字"}
-        cap, cap_src = ev["cap"], ev["src"]
-        extra = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
-                 DRAWING_F["cap_src"]: ev["src"][:200], DRAWING_F["text"]: text[:3000]}
+    parse = kind in CONTRACT_KINDS or kind == ENG_KIND
+    head = _pdf_first_pages(data, 6) if parse or len(data) > PDF_MAX_BYTES else data   # 讀數字只要前幾頁
+    store, note = data, ""
+    if len(data) > PDF_MAX_BYTES:
+        store, note = head, "（原檔太大，只存前 6 頁）"
+        if len(store) > PDF_MAX_BYTES:
+            try:
+                store, _ = _pdf_shrink(store)
+            except Exception as e:
+                print(f"[drawings_sync] 縮小失敗：{e}", flush=True)
+        if len(store) > PDF_MAX_BYTES:
+            store, note = None, "（原檔太大，沒存附件）"
     try:
         old = airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["key"] + "}='" + key.replace("'", chr(92) + "'") + "'", [DRAWING_F["key"]])
         resp = requests.post(DRAWING_API_URL, headers=airtable_headers(), json={"fields": {
             DRAWING_F["key"]: key, DRAWING_F["case_no"]: case_no, DRAWING_F["kind"]: kind, DRAWING_F["filename"]: filename,
             DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
-            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024), **extra}}, timeout=30)
+            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024),
+            **({DRAWING_F["cap_src"]: "讀取中…" + note} if parse else {})}}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)
         rid = resp.json()["id"]
-        try:
-            upload_attachment_to_ops_record(rid, DRAWING_F["file"], base64.b64encode(data).decode(), filename, content_type="application/pdf")
-        except Exception:
-            requests.delete(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
-            raise
+        if store is not None:
+            try:
+                upload_attachment_to_ops_record(rid, DRAWING_F["file"], base64.b64encode(store).decode(), filename, content_type="application/pdf")
+            except Exception:
+                requests.delete(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+                raise
         for o in old:   # 新的上傳成功後才刪舊的
             requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
-        return jsonify({"ok": True, "id": rid, "replaced": len(old), "capacity": cap, "capacity_src": cap_src,
-                        "price": extra.get(DRAWING_F["price"]), "unit_price": extra.get(DRAWING_F["unit_price"])})
+        if parse:
+            threading.Thread(target=_drawing_parse_job, args=(rid, kind, head, note), daemon=True).start()
+        return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": parse, "note": note})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
+
+
+_DRAWING_PARSE_LOCK = threading.Lock()   # 背景 OCR 一次一份，避免同時一堆大檔吃光記憶體
+
+
+def _pdf_first_pages(data, n):
+    """PDF 只留前 n 頁（不重新壓圖，很快）；失敗就回原檔。"""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(data))
+        if len(reader.pages) <= n:
+            return data
+        writer = PdfWriter()
+        for pg in reader.pages[:n]:
+            writer.add_page(pg)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception as e:
+        print(f"[pdf_first_pages] {e}", flush=True)
+        return data
+
+
+def _drawing_parse_job(rid, kind, data, note=""):
+    """背景讀台電契約／細協的容量、工程合約的容量／電價／單價，寫回案場圖面表這筆。"""
+    with _DRAWING_PARSE_LOCK:
+        try:
+            if kind == ENG_KIND:
+                text, err = _doc_pdf_text(data, "躉購電價")
+                ev = _eng_contract_values(text) if text.strip() else {"cap": None, "price": None, "unit_price": None, "src": err or "PDF 裡沒有文字"}
+                fields = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
+                          DRAWING_F["cap_src"]: (ev["src"] + note)[:200], DRAWING_F["text"]: text[:3000]}
+            else:
+                cap, src, text = _contract_capacity_from_pdf(data, kind)
+                fields = {DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: ((src or "") + note)[:200], DRAWING_F["text"]: text[:3000]}
+        except Exception as e:
+            fields = {DRAWING_F["cap_src"]: ("讀取失敗：" + str(e))[:200]}
+        try:
+            requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        except Exception as e:
+            print(f"[drawing_parse_job] 寫回 {rid} 失敗：{e}", flush=True)
 
 
 def _case_drawings_from_sync(case_no):
