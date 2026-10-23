@@ -8532,11 +8532,12 @@ def _eng_contract_values(text):
 def procurement_drawings_index():
     """本機同步程式用：目前已上傳的圖面（案號＋類型＋檔名＋來源修改時間），沒變的就不重傳。"""
     try:
-        recs = airtable_get_all(DRAWING_API_URL, None, [DRAWING_F[k] for k in ("key", "case_no", "kind", "filename", "mtime", "doc_date")])
+        recs = airtable_get_all(DRAWING_API_URL, None, [DRAWING_F[k] for k in ("key", "case_no", "kind", "filename", "mtime", "doc_date", "size_kb")])
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"items": [{"id": r["id"], "key": r["fields"].get(DRAWING_F["key"], ""), "filename": r["fields"].get(DRAWING_F["filename"], ""),
-                               "mtime": r["fields"].get(DRAWING_F["mtime"], ""), "doc_date": r["fields"].get(DRAWING_F["doc_date"], "")} for r in recs]})
+                               "mtime": r["fields"].get(DRAWING_F["mtime"], ""), "doc_date": r["fields"].get(DRAWING_F["doc_date"], ""),
+                               "size_kb": r["fields"].get(DRAWING_F["size_kb"])} for r in recs]})
 
 
 @app.route("/api/procurement/drawings/sync", methods=["POST"])
@@ -8575,7 +8576,8 @@ def procurement_drawings_sync():
         resp = requests.post(DRAWING_API_URL, headers=airtable_headers(), json={"fields": {
             DRAWING_F["key"]: key, DRAWING_F["case_no"]: case_no, DRAWING_F["kind"]: kind, DRAWING_F["filename"]: filename,
             DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
-            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024),
+            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30],
+            DRAWING_F["size_kb"]: round((body.get("orig_size") or len(data)) / 1024),   # 原檔大小（本機切過頁也記原檔），同步程式比對用
             **({DRAWING_F["cap_src"]: "讀取中…" + note} if parse else {})}}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)

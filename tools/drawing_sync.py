@@ -169,10 +169,12 @@ def main():
                 doc_date, mtime, path, fn = best
                 mt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
                 old = idx.get(f"{case_no}|{kind}")
-                if old and old.get("filename") == fn and old.get("mtime") == mt:
+                size = os.path.getsize(path)
+                # 檔名一樣，而且（修改時間一樣 或 大小一樣）就當沒變。G 槽（Google 雲端硬碟）回報的修改時間偶爾會跳，
+                # 2026-10-24 只靠修改時間時，台電契約／細協被整批重傳。
+                if old and old.get("filename") == fn and (old.get("mtime") == mt or old.get("size_kb") == round(size / 1024)):
                     skip += 1
                     continue
-                size = os.path.getsize(path)
                 data_bytes = None
                 if size > MAX_BYTES:
                     try:
@@ -192,7 +194,8 @@ def main():
                 data = base64.b64encode(data_bytes).decode()
                 try:
                     r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
-                        "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
+                        "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
+                        "orig_size": size, "data": data})
                     if r.status_code >= 400:
                         raise Exception(r.text[:200])
                     j = r.json()
