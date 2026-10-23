@@ -13572,8 +13572,12 @@ def _mc_doc_capacities(case_nos):
     for cn, lst in found.items():
         # 有讀到容量的優先；再來台電契約 > 細部協商；同類型日期新的優先
         lst.sort(key=lambda x: x[1], reverse=True)
+        files = {}   # 懸浮視窗用：每種文件各一份（日期最新、有附件的）
+        for _, _, info in lst:
+            if info["file_url"] and info["kind"] not in files:
+                files[info["kind"]] = info
         lst.sort(key=lambda x: (x[2]["value"] is None, x[0]))
-        out[cn] = lst[0][2]
+        out[cn] = {**lst[0][2], "files": files}
     return out
 
 
