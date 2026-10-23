@@ -4904,7 +4904,8 @@ VP_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{VP_TABLE_ID}"
 VP_F = {"key": "fldXo3w7bOqOaAgzG", "vendor": "fldjwNbMAjseosMfD", "case_no": "fldLsasSQhNFqZwio", "alias": "fld28F0iIOOGfpTJu",
         "items": "fldcZdBiOSxqybRQM", "dates": "fld8MyojY9L8UDmmS", "time_pref": "fldfO9kMLVejcD0ku", "note": "fldAkeTqoMJduwZdO",
         "contact": "fldp6WmjwmZRANjlr", "status": "fldY6g39Cavs223PW", "reply": "fldHnQWMNJmpr2iUj", "task_id": "fldgtaU2fITrdXqOu",
-        "submitted_at": "fldWC6a7xy8IXqiIy", "handled_at": "fldsM4ZiRV0le04XF"}
+        "submitted_at": "fldWC6a7xy8IXqiIy", "handled_at": "fldsM4ZiRV0le04XF",
+        "weekdays": "fld9pKSVgbC4iCyQh"}   # 2026-10-23 星期偏好 JSON：{"ok":[1,3],"no":[2],"within":14}（0＝週一…6＝週日）
 VP_ST_WAIT, VP_ST_TASK, VP_ST_REJECT, VP_ST_CANCEL = "待處理", "已轉任務", "已退回", "已取消"
 VP_VENDORS = ["三創", "尚展", "曙光", "光鼎", "宇陽達", "聚曜", "澄品", "大昇", "展亦", "凰太竹", "國欽", "振庭"]
 VP_TYPES = ["場勘", "放樣", "植筋", "進場", "掛表"]
@@ -4963,10 +4964,46 @@ def _vp_case_of_vendor(vendor, case_no):
     return None
 
 
+_VP_WD = ["一", "二", "三", "四", "五", "六", "日"]
+_VP_WITHIN = {7: "一週內", 14: "兩週內", 30: "一個月內", 60: "兩個月內"}
+
+
+def _vp_weekdays_clean(raw):
+    """廠商送來的星期偏好 → {"ok":[0-6], "no":[0-6], "within":天數}；沒有任何偏好回 None。"""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    ok = sorted({int(x) for x in (raw.get("ok") or []) if str(x).isdigit() and 0 <= int(x) <= 6})
+    no = sorted({int(x) for x in (raw.get("no") or []) if str(x).isdigit() and 0 <= int(x) <= 6} - set(ok))
+    if not ok and not no:
+        return None
+    try:
+        within = int(raw.get("within") or 14)
+    except (TypeError, ValueError):
+        within = 14
+    return {"ok": ok, "no": no, "within": within if within in _VP_WITHIN else 14}
+
+
+def _vp_weekdays_text(wd):
+    if not wd:
+        return ""
+    parts = []
+    if wd["ok"]:
+        parts.append("每週" + "、".join("週" + _VP_WD[i] for i in wd["ok"]) + "可以")
+    if wd["no"]:
+        parts.append("不行：" + "、".join("週" + _VP_WD[i] for i in wd["no"]))
+    return "；".join(parts) + f"（{_VP_WITHIN.get(wd['within'], '兩週內')}）"
+
+
 def _vp_request_dict(r):
     f = r.get("fields", {})
     g = lambda k: f.get(VP_F[k]) or ""
-    return {"id": r["id"], "vendor": g("vendor"), "case": g("case_no"), "alias": g("alias"),
+    wd = _vp_weekdays_clean(g("weekdays"))
+    return {"weekdays": wd, "weekdays_text": _vp_weekdays_text(wd),"id": r["id"], "vendor": g("vendor"), "case": g("case_no"), "alias": g("alias"),
             "items": [x for x in g("items").split("、") if x], "dates": [x for x in g("dates").split(",") if x],
             "time_pref": g("time_pref"), "note": g("note"), "contact": g("contact"), "status": g("status") or VP_ST_WAIT,
             "reply": g("reply"), "task_id": g("task_id"), "submitted_at": g("submitted_at"), "handled_at": g("handled_at")}
@@ -5041,6 +5078,45 @@ def _vp_stage_cases(vendor):
     return out
 
 
+def _vp_contacts_get(vendor):
+    try:
+        raw = _state_get_long(f"vp_contacts|{vendor}")
+        data = json.loads(raw) if raw else []
+    except Exception as e:
+        print(f"[vendor-portal] 讀聯絡人失敗：{e}", flush=True)
+        return []
+    return [c for c in data if isinstance(c, dict) and c.get("id") and (c.get("name") or c.get("phone"))][:20]
+
+
+@app.route("/api/vendor-portal/<token>/contacts", methods=["POST"])
+def vendor_portal_contacts(token):
+    """常用聯絡人：body {action:"add", name, phone} 或 {action:"remove", id}。每家廠商一份，所有人共用。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    body = request.get_json(silent=True) or {}
+    contacts = _vp_contacts_get(vendor)
+    if body.get("action") == "remove":
+        contacts = [c for c in contacts if c["id"] != body.get("id")]
+    elif body.get("action") == "add":
+        name = re.sub(r"\s+", " ", str(body.get("name") or "")).strip()[:20]
+        phone = re.sub(r"\s+", " ", str(body.get("phone") or "")).strip()[:30]
+        if not name and not phone:
+            return jsonify({"error": "請填聯絡人姓名或電話"}), 400
+        if any(c.get("name") == name and c.get("phone") == phone for c in contacts):
+            return jsonify({"ok": True, "contacts": contacts})
+        if len(contacts) >= 20:
+            return jsonify({"error": "常用聯絡人最多 20 位，請先刪除不用的"}), 400
+        contacts.append({"id": secrets.token_urlsafe(6), "name": name, "phone": phone})
+    else:
+        return jsonify({"error": "action 只能是 add／remove"}), 400
+    try:
+        _state_set_long(f"vp_contacts|{vendor}", json.dumps(contacts, ensure_ascii=False))
+    except Exception as e:
+        return jsonify({"error": f"儲存失敗：{e}"}), 502
+    return jsonify({"ok": True, "contacts": contacts})
+
+
 @app.route("/api/vendor-portal/<token>/info")
 def vendor_portal_info(token):
     vendor = _vp_vendor_from_token(token)
@@ -5092,7 +5168,7 @@ def vendor_portal_info(token):
     except Exception as e:
         print(f"[vendor-portal] 查已排定時段失敗：{e}", flush=True)
     order = {s: i for i, s in enumerate(VP_STAGES)}
-    return jsonify({"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES,
+    return jsonify({"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES, "contacts": _vp_contacts_get(vendor),
                     "suggestions": sorted(sugg.values(), key=lambda e: (order.get(e["stage"], 9), e["case"])),
                     "requests": reqs, "bookings": bookings})
 
@@ -5141,8 +5217,9 @@ def vendor_portal_submit(token):
     dates.sort()
     if not case_no or not items:
         return jsonify({"error": "請選擇案號，並勾選要預約的項目"}), 400
-    if not dates:
-        return jsonify({"error": "請至少填一個希望的日期（今天以後）"}), 400
+    weekdays = _vp_weekdays_clean(body.get("weekdays"))
+    if not dates and not weekdays:
+        return jsonify({"error": "請至少填一個希望的日期（今天以後），或選擇可以／不行的星期"}), 400
     c = _vp_case_of_vendor(vendor, case_no)
     if not c:
         return jsonify({"error": f"找不到「{case_no}」，或這個案號不是{vendor}的案件，請重新搜尋後選擇"}), 403
@@ -5160,13 +5237,15 @@ def vendor_portal_submit(token):
               VP_F["alias"]: c["alias"], VP_F["items"]: "、".join(items), VP_F["dates"]: ",".join(dates),
               VP_F["time_pref"]: (body.get("time_pref") or "").strip()[:60], VP_F["note"]: (body.get("note") or "").strip()[:800],
               VP_F["contact"]: (body.get("contact") or "").strip()[:60], VP_F["status"]: VP_ST_WAIT, VP_F["submitted_at"]: now}
+    if weekdays:
+        fields[VP_F["weekdays"]] = json.dumps(weekdays, ensure_ascii=False)
     resp = requests.post(VP_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
     if resp.status_code >= 400:
         return jsonify({"error": "儲存失敗，請稍後再試", "detail": resp.text[:200]}), 502
     try:
         wd = lambda d: _wd_label(d)
         card = _card("🏗️ 廠商預約申請", "#7C3AED", f"{vendor}｜{case_no} {c['alias']}".strip(), "",
-                     rows=[("項目", "、".join(items)), ("希望日期", "、".join(wd(d) for d in dates)),
+                     rows=[("項目", "、".join(items)), ("希望日期", "、".join(wd(d) for d in dates)), ("希望星期", _vp_weekdays_text(weekdays)),
                            ("希望時段", fields[VP_F["time_pref"]]), ("備註", fields[VP_F["note"]]), ("聯絡人", fields[VP_F["contact"]])],
                      button=("到主控台處理", _dash_url() + "/#slots-requests"), footer="主控台「廠商時段協調 → 廠商申請」可轉成指派任務或退回。")
         _line_push_card(card)
