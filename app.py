@@ -8031,10 +8031,13 @@ DRAWING_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{DRAWING_TABLE_ID}"
 DRAWING_F = {"key": "fldFRnNFLJ0O23ozF", "case_no": "fldDPePQKWpuWUT2t", "kind": "fld3LmClJqCLz4CYT", "filename": "fldGMpjJsHe5devyy",
              "doc_date": "fldvGRAr2stcMs6Q3", "file": "flddvWz9R8DgZ0r7x", "src_path": "fldZvHi1xnvbQTpel",
              "mtime": "fld8x8HmjyfsCnko8", "size_kb": "fldyDSeOLze1VoClW",
-             "cap": "fldmW0clYf0kURjci", "cap_src": "fldUS2ZHK8m84yj2C"}
+             "cap": "fldmW0clYf0kURjci", "cap_src": "fldUS2ZHK8m84yj2C",
+             "price": "fldRYllqHOgNJ88XR", "unit_price": "fldQn3CMIcspK7szP", "text": "fldgnC30TIZmNHUTs"}
 # 2026-10-22：台電契約／細部協商也從 G 槽同步上來，上傳時讀出總裝置容量（掛表資訊確認的容量確認用）
 CONTRACT_KINDS = ("台電契約", "細部協商")
-DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS
+# 2026-10-23：03 資料夾的工程合約（跟 EPC 簽的；容量、躉購電價、工程單價）＝掛表資訊確認的比對基準
+ENG_KIND = "工程合約"
+DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS + (ENG_KIND,)
 _CAP_NUM = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
 
 
@@ -8061,18 +8064,57 @@ def _contract_capacity(text, kind):
     return None, "文件裡找不到「總裝置容量」"
 
 
-def _contract_capacity_from_pdf(data, kind):
-    """PDF → (容量, 依據)。先讀文字層，掃描檔再用 PDF 公文更名設定的 Google OCR；讀不到不擋上傳。"""
+def _doc_pdf_text(data, need):
+    """PDF 文字：先讀文字層，沒有 need 這幾個字（掃描檔）再用 PDF 公文更名設定的 Google OCR。回傳 (文字, 問題說明)。"""
     try:
         text = _pdf_text_layer(data)
-        if "總裝置容量" not in text:   # 掃描檔（或文字層沒有這段）→ OCR
-            url = (_pdf_settings().get("ocr_url") or "").strip()
-            if not url:
-                return _contract_capacity(text, kind) if text.strip() else (None, "掃描檔，沒有設定 Google OCR")
-            text = _pdf_ocr(data, url)
-        return _contract_capacity(text, kind)
+        if need in text:
+            return text, ""
+        url = (_pdf_settings().get("ocr_url") or "").strip()
+        if not url:
+            return text, "掃描檔，沒有設定 Google OCR"
+        return _pdf_ocr(data, url), ""
     except Exception as e:
-        return None, ("讀檔失敗：" + str(e))[:80]
+        return "", ("讀檔失敗：" + str(e))[:80]
+
+
+def _contract_capacity_from_pdf(data, kind):
+    """PDF → (容量, 依據, 文字)。讀不到不擋上傳。"""
+    text, err = _doc_pdf_text(data, "總裝置容量")
+    if not text.strip():
+        return None, err or "PDF 裡沒有文字", ""
+    v, src = _contract_capacity(text, kind)
+    return v, src, text
+
+
+def _eng_contract_values(text):
+    """工程合約（03 資料夾）→ {cap, price, unit_price, total, src}。掃描檔 OCR 的表格常常整欄先出標籤、
+    再出數值，所以不靠「標籤緊接數值」，改看數字格式：
+      容量＝「設置容量 19 kWp」（沒有就封面「19 kWp」，數字直接接 kWp、前面不是「/」）；
+      電價＝「躉購電價 6.5777 元」（沒有就第一個 3～9 開頭、4 位小數的數字）；
+      單價＝「38,000 元/kWp」；總價＝「758,100 元（含稅）」。"""
+    t = (text or "").replace("：", ":").replace("（", "(").replace("）", ")").replace("　", " ").replace("／", "/")
+    t = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", t)
+    t = re.sub(r"(?<=\d)\s*,\s*(?=\d{3}(?!\d))", ",", t)
+    num = lambda s: float(s.replace(",", ""))
+    out = {"cap": None, "price": None, "unit_price": None, "total": None, "src": []}
+
+    m = re.search(r"設置容量\s*:?\s*([\d,]+(?:\.\d+)?)\s*[kK][wW]", t) or \
+        re.search(r"(?<![/\d.])([\d,]+(?:\.\d+)?)\s*[kK][wW][pP]?(?!\s*\))", t)
+    if m:
+        out["cap"] = num(m.group(1)); out["src"].append("容量 " + m.group(1) + " kWp")
+    m = re.search(r"躉購電價\s*:?\s*(\d+\.\d{3,4})", t) or re.search(r"(?<![\d.,])([3-9]\.\d{4})(?!\d)", t)
+    if m:
+        out["price"] = num(m.group(1)); out["src"].append("電價 " + m.group(1))
+    m = re.search(r"([\d,]{4,})\s*元\s*/\s*[kK][wW]", t)
+    if m:
+        out["unit_price"] = num(m.group(1)); out["src"].append("單價 " + m.group(1) + "/kWp")
+    m = re.search(r"工程總價\s*:?\s*(?:新台幣|新臺幣)?\s*([\d,]{5,})\s*元", t) or re.search(r"([\d,]{6,})\s*元\s*\(\s*含稅", t)
+    if m:
+        out["total"] = num(m.group(1))
+    out["src"] = "、".join(out["src"]) or "合約裡找不到容量／電價"
+    return out
+
 
 
 
@@ -8105,15 +8147,22 @@ def procurement_drawings_sync():
     filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
     key = f"{case_no}|{kind}"
     cap = cap_src = None
+    extra = {}
     if kind in CONTRACT_KINDS:
-        cap, cap_src = _contract_capacity_from_pdf(data, kind)
+        cap, cap_src, text = _contract_capacity_from_pdf(data, kind)
+        extra = {DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: cap_src, DRAWING_F["text"]: text[:3000]}
+    elif kind == ENG_KIND:
+        text, err = _doc_pdf_text(data, "躉購電價")
+        ev = _eng_contract_values(text) if text.strip() else {"cap": None, "price": None, "unit_price": None, "src": err or "PDF 裡沒有文字"}
+        cap, cap_src = ev["cap"], ev["src"]
+        extra = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
+                 DRAWING_F["cap_src"]: ev["src"][:200], DRAWING_F["text"]: text[:3000]}
     try:
         old = airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["key"] + "}='" + key.replace("'", chr(92) + "'") + "'", [DRAWING_F["key"]])
         resp = requests.post(DRAWING_API_URL, headers=airtable_headers(), json={"fields": {
             DRAWING_F["key"]: key, DRAWING_F["case_no"]: case_no, DRAWING_F["kind"]: kind, DRAWING_F["filename"]: filename,
             DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
-            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024),
-            **({DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: cap_src} if kind in CONTRACT_KINDS else {})}}, timeout=30)
+            DRAWING_F["mtime"]: (body.get("mtime") or "")[:30], DRAWING_F["size_kb"]: round(len(data) / 1024), **extra}}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)
         rid = resp.json()["id"]
@@ -8124,7 +8173,8 @@ def procurement_drawings_sync():
             raise
         for o in old:   # 新的上傳成功後才刪舊的
             requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
-        return jsonify({"ok": True, "id": rid, "replaced": len(old), "capacity": cap, "capacity_src": cap_src})
+        return jsonify({"ok": True, "id": rid, "replaced": len(old), "capacity": cap, "capacity_src": cap_src,
+                        "price": extra.get(DRAWING_F["price"]), "unit_price": extra.get(DRAWING_F["unit_price"])})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
 
@@ -8136,7 +8186,7 @@ def _case_drawings_from_sync(case_no):
     for r in recs:
         f = r["fields"]
         att = (f.get(DRAWING_F["file"]) or [{}])[0]
-        if not att.get("url") or f.get(DRAWING_F["kind"]) in CONTRACT_KINDS:
+        if not att.get("url") or f.get(DRAWING_F["kind"]) in CONTRACT_KINDS + (ENG_KIND,):
             continue
         out.append({"id": r["id"], "doc_type": f.get(DRAWING_F["kind"], ""), "doc_date": f.get(DRAWING_F["doc_date"], ""), "status": "G槽",
                     "name": f.get(DRAWING_F["filename"], "") or att.get("filename", ""), "ext": "pdf", "file_url": att["url"]})
@@ -13121,6 +13171,46 @@ def _mc_doc_capacities(case_nos):
     return out
 
 
+def _mc_eng_contracts(case_nos):
+    """{案號: {cap, price, unit_price, date, src, origin, filename, file_url}}：工程合約（同案取日期最新）。
+    來源：案場圖面表（G 槽同步、上傳時已讀出）＋ PDF 公文更名的工程合約（用辨識文字摘錄）。"""
+    found = {}
+    esc = lambda n: n.replace("'", chr(92) + "'")
+    for i in range(0, len(case_nos), 40):
+        chunk = case_nos[i:i + 40]
+        try:
+            for r in airtable_get_all(DRAWING_API_URL, "AND({" + DRAWING_F["kind"] + "}='" + ENG_KIND + "',OR(" + ",".join("{" + DRAWING_F["case_no"] + "}='" + esc(n) + "'" for n in chunk) + "))",
+                                      [DRAWING_F[k] for k in ("case_no", "doc_date", "filename", "file", "cap", "price", "unit_price", "cap_src")]):
+                f = r["fields"]
+                found.setdefault(f.get(DRAWING_F["case_no"], ""), []).append({
+                    "cap": f.get(DRAWING_F["cap"]), "price": f.get(DRAWING_F["price"]), "unit_price": f.get(DRAWING_F["unit_price"]),
+                    "date": f.get(DRAWING_F["doc_date"], ""), "src": f.get(DRAWING_F["cap_src"]) or "", "origin": "G槽",
+                    "filename": f.get(DRAWING_F["filename"], ""), "file_url": ((f.get(DRAWING_F["file"]) or [{}])[0]).get("url", "")})
+        except Exception as e:
+            print(f"[_mc_eng_contracts] 案場圖面表查詢失敗：{e}", flush=True)
+        try:
+            for r in airtable_get_all(PDF_API_URL, "AND({" + PDF_F["doc_type"] + "}='" + ENG_KIND + "',OR(" + ",".join("{" + PDF_F["case_no"] + "}='" + esc(n) + "'" for n in chunk) + "))",
+                                      [PDF_F[k] for k in ("case_no", "doc_date", "final_name", "file", "result_json")]):
+                f = r["fields"]
+                try:
+                    text = json.loads(f.get(PDF_F["result_json"]) or "{}").get("text_excerpt", "")
+                except ValueError:
+                    text = ""
+                ev = _eng_contract_values(text)
+                found.setdefault(f.get(PDF_F["case_no"], ""), []).append({
+                    "cap": ev["cap"], "price": ev["price"], "unit_price": ev["unit_price"], "date": f.get(PDF_F["doc_date"], ""),
+                    "src": ev["src"], "origin": "公文更名", "filename": f.get(PDF_F["final_name"], ""),
+                    "file_url": ((f.get(PDF_F["file"]) or [{}])[0]).get("url", "")})
+        except Exception as e:
+            print(f"[_mc_eng_contracts] PDF 公文更名查詢失敗：{e}", flush=True)
+    out = {}
+    for cn, lst in found.items():
+        lst.sort(key=lambda x: x["date"] or "", reverse=True)
+        lst.sort(key=lambda x: x["cap"] is None and x["price"] is None)   # 有讀到數字的優先
+        out[cn] = lst[0]
+    return out
+
+
 @app.route("/api/meter-check", methods=["GET"])
 def get_meter_check():
     """?month=YYYY-MM → 當月掛表案件（依掛表日期排序）＋人工確認值、當月撤案案件。"""
@@ -13154,9 +13244,10 @@ def get_meter_check():
             }
 
         doc_caps = _mc_doc_capacities([c["case_no"] for c in cases.values() if c["case_no"]])
+        engs = _mc_eng_contracts([c["case_no"] for c in cases.values() if c["case_no"]])
         rows = []
         for cid, c in cases.items():
-            rows.append({**c, "meter_date": meter_date.get(cid, ""), "doc_cap": doc_caps.get(c["case_no"]),
+            rows.append({**c, "meter_date": meter_date.get(cid, ""), "doc_cap": doc_caps.get(c["case_no"]), "eng": engs.get(c["case_no"]),
                          **chk.get(("掛表", c["case_no"]), {"check_id": None, "cap_confirm": None, "price_confirm": None,
                                                            "note": "", "by": "", "updated": "", "contract_cap": None,
                                                            "contract_price": None, "adj_status": ""})})

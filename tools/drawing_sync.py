@@ -2,7 +2,7 @@
 """
 把 G 槽各案場的「審訖圖」（06 政府函文及相關文件）和「系統送審圖」（04 電廠設計圖）同步到主控台，
 讓「採購專區 → 訂單查詢」點進案件時可以直接對照圖面。
-2026-10-22 起也同步 06 裡的「台電契約」「細部協商」：主控台上傳時讀出總裝置容量，給「掛表資訊確認」的容量確認用。
+2026-10-22 起也同步「台電契約」「細部協商」、10-23 起同步 03 的「工程合約」：主控台上傳時讀出容量／電價，給「掛表資訊確認」比對用。
 
   py drawing_sync.py "G:\\共用雲端硬碟\\永續電力處\\02 專案\\01 已上架電廠"            # 掃全部
   py drawing_sync.py "<root>" --case 工程宜蘭9號                                       # 只同步一案
@@ -33,7 +33,10 @@ DEFAULT_ROOTS = [r"G:\共用雲端硬碟\永續電力處\02 專案\01 已上架�
 KINDS = [("審訖圖", "6", ("審訖圖",), ()), ("系統送審圖", "4", ("系統送審圖",), ()),
          # 台電契約／細部協商：整個案場資料夾（含子資料夾）都找，不限 06（cat=None）
          ("台電契約", None, ("台電契約", "購售契約", "購售電契約"), ("契約函", "契約函文", "租約", "修約")),
-         ("細部協商", None, ("細部協商", "細協"), ("補件",))]
+         ("細部協商", None, ("細部協商", "細協"), ("補件",)),
+         # 2026-10-23：03 資料夾的工程合約（跟 EPC 簽的容量、躉購電價、工程單價）＝掛表資訊確認的比對基準
+         ("工程合約", None, ("工程合約", "工程契約"), ())]
+CONTRACT_KINDS = ("台電契約", "細部協商", "工程合約")
 
 
 try:
@@ -98,11 +101,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--open-orders", action="store_true",
                     help="只同步「還沒出貨」(已成立／可能撤案) 訂單的案件，省 Airtable 空間；全部案場約 1.4GB，不建議全傳")
-    ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商（掛表資訊確認的容量用）")
+    ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商／工程合約（掛表資訊確認用）")
     args = ap.parse_args()
     args.root = args.root or DEFAULT_ROOTS
     log(datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + " 開始同步")
-    kinds = [k for k in KINDS if k[0] in ("台電契約", "細部協商")] if args.contracts_only else KINDS
+    kinds = [k for k in KINDS if k[0] in CONTRACT_KINDS] if args.contracts_only else KINDS
 
     try:
         idx = {i["key"]: i for i in api("GET", "/api/procurement/drawings/index").json().get("items", [])}
@@ -159,8 +162,13 @@ def main():
                         "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
                     if r.status_code >= 400:
                         raise Exception(r.text[:200])
-                    cap = r.json().get("capacity") if kind in ("台電契約", "細部協商") else None
-                    log(f"  ✓ {case_no} {kind}：{fn}" + (f"（容量 {cap} kW）" if cap else (f"（{r.json().get('capacity_src')}）" if kind in ("台電契約", "細部協商") else "")))
+                    j = r.json()
+                    info = ""
+                    if kind == "工程合約":
+                        info = f"（容量 {j.get('capacity')} kW、電價 {j.get('price')}、單價 {j.get('unit_price')}）" if j.get("capacity") or j.get("price") else f"（{j.get('capacity_src')}）"
+                    elif kind in CONTRACT_KINDS:
+                        info = f"（容量 {j.get('capacity')} kW）" if j.get("capacity") else f"（{j.get('capacity_src')}）"
+                    log(f"  ✓ {case_no} {kind}：{fn}{info}")
                     up += 1
                 except Exception as e:
                     log(f"  ✗ {case_no} {kind}：{fn} 上傳失敗：{e}")
