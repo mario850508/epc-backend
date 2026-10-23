@@ -4979,8 +4979,8 @@ def _vp_requests(vendor=None, status=None):
     return out
 
 
-VP_STAGES = ["場勘", "放樣", "進場"]
-_VP_STAGE_CACHE = {"ts": 0.0, "bingo": set(), "entered": set(), "pool": {}}
+VP_STAGES = ["場勘", "放樣", "進場", "掛表"]
+_VP_STAGE_CACHE = {"ts": 0.0, "bingo": set(), "entered": {}, "pool": {}}
 _VP_STAGE_TTL = 600
 
 
@@ -4988,8 +4988,9 @@ def _vp_stage_cases(vendor):
     """廠商預約頁「待安排案件」依案件進度分階段（使用者 2026-10-23 定義）：
     還沒送併聯審查 → 場勘（由 SURVEY_CACHE 提供，不在這裡）；
     已取得併聯審查（完成日期）、還沒同備 → 放樣；
-    已取得同備 → 進場（也可以預約放樣）。
-    只列進行中、還沒掛表、非撤案的案件；進場已完成的不列。10 分鐘快取。"""
+    已取得同備 → 進場（也可以預約放樣）；
+    進場已完成（進場里程碑完成日期今天或以前）、還沒掛表 → 掛表。進場日期在未來（已預約、還沒施工）的不列。
+    只列進行中、還沒掛表、非撤案的案件。10 分鐘快取。"""
     now = time.time()
     c = _VP_STAGE_CACHE
     if now - c["ts"] > _VP_STAGE_TTL:
@@ -5000,8 +5001,9 @@ def _vp_stage_cases(vendor):
         # 進場里程碑已有完成日期 → 已進場，不再列（直接查，不靠重啟後會是空的 DATA_CACHE）
         recs = airtable_get_all(MILESTONE_API_URL,
                                 f"AND({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_ENTRY}',NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK()))",
-                                [FIELD_MS_PROJECT_NAME])
-        c["entered"] = {r["fields"].get(FIELD_MS_PROJECT_NAME) for r in recs if r["fields"].get(FIELD_MS_PROJECT_NAME)}
+                                [FIELD_MS_PROJECT_NAME, FIELD_MS_ACTUAL_DATE])
+        c["entered"] = {r["fields"].get(FIELD_MS_PROJECT_NAME): (r["fields"].get(FIELD_MS_ACTUAL_DATE) or "")
+                        for r in recs if r["fields"].get(FIELD_MS_PROJECT_NAME)}
         c["pool"] = {}
         c["ts"] = now
     if vendor not in c["pool"]:
@@ -5013,16 +5015,20 @@ def _vp_stage_cases(vendor):
     _ensure_biz_snapshots_loaded()
     cancelled = CANCELLED_CASE_CACHE["case_nos"]
     entered = c["entered"]
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     out = []
     for r in c["pool"][vendor]:
         f = r["fields"]
         case_no = f.get(FIELD_CASE_NO, "")
-        if not case_no or case_no in cancelled or case_no in entered:
+        if not case_no or case_no in cancelled:
             continue
         agree = f.get(FIELD_AGREE_DATE)
         agree = agree[0] if isinstance(agree, list) and agree else agree
         base = {"case": case_no, "alias": f.get(FIELD_ALIAS, ""), "address": f.get(FIELD_ADDRESS, "")}
-        if agree:
+        if case_no in entered:
+            if entered[case_no] and entered[case_no] <= today:
+                out.append({**base, "stage": "掛表", "types": ["掛表"], "sel": ["掛表"]})
+        elif agree:
             out.append({**base, "stage": "進場", "types": ["進場", "放樣"], "sel": ["進場"]})
         elif case_no in c["bingo"]:
             out.append({**base, "stage": "放樣", "types": ["放樣"], "sel": ["放樣"]})
