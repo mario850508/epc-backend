@@ -13038,7 +13038,10 @@ MC_F = {
     "title": "fld1feoQ62Rh0xN1C", "month": "fldJs8klE8wAv2a5K", "case_no": "fldYQFqzWYgrx9v3w",
     "kind": "fldHCbkDCWzORvcdn", "cap": "fld6DBxXOtGjpgOY0", "price": "fldDCajFNnCigrBSA",
     "note": "fldfQdH0MeAzRKxe6", "by": "fldJ21B5ihKRzGlv5", "updated": "fldi0oJSb7m9Tx4s1",
+    # 2026-10-23：工程合約那側的人工修正（空白＝用專案細節系統容量／工程合約電價）＋有調整時的處理進度
+    "contract_cap": "fldHU68zisgepVeG0", "contract_price": "fld8rAXXGV4VVrrp3", "adj_status": "fldRlGGa6HHwuQnX8",
 }
+MC_ADJ_STATUSES = ("待廠商提供", "已收到折讓／發票", "已通知內部")
 MC_KINDS = ("掛表", "撤案")
 FIELD_SYSTEM_CAPACITY = "fldQwb2qdQiYN3fIi"   # 專案細節「系統容量」(kW)
 FIELD_CONTRACT_PRICE = "fldzJoM0X3Gcnfq3z"    # 專案細節 工程合約電價（有些案件沒填）
@@ -13146,6 +13149,8 @@ def get_meter_check():
             chk[(f.get(MC_F["kind"]), f.get(MC_F["case_no"]))] = {
                 "check_id": r["id"], "cap_confirm": f.get(MC_F["cap"]), "price_confirm": f.get(MC_F["price"]),
                 "note": f.get(MC_F["note"]) or "", "by": f.get(MC_F["by"]) or "", "updated": f.get(MC_F["updated"]) or "",
+                "contract_cap": f.get(MC_F["contract_cap"]), "contract_price": f.get(MC_F["contract_price"]),
+                "adj_status": f.get(MC_F["adj_status"]) or "",
             }
 
         doc_caps = _mc_doc_capacities([c["case_no"] for c in cases.values() if c["case_no"]])
@@ -13153,7 +13158,8 @@ def get_meter_check():
         for cid, c in cases.items():
             rows.append({**c, "meter_date": meter_date.get(cid, ""), "doc_cap": doc_caps.get(c["case_no"]),
                          **chk.get(("掛表", c["case_no"]), {"check_id": None, "cap_confirm": None, "price_confirm": None,
-                                                           "note": "", "by": "", "updated": ""})})
+                                                           "note": "", "by": "", "updated": "", "contract_cap": None,
+                                                           "contract_price": None, "adj_status": ""})})
         rows.sort(key=lambda x: (x["meter_date"], x["case_no"]))
 
         w_keys = [k[1] for k in chk if k[0] == "撤案" and k[1]]
@@ -13195,10 +13201,19 @@ def upsert_meter_check():
             fields[MC_F["cap"]] = num(b.get("cap_confirm"))
         if "price_confirm" in b:
             fields[MC_F["price"]] = num(b.get("price_confirm"))
+        if "contract_cap" in b:
+            fields[MC_F["contract_cap"]] = num(b.get("contract_cap"))
+        if "contract_price" in b:
+            fields[MC_F["contract_price"]] = num(b.get("contract_price"))
     except (TypeError, ValueError):
         return jsonify({"error": "容量／電價要是數字"}), 400
     if "note" in b:
         fields[MC_F["note"]] = (b.get("note") or "").strip()
+    if "adj_status" in b:
+        st = (b.get("adj_status") or "").strip()
+        if st and st not in MC_ADJ_STATUSES:
+            return jsonify({"error": "調整處理狀態不正確"}), 400
+        fields[MC_F["adj_status"]] = st or None
     if b.get("by"):
         fields[MC_F["by"]] = str(b["by"]).strip()[:40]
     try:
