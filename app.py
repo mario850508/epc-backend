@@ -11515,6 +11515,39 @@ def pdf_rename_save_settings():
     return jsonify({"ok": True, "settings": s})
 
 
+@app.route("/api/pdf-rename/doc-types", methods=["POST"])
+def pdf_rename_add_doc_type():
+    """確認時遇到沒有的函文類型（選「其他」並自己命名）：直接新增一種類型。
+    body: {name, category(03/04/06/07，選填), keywords(頓號分隔，選填，沒填就用名稱)}。
+    之後辨識時，主旨／內文出現名稱或關鍵字就會判成這個類型；確認歸檔會放進所選分類資料夾。
+    已經有同名類型：不新增，只在它還沒設分類時補上分類。"""
+    body = request.get_json(force=True) or {}
+    name = re.sub(r"\s+", "", (body.get("name") or "")).strip()
+    if not name or len(name) > 30 or name == "其他" or any(c in name for c in '\\/:*?"<>|'):
+        return jsonify({"error": "類型名稱請填 1～30 字，不能是「其他」，也不能含 \\ / : * ? \" < > |"}), 400
+    category = (body.get("category") or "").strip()
+    if category and category not in ("03", "04", "06", "07"):
+        return jsonify({"error": "分類只能是 03／04／06／07"}), 400
+    kws = [k.strip() for k in re.split(r"[、,，;；\s]+", body.get("keywords") or "") if len(k.strip()) >= 2]
+    kws = list(dict.fromkeys([name] + kws))[:12]
+    s = dict(_pdf_settings())
+    types = [dict(t) for t in s.get("doc_types") or []]
+    existing = next((t for t in types if (t.get("name") or "") == name), None)
+    created = existing is None
+    if existing is not None:
+        if category and not existing.get("category"):
+            existing["category"] = category
+    else:
+        types.append({"name": name, "category": category, "milestone": "", "synonyms": "",
+                      "keywords": "、".join(kws), "note": "主控台確認時新增"})
+    s["doc_types"] = types
+    try:
+        _pdf_save_settings(s)
+    except Exception as e:
+        return jsonify({"error": f"儲存設定失敗：{e}"}), 502
+    return jsonify({"ok": True, "created": created, "doc_types": types})
+
+
 @app.route("/api/pdf-rename/import-learn", methods=["POST"])
 def pdf_rename_import_learn():
     """匯入 tools/pdf_learn.py 產生的 report.json：建立案號 → 簡稱對照（檔名 {簡稱}），
