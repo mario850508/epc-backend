@@ -4974,6 +4974,50 @@ def _vp_requests(vendor=None, status=None):
     return out
 
 
+VP_STAGES = ["場勘", "放樣", "進場"]
+_VP_STAGE_CACHE = {"ts": 0.0, "bingo": set(), "pool": {}}
+_VP_STAGE_TTL = 600
+
+
+def _vp_stage_cases(vendor):
+    """廠商預約頁「待安排案件」依案件進度分階段（使用者 2026-10-23 定義）：
+    還沒送併聯審查 → 場勘（由 SURVEY_CACHE 提供，不在這裡）；
+    已取得併聯審查（完成日期）、還沒同備 → 放樣；
+    已取得同備 → 進場（也可以預約放樣）。
+    只列進行中、還沒掛表、非撤案的案件；進場已完成的不列。10 分鐘快取。"""
+    now = time.time()
+    c = _VP_STAGE_CACHE
+    if now - c["ts"] > _VP_STAGE_TTL:
+        recs = airtable_get_all(MILESTONE_API_URL,
+                                f"AND({{{FIELD_MS_TYPE}}}='併聯審查',NOT({{{FIELD_MS_ACTUAL_DATE}}}=BLANK()))",
+                                [FIELD_MS_PROJECT_NAME])
+        c["bingo"] = {r["fields"].get(FIELD_MS_PROJECT_NAME) for r in recs if r["fields"].get(FIELD_MS_PROJECT_NAME)}
+        c["pool"] = {}
+        c["ts"] = now
+    if vendor not in c["pool"]:
+        formula = (f"AND({{{FIELD_CLOSE_STATUS}}}='進行中',{{{FIELD_HANG_METER_DATE}}}='',"
+                   f"{{{FIELD_VENDOR}}}='{_vp_esc(vendor)}')")
+        c["pool"][vendor] = airtable_get_all(CASE_API_URL, formula,
+                                             [FIELD_CASE_NO, FIELD_ALIAS, FIELD_ADDRESS, FIELD_AGREE_DATE])
+    _ensure_biz_snapshots_loaded()
+    cancelled = CANCELLED_CASE_CACHE["case_nos"]
+    entered = {x.get("case") for x in DATA_CACHE.get("completed") or []}
+    out = []
+    for r in c["pool"][vendor]:
+        f = r["fields"]
+        case_no = f.get(FIELD_CASE_NO, "")
+        if not case_no or case_no in cancelled or case_no in entered:
+            continue
+        agree = f.get(FIELD_AGREE_DATE)
+        agree = agree[0] if isinstance(agree, list) and agree else agree
+        base = {"case": case_no, "alias": f.get(FIELD_ALIAS, ""), "address": f.get(FIELD_ADDRESS, "")}
+        if agree:
+            out.append({**base, "stage": "進場", "types": ["進場", "放樣"], "sel": ["進場"]})
+        elif case_no in c["bingo"]:
+            out.append({**base, "stage": "放樣", "types": ["放樣"], "sel": ["放樣"]})
+    return out
+
+
 @app.route("/api/vendor-portal/<token>/info")
 def vendor_portal_info(token):
     vendor = _vp_vendor_from_token(token)
@@ -4985,20 +5029,19 @@ def vendor_portal_info(token):
         return jsonify({"error": str(e)}), 502
     waiting = {(r["case"], t) for r in reqs if r["status"] == VP_ST_WAIT for t in r["items"]}
     sugg = {}
-    def add(case_no, alias, address, typ):
-        if not case_no:
+    def add(case_no, alias, address, stage, types, sel):
+        if not case_no or case_no in sugg:
             return
-        e = sugg.setdefault(case_no, {"case": case_no, "alias": alias or "", "address": " ".join((address or "").split()), "types": []})
-        if typ not in e["types"]:
-            e["types"].append(typ)
-        if alias and not e["alias"]:
-            e["alias"] = alias
+        sugg[case_no] = {"case": case_no, "alias": alias or "", "address": " ".join((address or "").split()),
+                         "stage": stage, "types": types, "sel": sel}
     for c in SURVEY_CACHE.get("cases") or []:
         if (c.get("vendor") or "") == vendor:
-            add(c.get("case"), c.get("alias"), c.get("address"), "場勘")
-    for c in DATA_CACHE.get("entry") or []:
-        if (c.get("vendor") or "") == vendor:
-            add(c.get("case"), c.get("alias"), c.get("address"), "進場")
+            add(c.get("case"), c.get("alias"), c.get("address"), "場勘", ["場勘"], ["場勘"])
+    try:
+        for c in _vp_stage_cases(vendor):
+            add(c["case"], c["alias"], c["address"], c["stage"], c["types"], c["sel"])
+    except Exception as e:
+        print(f"[vendor-portal] 查案件階段失敗：{e}", flush=True)
     for e in sugg.values():
         e["pending"] = [t for t in e["types"] if (e["case"], t) in waiting]
     # 這家廠商已排定的時段（今天起）
@@ -5013,7 +5056,9 @@ def vendor_portal_info(token):
         bookings.sort(key=lambda b: (b["date"], b["start"]))
     except Exception as e:
         print(f"[vendor-portal] 查已排定時段失敗：{e}", flush=True)
-    return jsonify({"vendor": vendor, "types": VP_TYPES, "suggestions": sorted(sugg.values(), key=lambda e: e["case"]),
+    order = {s: i for i, s in enumerate(VP_STAGES)}
+    return jsonify({"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES,
+                    "suggestions": sorted(sugg.values(), key=lambda e: (order.get(e["stage"], 9), e["case"])),
                     "requests": reqs, "bookings": bookings})
 
 
