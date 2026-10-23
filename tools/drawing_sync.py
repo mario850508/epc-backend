@@ -69,6 +69,26 @@ def find_cases(root):
     return out
 
 
+def first_pages(path, n=6):
+    """超過 30MB 的 PDF（台電契約常 35～55MB 掃描檔）在本機先切前 n 頁再傳；容量／電價都在前幾頁。
+    需要 pypdf 或 PyPDF2（Anaconda 通常有 PyPDF2）；都沒有就回 None。"""
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader, PdfWriter
+        except ImportError:
+            return None
+    import io
+    reader = PdfReader(path)
+    writer = PdfWriter()
+    for pg in reader.pages[:n]:
+        writer.add_page(pg)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
 def pick_latest(case_dir, cat, keywords, excludes=()):
     """案場資料夾底下的某分類資料夾裡，檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
     cands = []
@@ -153,15 +173,23 @@ def main():
                     skip += 1
                     continue
                 size = os.path.getsize(path)
+                data_bytes = None
                 if size > MAX_BYTES:
-                    too_big.append((case_no, kind, fn, round(size / 1048576, 1)))
-                    continue
+                    try:
+                        data_bytes = first_pages(path) if not args.dry_run else b""
+                    except Exception as e:
+                        log(f"  ✗ {case_no} {kind}：{fn} 切前 6 頁失敗：{e}")
+                    if data_bytes is None or len(data_bytes) > MAX_BYTES:
+                        too_big.append((case_no, kind, fn, round(size / 1048576, 1)))
+                        continue
                 if args.dry_run:
                     log(f"  ＋ {case_no} {kind}：{fn}（{round(size / 1024)}KB）")
                     up += 1
                     continue
-                with open(path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode()
+                if data_bytes is None:
+                    with open(path, "rb") as f:
+                        data_bytes = f.read()
+                data = base64.b64encode(data_bytes).decode()
                 try:
                     r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
                         "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt, "data": data})
@@ -176,7 +204,7 @@ def main():
                     fail += 1
     log(f"\n完成：上傳 {up}、沒變略過 {skip}、失敗 {fail}")
     if too_big:
-        log(f"\n超過 30MB 沒上傳（{len(too_big)} 份）：")
+        log(f"\n超過 30MB 沒上傳（{len(too_big)} 份；先執行 py -m pip install pypdf 再跑一次，就會自動只傳前 6 頁）：")
         for c, k, fn, mb in too_big:
             log(f"  {c} {k}：{fn}（{mb}MB）")
     return 0

@@ -8453,7 +8453,9 @@ def _contract_capacity(text, kind):
     pats = ([r"合計總裝置容量\s*為?\s*" + _CAP_NUM + unit, r"總購售電容量\s*為?\s*" + _CAP_NUM + unit]
             if kind == "台電契約" else []) + [r"總裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
             # 台電契約移轉函：「(電號:…)裝置容量為19.68kWp之再生能源發電系統」
-            r"裝置容量\s*[為:]?\s*" + _CAP_NUM + unit]
+            r"裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
+            # 雲林區細協：「不需要(原因:17.16kwp-1433110/220V)」（要有 p，避免抓到「100kW以上者」）
+            r"(?<![\d.])" + _CAP_NUM + r"\s*[kK][wW][pP]"]
     for p in pats:
         ms = list(re.finditer(p, t))
         if ms:
@@ -8464,6 +8466,11 @@ def _contract_capacity(text, kind):
                 continue
             if 0 < v < 100000:
                 return v, " ".join(m.group(0).split())[:80]
+    # 最後：模組「440 wpx 39 組」→ 440×39/1000＝17.16 kW（同一份可能有好幾種模組，全部加起來）
+    mods = re.findall(r"(\d{3})\s*[wW][pP]?\s*[xX×*]\s*(\d{1,4})\s*組", t)
+    if mods:
+        v = round(sum(int(w) * int(n) for w, n in mods) / 1000, 3)
+        return v, "模組 " + "＋".join(f"{w}W×{n}" for w, n in mods) + f"＝{v} kW"
     return None, "文件裡找不到「裝置容量」"
 
 
@@ -8609,24 +8616,37 @@ def _pdf_first_pages(data, n):
         return data
 
 
-def _reparse_unread_contracts(limit=300):
+def _reparse_unread_contracts(limit=3000):
     """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的（讀不到、或重啟時卡在讀取中）。
     用存著的附件（大檔是前 6 頁）。回傳排進背景的筆數。"""
     kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
     recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())",
-                            [DRAWING_F[k] for k in ("kind", "file", "cap_src")])
+                            [DRAWING_F[k] for k in ("kind", "file", "cap_src", "text")])
     todo = []
     for r in recs[:limit]:
         f = r["fields"]
         att = (f.get(DRAWING_F["file"]) or [{}])[0]
-        if att.get("url"):
-            todo.append((r["id"], f.get(DRAWING_F["kind"]), att["url"]))
+        # 已經 OCR 過（有存文字）的直接用文字重讀，不用再 OCR；還在讀取中／沒文字的才重新下載
+        if (f.get(DRAWING_F["text"]) or "").strip():
+            todo.append((r["id"], f.get(DRAWING_F["kind"]), None, f[DRAWING_F["text"]], f.get(DRAWING_F["cap_src"]) or ""))
+        elif att.get("url"):
+            todo.append((r["id"], f.get(DRAWING_F["kind"]), att["url"], "", f.get(DRAWING_F["cap_src"]) or ""))
 
     def run():
-        for rid, kind, url in todo:
+        for rid, kind, url, text, src in todo:
+            note = "（原檔太大，只存前 6 頁）" if "只存前 6 頁" in src else ""
             try:
-                data = requests.get(url, timeout=120).content
-                _drawing_parse_job(rid, kind, data)
+                if url:
+                    _drawing_parse_job(rid, kind, requests.get(url, timeout=120).content, note)
+                else:
+                    if kind == ENG_KIND:
+                        ev = _eng_contract_values(text)
+                        fields = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
+                                  DRAWING_F["cap_src"]: (ev["src"] + note)[:200]}
+                    else:
+                        v, why = _contract_capacity(text, kind)
+                        fields = {DRAWING_F["cap"]: v, DRAWING_F["cap_src"]: ((why or "") + note)[:200]}
+                    requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
             except Exception as e:
                 print(f"[reparse_unread_contracts] {rid} 失敗：{e}", flush=True)
     threading.Thread(target=run, daemon=True).start()
