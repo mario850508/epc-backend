@@ -1037,7 +1037,8 @@ def cancel_vendor_slot_booking(record_id):
     except Exception as e:
         print(f"[cancel_vendor_slot_booking] 更新任務失敗（預約已取消）：{e}", flush=True)
     notice = _cancel_notice(rec, task, reason, reopen)
-    rep_ok = _push_to_name(notice["rep_name"], notice["rep_card"]) if (notify and notice["rep_name"]) else False
+    with _push_now():     # PM 在取消視窗勾「通知業務」：馬上送
+        rep_ok = _push_to_name(notice["rep_name"], notice["rep_card"]) if (notify and notice["rep_name"]) else False
     sched_ok = False if quiet else _send_cancel_to_scheduler(notice, task)
     return jsonify({"ok": True, "owner_message": notice["msg"], "rep_name": notice["rep_name"], "rep_notified": rep_ok,
                     "scheduler_notified": sched_ok,
@@ -1113,7 +1114,8 @@ def resend_cancel_notice(record_id):
     if "scheduler" in targets:
         out["scheduler_notified"] = _send_cancel_to_scheduler(notice, task)
     if "rep" in targets and notice["rep_name"]:
-        out["rep_notified"] = _push_to_name(notice["rep_name"], notice["rep_card"])
+        with _push_now():
+            out["rep_notified"] = _push_to_name(notice["rep_name"], notice["rep_card"])
     return jsonify(out)
 
 
@@ -2771,7 +2773,9 @@ def vendor_slot_rep_notice(record_id):
         except Exception as e:
             print(f"[rep-notice] 查綁定失敗：{e}", flush=True)
     if bound and not body.get("share"):
-        if _push_to_name(rep_name, _rep_notice_card(rec)):
+        with _push_now():     # PM 按「通知業務」：馬上送
+            sent_now = _push_to_name(rep_name, _rep_notice_card(rec))
+        if sent_now:
             return jsonify({"ok": True, "sent": True, "rep_name": rep_name})
     token = f.get(FIELD_SLOT_VENDOR_TOKEN) or secrets.token_urlsafe(16)
     if not f.get(FIELD_SLOT_VENDOR_TOKEN):
@@ -3022,7 +3026,9 @@ def case_reminder():
         except Exception as e:
             print(f"[case-reminder] 查綁定失敗：{e}", flush=True)
     if bound and not body.get("share"):
-        if _push_to_name(rep, card):
+        with _push_now():     # PM 按「傳提醒」：馬上送
+            sent_now = _push_to_name(rep, card)
+        if sent_now:
             return jsonify({"ok": True, "sent": True, "rep_name": rep})
     token = _reminder_token_make({"c": case_no, "k": kind, "d": date, "t": tm, "n": note,
                                   "x": int(time.time()) + 45 * 86400})
@@ -6187,11 +6193,239 @@ def _line_note_result(status_code, text=""):
         LINE_HEALTH["quota_exhausted"] = True
 
 
-def _line_push_text(text, to=None):
+# ===================================================================
+# 2026-10-23：LINE 每日彙整（使用者：免費額度每月 200 則，不想付費；同一個人一天可能收到好幾則——出貨、進場、
+# 屋主沒回簽、業務沒審理…——希望「每個人一天最多只收 1 則」，期限提醒也改成每天固定時間）。
+# 做法：所有「自動」推播給個人（U 開頭）的通知，不立刻送，先排進佇列（存在 Airtable「系統狀態」，重啟不會掉）；
+# 每天固定時間（預設 12:30）把每個人佇列裡的通知合併成「一則」LINE 輪播卡片（第一張是摘要，後面是原本的卡片）。
+# LINE 額度是算「訊息物件」數量（一次推播最多 5 個物件就算 5 則），所以一定只放 1 個物件（carousel）。
+# 不排隊、馬上送的：群組（C／R 開頭，本來就一天一次）、PM 在主控台按「通知業務」之類的按鈕（用 _push_now()）、
+# 採購司機資訊（時間敏感，自己合併成一則）。要關掉彙整：POST /api/line/digest {"enabled": false}。
+# ===================================================================
+LINE_DIGEST_STATE_KEY = "line_digest_state"
+LINE_DIGEST = {"loaded": False, "cfg": {"enabled": True, "time": "12:30"}, "items": [], "sent_on": {}, "done_date": "",
+               "attempts": 0, "last_flush": None, "last_result": None}
+_LINE_DIGEST_LOCK = threading.RLock()
+_LINE_DIGEST_SAVE = {"timer": None}
+_PUSH_CTX = threading.local()
+LINE_DIGEST_MAX_BUBBLES = 11     # 輪播最多 12 張：1 張摘要 + 11 張原卡片，超過的只列在摘要
+LINE_DIGEST_MAX_ITEMS = 400
+LINE_DIGEST_KEEP_DAYS = 3
+LINE_DIGEST_MIN_TIME = 12 * 60 + 15   # 彙整時間不能早於 12:15（前日提醒、明日總覽 12:00 起才會排進來）
+
+
+class _push_now:
+    """with _push_now(): … 裡面的 LINE 推播馬上送、不排進每日彙整（PM 自己按按鈕要通知的情況）。"""
+    def __enter__(self):
+        _PUSH_CTX.now = True
+        return self
+
+    def __exit__(self, *a):
+        _PUSH_CTX.now = False
+        return False
+
+
+def _tw_today_str():
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _digest_load():
+    """第一次用到時從 Airtable 讀回佇列；讀不到就丟例外（呼叫端會改成馬上送，不讓通知消失）。"""
+    with _LINE_DIGEST_LOCK:
+        if LINE_DIGEST["loaded"]:
+            return
+        raw = _state_get_long(LINE_DIGEST_STATE_KEY)
+        data = json.loads(raw) if raw else {}
+        cfg = data.get("cfg") or {}
+        if isinstance(cfg.get("enabled"), bool):
+            LINE_DIGEST["cfg"]["enabled"] = cfg["enabled"]
+        if re.fullmatch(r"\d{1,2}:\d{2}", str(cfg.get("time") or "")):
+            LINE_DIGEST["cfg"]["time"] = cfg["time"]
+        LINE_DIGEST["items"] = list(data.get("items") or [])
+        LINE_DIGEST["sent_on"] = dict(data.get("sent_on") or {})
+        LINE_DIGEST["done_date"] = data.get("done_date") or ""
+        LINE_DIGEST["loaded"] = True
+
+
+def _digest_save_now():
+    with _LINE_DIGEST_LOCK:
+        data = {"cfg": LINE_DIGEST["cfg"], "items": LINE_DIGEST["items"], "sent_on": LINE_DIGEST["sent_on"],
+                "done_date": LINE_DIGEST["done_date"]}
+        text = json.dumps(data, ensure_ascii=False)
+    try:
+        _state_set_long(LINE_DIGEST_STATE_KEY, text)
+    except Exception as e:
+        print(f"[line_digest] 儲存佇列失敗：{e}", flush=True)
+
+
+def _digest_save_async():
+    """2 秒內的多次變更合併成一次寫入，不拖慢呼叫端。"""
+    with _LINE_DIGEST_LOCK:
+        t = _LINE_DIGEST_SAVE.get("timer")
+        if t is not None and t.is_alive():
+            return
+        t = threading.Timer(2.0, _digest_save_now)
+        t.daemon = True
+        _LINE_DIGEST_SAVE["timer"] = t
+        t.start()
+
+
+def _digest_enabled():
+    try:
+        _digest_load()
+    except Exception:
+        pass
+    return bool(LINE_DIGEST["cfg"].get("enabled"))
+
+
+def _digest_time_minutes():
+    h, m = str(LINE_DIGEST["cfg"].get("time") or "12:30").split(":")
+    return max(LINE_DIGEST_MIN_TIME, int(h) * 60 + int(m))
+
+
+def _digest_should_queue(target, immediate):
+    if immediate or getattr(_PUSH_CTX, "now", False):
+        return False
+    if not target or target[:1] != "U":      # 群組／聊天室不排隊
+        return False
+    return _digest_enabled()
+
+
+def _digest_enqueue(target, card=None, text=None):
+    """排進佇列。成功回 True；佇列讀不到（Airtable 有問題）回 False → 呼叫端改成馬上送。"""
+    try:
+        _digest_load()
+    except Exception as e:
+        print(f"[line_digest] 讀取佇列失敗，這則改成馬上送：{e}", flush=True)
+        return False
+    key = hashlib.sha1(json.dumps([target, card, text], sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
+    with _LINE_DIGEST_LOCK:
+        if any(x.get("k") == key for x in LINE_DIGEST["items"]):
+            return True      # 同一則通知重複進來，只留一則
+        LINE_DIGEST["items"].append({"k": key, "to": target, "at": datetime.now(timezone(timedelta(hours=8))).isoformat(),
+                                     "card": card, "text": text})
+        if len(LINE_DIGEST["items"]) > LINE_DIGEST_MAX_ITEMS:
+            LINE_DIGEST["items"] = LINE_DIGEST["items"][-LINE_DIGEST_MAX_ITEMS:]
+    _digest_save_async()
+    return True
+
+
+def _text_to_card(text):
+    lines = [x for x in str(text or "").splitlines() if x.strip()]
+    head = lines[0] if lines else "通知"
+    return _card("📝 通知", "#6B7280", head[:60], note="\n".join(lines[1:])[:900] if len(lines) > 1 else "")
+
+
+def _digest_messages(items):
+    """一個人的所有通知 → 一個 LINE 訊息物件（單一通知就直接是那張卡片；多則是輪播：摘要＋原卡片）。"""
+    cards = [it.get("card") or _text_to_card(it.get("text")) for it in items]
+    n = len(cards)
+    titles = [(re.sub(r"[｜|].*$", "", c["tag"]).strip() + " " + c["title"]).strip() for c in cards]
+    if n == 1:
+        c = cards[0]
+        alt = (c["tag"] + "：" + c["title"])[:390]
+        return {"type": "flex", "altText": alt, "contents": _card_to_flex(c)}, cards
+    note = f"另外 {n - LINE_DIGEST_MAX_BUBBLES} 則請到主控台查看" if n > LINE_DIGEST_MAX_BUBBLES else "左右滑動看每一則的詳細內容"
+    summary = _card("📬 今日 LINE 通知彙整", "#0F766E", f"共 {n} 則", subtitle="一天只傳一次，所有通知都整理在這裡",
+                    sections=[("摘要", [f"• {t}" for t in titles[:30]])], note=note)
+    bubbles = [_card_to_flex(summary)] + [_card_to_flex(c) for c in cards[:LINE_DIGEST_MAX_BUBBLES]]
+    alt = (f"📬 今日通知彙整（{n} 則）：" + "；".join(titles))[:390]
+    return {"type": "flex", "altText": alt, "contents": {"type": "carousel", "contents": bubbles}}, cards
+
+
+def _line_post_messages(target, messages):
+    token, _ = _line_config()
+    resp = requests.post(LINE_PUSH_URL, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                         json={"to": target, "messages": messages}, timeout=20)
+    _line_note_result(resp.status_code, resp.text)
+    return resp
+
+
+def _line_digest_flush(force=False):
+    """把佇列依收件人合併後各送一則。一般只在每天固定時間跑一次（done_date 擋重複）；force＝手動立刻送。"""
+    token, _ = _line_config()
+    if not token:
+        return {"ok": False, "error": "LINE 環境變數未設定"}
+    try:
+        _digest_load()
+    except Exception as e:
+        return {"ok": False, "error": f"讀取佇列失敗：{e}"}
+    today = _tw_today_str()
+    with _LINE_DIGEST_LOCK:
+        if not force and LINE_DIGEST["done_date"] == today:
+            return {"ok": True, "skipped": "今天已經送過"}
+        cutoff = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=LINE_DIGEST_KEEP_DAYS)).isoformat()
+        LINE_DIGEST["items"] = [x for x in LINE_DIGEST["items"] if (x.get("at") or "9") >= cutoff]
+        groups = {}
+        for it in LINE_DIGEST["items"]:
+            groups.setdefault(it["to"], []).append(it)
+    results, hard_fail, quota_out = [], False, False
+    for target, its in groups.items():
+        if quota_out:
+            results.append({"to": target[:6] + "…", "n": len(its), "ok": False, "error": "額度已用完，留到明天"})
+            continue
+        if not force and LINE_DIGEST["sent_on"].get(target) == today:
+            continue      # 今天已經送過這個人（重試時不重送）
+        try:
+            msg, cards = _digest_messages(its)
+            resp = _line_post_messages(target, [msg])
+            ok = resp.status_code < 400
+            err = "" if ok else f"{resp.status_code} {resp.text[:160]}"
+            if not ok and resp.status_code == 429:
+                quota_out = True
+            elif not ok:      # 卡片格式有問題：退回純文字（還是一則）
+                text = "\n\n".join(_card_plain_text(c) for c in cards)[:4800]
+                resp = _line_post_messages(target, [{"type": "text", "text": text}])
+                ok = resp.status_code < 400
+                err = "" if ok else f"{resp.status_code} {resp.text[:160]}"
+                quota_out = quota_out or resp.status_code == 429
+        except Exception as e:
+            ok, err = False, repr(e)[:160]
+        if ok:
+            keys = {x["k"] for x in its}
+            with _LINE_DIGEST_LOCK:
+                LINE_DIGEST["items"] = [x for x in LINE_DIGEST["items"] if x["k"] not in keys]
+                LINE_DIGEST["sent_on"][target] = today
+        elif not quota_out:
+            hard_fail = True
+        results.append({"to": target[:6] + "…", "n": len(its), "ok": ok, "error": err})
+    with _LINE_DIGEST_LOCK:
+        LINE_DIGEST["attempts"] = LINE_DIGEST.get("attempts", 0) + 1
+        # 全部成功（或額度用完、重試沒意義）就算今天做完；其他失敗最多重試 6 輪（每輪 5 分鐘）
+        if not force and (not hard_fail or LINE_DIGEST["attempts"] >= 6):
+            LINE_DIGEST["done_date"] = today
+            LINE_DIGEST["attempts"] = 0
+        LINE_DIGEST["sent_on"] = {k: v for k, v in LINE_DIGEST["sent_on"].items() if v == today}
+        LINE_DIGEST["last_flush"] = datetime.now(timezone(timedelta(hours=8))).isoformat()
+        LINE_DIGEST["last_result"] = results
+    _digest_save_now()
+    return {"ok": not hard_fail and not quota_out, "results": results}
+
+
+def line_digest_tick():
+    """每 5 分鐘看一次：到了設定的時間、今天還沒送過 → 送。"""
+    try:
+        if not _digest_enabled():
+            return
+        now = datetime.now(timezone(timedelta(hours=8)))
+        if now.hour * 60 + now.minute < _digest_time_minutes():
+            return
+        _line_digest_flush()
+    except Exception as e:
+        print(f"[line_digest_tick] 例外：{e!r}", flush=True)
+
+
+scheduler.add_job(line_digest_tick, CronTrigger(minute="*/5", timezone="Asia/Taipei"), id="line_digest_flush",
+                  replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
+
+
+def _line_push_text(text, to=None, immediate=False):
     token, default_target = _line_config()
     target = to or default_target
     if not token or not target:
         return False, "LINE 環境變數未設定"
+    if _digest_should_queue(target, immediate) and _digest_enqueue(target, text=text):
+        return True, "queued"
     resp = requests.post(
         LINE_PUSH_URL,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -6295,11 +6529,13 @@ def _card_plain_text(card):
     return "\n".join(lines)
 
 
-def _line_push_card(card, to=None):
+def _line_push_card(card, to=None, immediate=False):
     token, default_target = _line_config()
     target = to or default_target
     if not token or not target:
         return False, "LINE 環境變數未設定"
+    if _digest_should_queue(target, immediate) and _digest_enqueue(target, card=card):
+        return True, "queued"
     alt = (card["tag"] + "：" + card["title"] + "｜" + "｜".join(f"{k}{v}" for k, v in (card.get("rows") or []) if v not in (None, "")))[:390]
     try:
         resp = requests.post(
@@ -6316,7 +6552,30 @@ def _line_push_card(card, to=None):
         print(f"[_line_push_card] Flex 失敗，改用純文字：{resp.status_code} {resp.text[:200]}", flush=True)
     except Exception as e:
         print(f"[_line_push_card] Flex 例外，改用純文字：{e}", flush=True)
-    return _line_push_text(_card_plain_text(card), to=to)
+    return _line_push_text(_card_plain_text(card), to=to, immediate=True)
+
+
+def _line_push_cards(cards, to):
+    """幾張卡片合成「一則」輪播馬上送（額度只算 1 則；給採購司機資訊這種時間敏感的通知用）。"""
+    cards = [c for c in cards if c]
+    if not cards:
+        return True, ""
+    token, _ = _line_config()
+    if not token or not to:
+        return False, "LINE 環境變數未設定"
+    if len(cards) == 1:
+        return _line_push_card(cards[0], to=to, immediate=True)
+    alt = "｜".join(f"{c['tag']}：{c['title']}" for c in cards)[:390]
+    try:
+        resp = _line_post_messages(to, [{"type": "flex", "altText": alt, "contents": {
+            "type": "carousel", "contents": [_card_to_flex(c) for c in cards[:12]]}}])
+        if resp.status_code < 400:
+            return True, ""
+        if resp.status_code == 429:
+            return False, f"{resp.status_code} {resp.text}"
+    except Exception as e:
+        print(f"[_line_push_cards] 例外，改用純文字：{e}", flush=True)
+    return _line_push_text("\n\n".join(_card_plain_text(c) for c in cards)[:4800], to=to, immediate=True)
 
 
 def _owner_str(name, phone):
@@ -6331,6 +6590,17 @@ def send_deadline_reminders():
         lead_min = int(os.environ.get("LINE_REMINDER_LEAD_MIN", "60"))
     except ValueError:
         lead_min = 60
+    digest_mode = _digest_enabled()
+    overdue_min = 0
+    if digest_mode:
+        # 每日彙整模式：不再「期限前 1 小時」各自推播，改成彙整時間前 20 分鐘收一次，
+        # 把「到下一次彙整前會到期」跟「已經逾期（48 小時內）還沒回的」都排進今天的彙整。
+        nowtw = datetime.now(timezone(timedelta(hours=8)))
+        cur = nowtw.hour * 60 + nowtw.minute
+        if not (_digest_time_minutes() - 20 <= cur < _digest_time_minutes()):
+            return
+        lead_min = 26 * 60
+        overdue_min = 48 * 60
     try:
         records = airtable_get_all(
             TASK_API_URL, "TRUE()", _task_fields() + [FIELD_TASK_REMINDED]
@@ -6361,7 +6631,7 @@ def send_deadline_reminders():
             continue
         remain_min = (dl - now).total_seconds() / 60
         # 只提醒「剩餘時間已進入提醒區間、且還沒過期」的任務
-        if remain_min > lead_min or remain_min < 0:
+        if remain_min > lead_min or remain_min < -overdue_min:
             continue
         local = dl.astimezone(timezone(timedelta(hours=8)))
         who = f.get(FIELD_TASK_ASSIGNEE) or "業務"
@@ -6370,7 +6640,12 @@ def send_deadline_reminders():
         types = "、".join(f.get(FIELD_TASK_TYPE) or [])
         vendor = f.get(FIELD_TASK_VENDOR) or ""
         title = f"{case_no} {alias}".strip()
-        dl_text = f"{local.strftime('%H:%M')}（剩約 {max(1, round(remain_min))} 分鐘）"
+        if remain_min < 0:
+            dl_text = f"{_wd_label(local.strftime('%Y-%m-%d'))} {local.strftime('%H:%M')}（已逾期）"
+        elif digest_mode:
+            dl_text = f"{_wd_label(local.strftime('%Y-%m-%d'))} {local.strftime('%H:%M')}"
+        else:
+            dl_text = f"{local.strftime('%H:%M')}（剩約 {max(1, round(remain_min))} 分鐘）"
         stage = f.get(FIELD_TASK_STAGE) or ""
         owner_mode = bool(f.get(FIELD_TASK_OWNER_MODE))
         if owner_mode:
@@ -7305,6 +7580,42 @@ def line_quota():
         out["error"] = str(e)[:200]
     out["exhausted"] = bool(out.get("exhausted") or LINE_HEALTH.get("quota_exhausted"))
     return jsonify(out)
+
+
+@app.route("/api/line/digest", methods=["GET", "POST"])
+def line_digest_api():
+    """每日彙整：GET 看設定與佇列；POST {enabled, time:"HH:MM"} 改設定；POST /api/line/digest/flush 手動立刻送。"""
+    try:
+        _digest_load()
+    except Exception as e:
+        return jsonify({"error": f"讀取佇列失敗：{e}"}), 502
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        with _LINE_DIGEST_LOCK:
+            if isinstance(body.get("enabled"), bool):
+                LINE_DIGEST["cfg"]["enabled"] = body["enabled"]
+            if "time" in body:
+                t = str(body["time"]).strip()
+                m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+                if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59 or int(m.group(1)) * 60 + int(m.group(2)) < LINE_DIGEST_MIN_TIME:
+                    return jsonify({"error": "時間格式要是 HH:MM（24 小時制），而且不能早於 12:15（前日提醒、明日總覽 12:00 起才會排進來）"}), 400
+                LINE_DIGEST["cfg"]["time"] = f"{int(m.group(1)):02d}:{m.group(2)}"
+        _digest_save_now()
+    with _LINE_DIGEST_LOCK:
+        by = {}
+        for it in LINE_DIGEST["items"]:
+            by[it["to"][:6] + "…"] = by.get(it["to"][:6] + "…", 0) + 1
+        return jsonify({"cfg": LINE_DIGEST["cfg"], "queued": len(LINE_DIGEST["items"]), "by_recipient": by,
+                        "done_date": LINE_DIGEST["done_date"], "last_flush": LINE_DIGEST["last_flush"],
+                        "last_result": LINE_DIGEST["last_result"],
+                        "preview": [{"to": x["to"][:6] + "…", "at": x["at"][:16],
+                                     "title": ((x.get("card") or {}).get("tag", "") + " " + (x.get("card") or {}).get("title", "")).strip() or (x.get("text") or "")[:40]}
+                                    for x in LINE_DIGEST["items"][-40:]]})
+
+
+@app.route("/api/line/digest/flush", methods=["POST"])
+def line_digest_flush_api():
+    return jsonify(_line_digest_flush(force=True))
 
 
 @app.route("/api/line/status")
@@ -8609,6 +8920,7 @@ def send_driver_requests(force=False, target_date=None):
             results.append({"group": b["name"], "ok": True, "skipped": "今天已發過"})
             continue
         oks, errs = [], []
+        buyer_cards = []
         if cases:
             bc = _driver_request_card(target, cases, include_epc=True)
             bc["tag"] = "🚚 明天到貨｜元晶司機資訊請求（給採購）"
@@ -8618,13 +8930,14 @@ def send_driver_requests(force=False, target_date=None):
                 bc["note"] = "按下方「傳送到元晶群組」，選元晶的群組，就會用你的 LINE 把這張卡片傳過去。"
             elif groups:
                 bc["note"] = "這張卡片已同時發到元晶群組。"
-            ok, err = _line_push_card(bc, to=b["user_id"])
-            oks.append(ok); errs.append(err)
+            buyer_cards.append(bc)
         if inv_cases:
-            ok, err = _line_push_card(_inverter_tomorrow_card(target, inv_cases), to=b["user_id"])
+            buyer_cards.append(_inverter_tomorrow_card(target, inv_cases))
+        if buyer_cards:
+            ok, err = _line_push_cards(buyer_cards, b["user_id"])    # 元晶＋碩天合成一則，額度只算 1
             oks.append(ok); errs.append(err)
         if not cases and not inv_cases:
-            ok, err = _line_push_text(f"🚚 採購到貨通知\n明天 {_wd_label(target.isoformat())} 沒有元晶模組、碩天變流器到貨的訂單。", to=b["user_id"])
+            ok, err = _line_push_text(f"🚚 採購到貨通知\n明天 {_wd_label(target.isoformat())} 沒有元晶模組、碩天變流器到貨的訂單。", to=b["user_id"], immediate=True)
             oks.append(ok); errs.append(err)
         ok, err = all(oks), "；".join(e for e in errs if e)
         if ok:
