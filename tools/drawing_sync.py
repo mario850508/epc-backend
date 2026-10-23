@@ -108,7 +108,12 @@ def main():
     kinds = [k for k in KINDS if k[0] in CONTRACT_KINDS] if args.contracts_only else KINDS
 
     try:
-        idx = {i["key"]: i for i in api("GET", "/api/procurement/drawings/index").json().get("items", [])}
+        r0 = api("GET", "/api/procurement/drawings/index")
+        if r0.status_code == 401:
+            log("主控台有登入保護，要先設定服務金鑰：在命令提示字元執行 setx EPC_SERVICE_KEY \"<Render 上 SERVICE_KEY 的值>\"，"
+                "關掉視窗、開一個新的再跑一次")
+            return 1
+        idx = {i["key"]: i for i in r0.json().get("items", [])}
     except Exception as e:
         log(f"讀取主控台已上傳清單失敗：{e}")
         return 1
