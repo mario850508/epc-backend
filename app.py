@@ -8560,10 +8560,9 @@ def procurement_drawings_sync():
     filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
     key = f"{case_no}|{kind}"
     parse = kind in CONTRACT_KINDS or kind == ENG_KIND
-    head = _pdf_first_pages(data, 6) if parse or len(data) > PDF_MAX_BYTES else data   # 讀數字只要前幾頁
     store, note = data, ""
     if len(data) > PDF_MAX_BYTES:
-        store, note = head, "（原檔太大，只存前 6 頁）"
+        store, note = _pdf_first_pages(data, 6), "（原檔太大，只存前 6 頁）"
         if len(store) > PDF_MAX_BYTES:
             try:
                 store, _ = _pdf_shrink(store)
@@ -8578,7 +8577,7 @@ def procurement_drawings_sync():
             DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
             DRAWING_F["mtime"]: (body.get("mtime") or "")[:30],
             DRAWING_F["size_kb"]: round((body.get("orig_size") or len(data)) / 1024),   # 原檔大小（本機切過頁也記原檔），同步程式比對用
-            **({DRAWING_F["cap_src"]: "讀取中…" + note} if parse else {})}}, timeout=30)
+            **({DRAWING_F["cap_src"]: ("讀取中…" if store is not None else "原檔太大、沒存附件，讀不到") + note} if parse else {})}}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)
         rid = resp.json()["id"]
@@ -8590,14 +8589,69 @@ def procurement_drawings_sync():
                 raise
         for o in old:   # 新的上傳成功後才刪舊的
             requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
-        if parse:
-            threading.Thread(target=_drawing_parse_job, args=(rid, kind, head, note), daemon=True).start()
+        if parse and store is not None:
+            _parse_enqueue(rid)   # 只排記錄 ID，輪到時再從附件下載（2026-10-25：原本每份檔案留在記憶體排隊 → 記憶體爆掉、伺服器一直重開）
         return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": parse, "note": note})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
 
 
-_DRAWING_PARSE_LOCK = threading.Lock()   # 背景 OCR 一次一份，避免同時一堆大檔吃光記憶體
+# ---- 背景讀取佇列：一次一份，佇列裡只放記錄 ID（不放檔案內容），輪到時才下載附件 ----
+import queue as _queue
+_PARSE_Q = _queue.Queue()
+_PARSE_PENDING = set()
+_PARSE_LOCK = threading.Lock()
+_PARSE_WORKER = {"thread": None}
+
+
+def _parse_enqueue(rid):
+    with _PARSE_LOCK:
+        if rid in _PARSE_PENDING:
+            return
+        _PARSE_PENDING.add(rid)
+        _PARSE_Q.put(rid)
+        t = _PARSE_WORKER["thread"]
+        if t is None or not t.is_alive():
+            t = threading.Thread(target=_parse_worker, daemon=True)
+            _PARSE_WORKER["thread"] = t
+            t.start()
+
+
+def _parse_worker():
+    while True:
+        rid = _PARSE_Q.get()
+        try:
+            _parse_record(rid)
+        except Exception as e:
+            print(f"[parse_worker] {rid} 失敗：{e}", flush=True)
+        finally:
+            with _PARSE_LOCK:
+                _PARSE_PENDING.discard(rid)
+
+
+def _parse_record(rid):
+    """讀一筆案場圖面記錄：已經 OCR 過（有存文字）就直接用文字重讀；沒有就下載附件（大檔是前 6 頁）再讀。"""
+    r = requests.get(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=30)
+    if r.status_code == 404:
+        return   # 已經被新的一份取代刪掉了
+    r.raise_for_status()
+    f = r.json().get("fields", {})
+    kind, src, text = f.get(DRAWING_F["kind"]), f.get(DRAWING_F["cap_src"]) or "", f.get(DRAWING_F["text"]) or ""
+    note = "（原檔太大，只存前 6 頁）" if "只存前 6 頁" in src else ""
+    if text.strip():
+        if kind == ENG_KIND:
+            ev = _eng_contract_values(text)
+            fields = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
+                      DRAWING_F["cap_src"]: (ev["src"] + note)[:200]}
+        else:
+            v, why = _contract_capacity(text, kind)
+            fields = {DRAWING_F["cap"]: v, DRAWING_F["cap_src"]: ((why or "") + note)[:200]}
+        requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        return
+    att = (f.get(DRAWING_F["file"]) or [{}])[0]
+    if not att.get("url"):
+        return
+    _drawing_parse_job(rid, kind, requests.get(att["url"], timeout=120).content, note)
 
 
 def _pdf_first_pages(data, n):
@@ -8619,40 +8673,12 @@ def _pdf_first_pages(data, n):
 
 
 def _reparse_unread_contracts(limit=3000):
-    """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的（讀不到、或重啟時卡在讀取中）。
-    用存著的附件（大檔是前 6 頁）。回傳排進背景的筆數。"""
+    """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的（讀不到、或重啟時卡在讀取中）→ 排進背景佇列。"""
     kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
-    recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())",
-                            [DRAWING_F[k] for k in ("kind", "file", "cap_src", "text")])
-    todo = []
+    recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())", [DRAWING_F["kind"]])
     for r in recs[:limit]:
-        f = r["fields"]
-        att = (f.get(DRAWING_F["file"]) or [{}])[0]
-        # 已經 OCR 過（有存文字）的直接用文字重讀，不用再 OCR；還在讀取中／沒文字的才重新下載
-        if (f.get(DRAWING_F["text"]) or "").strip():
-            todo.append((r["id"], f.get(DRAWING_F["kind"]), None, f[DRAWING_F["text"]], f.get(DRAWING_F["cap_src"]) or ""))
-        elif att.get("url"):
-            todo.append((r["id"], f.get(DRAWING_F["kind"]), att["url"], "", f.get(DRAWING_F["cap_src"]) or ""))
-
-    def run():
-        for rid, kind, url, text, src in todo:
-            note = "（原檔太大，只存前 6 頁）" if "只存前 6 頁" in src else ""
-            try:
-                if url:
-                    _drawing_parse_job(rid, kind, requests.get(url, timeout=120).content, note)
-                else:
-                    if kind == ENG_KIND:
-                        ev = _eng_contract_values(text)
-                        fields = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
-                                  DRAWING_F["cap_src"]: (ev["src"] + note)[:200]}
-                    else:
-                        v, why = _contract_capacity(text, kind)
-                        fields = {DRAWING_F["cap"]: v, DRAWING_F["cap_src"]: ((why or "") + note)[:200]}
-                    requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
-            except Exception as e:
-                print(f"[reparse_unread_contracts] {rid} 失敗：{e}", flush=True)
-    threading.Thread(target=run, daemon=True).start()
-    return len(todo)
+        _parse_enqueue(r["id"])
+    return min(len(recs), limit)
 
 
 @app.route("/api/procurement/drawings/reparse", methods=["POST"])
@@ -8665,8 +8691,8 @@ def procurement_drawings_reparse():
 
 
 def _drawing_parse_job(rid, kind, data, note=""):
-    """背景讀台電契約／細協的容量、工程合約的容量／電價／單價，寫回案場圖面表這筆。"""
-    with _DRAWING_PARSE_LOCK:
+    """讀台電契約／細協的容量、工程合約的容量／電價／單價，寫回案場圖面表這筆（由背景佇列一次一份呼叫）。"""
+    if True:
         try:
             if kind == ENG_KIND:
                 text, err = _doc_pdf_text(data, "躉購電價")
