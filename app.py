@@ -4761,11 +4761,9 @@ def _startup_refresh_all():
     直接 `python app.py` 執行時），確保一定是在真正服務請求的 process 裡執行。"""
     refresh_cache()
     refresh_model_options_cache()
-    try:   # 2026-10-23：重啟會丟掉背景讀取中的契約 → 開機後把還沒讀到數字的契約重讀一次
-        n = _reparse_unread_contracts()
-        print(f"[startup] 重讀還沒讀到數字的契約 {n} 份", flush=True)
-    except Exception as e:
-        print(f"[startup] 重讀契約失敗：{e}", flush=True)
+    # 2026-10-25：拿掉「開機自動重讀還沒讀到數字的契約」。很多契約本來就讀不到數字（cap 永遠空白），
+    # 每次開機都把幾百份全部下載＋OCR 一遍，疊在開機刷新快取上 → 記憶體超過 512MB 被殺 → 重開 → 又重讀，
+    # 形成開機迴圈（Render 事件：Ran out of memory，約每 2 分鐘一次）。要重讀請按「掛表資訊確認」的「🔁 重讀」按鈕。
     refresh_survey_cache()
 
 
