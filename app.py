@@ -8558,7 +8558,7 @@ def procurement_drawings_sync():
     filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
     key = f"{case_no}|{kind}"
     parse = kind in CONTRACT_KINDS or kind == ENG_KIND
-    store, note = data, ""
+    store, note = data, ("（原檔太大，只存前 6 頁）" if body.get("trimmed") else "")   # trimmed：本機已切前 6 頁
     if len(data) > PDF_MAX_BYTES:
         store, note = _pdf_first_pages(data, 6), "（原檔太大，只存前 6 頁）"
         if len(store) > PDF_MAX_BYTES:

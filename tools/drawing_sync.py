@@ -23,7 +23,9 @@ import sys
 import requests
 
 BACKEND = "https://epc-backend-4aj2.onrender.com"
-MAX_BYTES = 30 * 1024 * 1024   # 2026-10-23：台電契約常 10～22MB，主控台收 30MB，超過 5MB 的由主控台只存前 6 頁
+MAX_BYTES = 30 * 1024 * 1024   # 主控台收件上限
+# 2026-10-25：5MB 以上一律在本機先切前 6 頁再傳。大檔交給主控台切會吃光 Render 記憶體 → 502、伺服器重開。
+TRIM_BYTES = 5 * 1024 * 1024
 CASE_RE = re.compile(r"^\d*\s*((?:工程|潤特)[^\d_\s]+\d+號)")
 CAT_RE = re.compile(r"^0?([46])\s*[\.、_ -]?\s*(電廠設計圖|政府函文)")
 DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
@@ -77,6 +79,18 @@ def find_cases(root):
                 out.append((m.group(1), os.path.join(dirpath, d)))
                 dirnames.remove(d)
     return out
+
+
+def have_pdf_lib():
+    try:
+        import pypdf  # noqa: F401
+        return True
+    except ImportError:
+        try:
+            import PyPDF2  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
 
 def first_pages(path, n=6):
@@ -176,6 +190,9 @@ def main():
         for case_no, case_dir in found:
             merged.setdefault(case_no, []).append(case_dir)
     log(f"合併後共 {len(merged)} 個案件")
+    if not have_pdf_lib():
+        log("⚠️ 這台電腦沒有切 PDF 的套件，5MB 以上的檔案會整份上傳，容易讓主控台當掉。"
+            "請先按 Ctrl+C 停掉，執行 py -m pip install pypdf 再跑一次。")
     if True:
         for case_no, case_dir in merged.items():
             if args.case and args.case != case_no:
@@ -202,12 +219,12 @@ def main():
                     skip += 1
                     continue
                 data_bytes = None
-                if size > MAX_BYTES:
+                if size > TRIM_BYTES and not args.dry_run:
                     try:
-                        data_bytes = first_pages(path) if not args.dry_run else b""
+                        data_bytes = first_pages(path)
                     except Exception as e:
                         log(f"  ✗ {case_no} {kind}：{fn} 切前 6 頁失敗：{e}")
-                    if data_bytes is None or len(data_bytes) > MAX_BYTES:
+                    if data_bytes is None and size > MAX_BYTES:
                         too_big.append((case_no, kind, fn, round(size / 1048576, 1)))
                         continue
                 if args.dry_run:
@@ -219,18 +236,19 @@ def main():
                         data_bytes = f.read()
                 data = base64.b64encode(data_bytes).decode()
                 try:
-                    for attempt in (1, 2):   # 主控台剛好在重新部署時會失敗 → 等 30 秒再試一次
+                    for attempt in (1, 2, 3, 4):   # 主控台重開／部署時會 502 → 等 60 秒再試，最多 4 次
                         try:
                             r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
                                 "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
-                                "orig_size": size, "data": data})
+                                "orig_size": size, "trimmed": len(data_bytes) < size, "data": data})
                             if r.status_code >= 400:
                                 raise Exception(f"HTTP {r.status_code} {r.text[:200]}")
                             break
                         except Exception:
-                            if attempt == 2:
+                            if attempt == 4:
                                 raise
-                            time.sleep(30)
+                            log(f"    （主控台沒回應，60 秒後重試第 {attempt + 1} 次）")
+                            time.sleep(60)
                     j = r.json()
                     info = ("（容量／電價主控台背景讀取中）" if j.get("parsing") else "") + (j.get("note") or "")
                     log(f"  ✓ {case_no} {kind}：{fn}{info}")
