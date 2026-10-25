@@ -15,6 +15,7 @@
 import argparse
 import base64
 import datetime
+import time
 import os
 import re
 import sys
@@ -45,8 +46,17 @@ except Exception:
     pass
 
 
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "drawing_sync_last.log")
+
+
 def log(msg):
+    """印在畫面上，也寫進 drawing_sync_last.log（每次執行重寫），視窗關掉也查得到。"""
     print(msg, flush=True)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
 
 
 def api(method, path, **kw):
@@ -89,17 +99,21 @@ def first_pages(path, n=6):
     return out.getvalue()
 
 
-def pick_latest(case_dir, cat, keywords, excludes=()):
-    """案場資料夾底下的某分類資料夾裡，檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
+def pick_latest(case_dirs, cat, keywords, excludes=()):
+    """案場資料夾（同一案可能有好幾個：地區資料夾、買賣合約相關、撤案案件…，2026-10-25 起合併看）底下，
+    檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
+    if isinstance(case_dirs, str):
+        case_dirs = [case_dirs]
     cands = []
-    if cat is None:
-        folders = [dp for dp, _, _ in os.walk(case_dir)]
-    else:
-        folders = []
-        for d in os.listdir(case_dir):
-            m = CAT_RE.match(d)
-            if m and m.group(1) == cat and os.path.isdir(os.path.join(case_dir, d)):
-                folders.append(os.path.join(case_dir, d))
+    folders = []
+    for case_dir in case_dirs:
+        if cat is None:
+            folders += [dp for dp, _, _ in os.walk(case_dir)]
+        else:
+            for d in os.listdir(case_dir):
+                m = CAT_RE.match(d)
+                if m and m.group(1) == cat and os.path.isdir(os.path.join(case_dir, d)):
+                    folders.append(os.path.join(case_dir, d))
     for folder in folders:
         for fn in os.listdir(folder):
             if (any(k in fn for k in keywords) and not any(x in fn for x in excludes)
@@ -124,6 +138,10 @@ def main():
     ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商／工程合約（掛表資訊確認用）")
     args = ap.parse_args()
     args.root = args.root or DEFAULT_ROOTS
+    try:
+        open(LOG_PATH, "w", encoding="utf-8").close()   # 每次執行重寫記錄檔
+    except OSError:
+        pass
     log(datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + " 開始同步")
     kinds = [k for k in KINDS if k[0] in CONTRACT_KINDS] if args.contracts_only else KINDS
 
@@ -148,11 +166,18 @@ def main():
                 return 1
         log(f"還沒出貨的訂單共 {len(only)} 個案件")
     up = skip = fail = 0
-    too_big = []
+    too_big, failed = [], []
+    # 同一個案號可能有好幾個資料夾（地區資料夾＋「買賣合約相關」＋「撤案案件」…）→ 合併成一案一起挑最新的，
+    # 不然兩個資料夾的檔案會輪流蓋掉對方（2026-10-25 發現：每次都整批重傳的真正原因）
+    merged = {}
     for root in args.root:
-        cases = find_cases(root)
-        log(f"{root}：找到 {len(cases)} 個案場資料夾")
-        for case_no, case_dir in cases:
+        found = find_cases(root)
+        log(f"{root}：找到 {len(found)} 個案場資料夾")
+        for case_no, case_dir in found:
+            merged.setdefault(case_no, []).append(case_dir)
+    log(f"合併後共 {len(merged)} 個案件")
+    if True:
+        for case_no, case_dir in merged.items():
             if args.case and args.case != case_no:
                 continue
             if args.open_orders and case_no not in only:
@@ -162,6 +187,7 @@ def main():
                     best = pick_latest(case_dir, cat, kw, ex)
                 except OSError as e:
                     log(f"  ✗ {case_no} {kind} 讀資料夾失敗：{e}")
+                    failed.append((case_no, kind, "", f"讀資料夾失敗：{e}"))
                     fail += 1
                     continue
                 if not best:
@@ -193,19 +219,31 @@ def main():
                         data_bytes = f.read()
                 data = base64.b64encode(data_bytes).decode()
                 try:
-                    r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
-                        "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
-                        "orig_size": size, "data": data})
-                    if r.status_code >= 400:
-                        raise Exception(r.text[:200])
+                    for attempt in (1, 2):   # 主控台剛好在重新部署時會失敗 → 等 30 秒再試一次
+                        try:
+                            r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
+                                "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
+                                "orig_size": size, "data": data})
+                            if r.status_code >= 400:
+                                raise Exception(f"HTTP {r.status_code} {r.text[:200]}")
+                            break
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            time.sleep(30)
                     j = r.json()
                     info = ("（容量／電價主控台背景讀取中）" if j.get("parsing") else "") + (j.get("note") or "")
                     log(f"  ✓ {case_no} {kind}：{fn}{info}")
                     up += 1
                 except Exception as e:
                     log(f"  ✗ {case_no} {kind}：{fn} 上傳失敗：{e}")
+                    failed.append((case_no, kind, fn, str(e)[:120]))
                     fail += 1
     log(f"\n完成：上傳 {up}、沒變略過 {skip}、失敗 {fail}")
+    if failed:
+        log(f"\n失敗清單（{len(failed)} 份，再跑一次會重試）：")
+        for c, k, fn, why in failed:
+            log(f"  {c} {k}：{fn} → {why}")
     if too_big:
         log(f"\n超過 30MB 沒上傳（{len(too_big)} 份；先執行 py -m pip install pypdf 再跑一次，就會自動只傳前 6 頁）：")
         for c, k, fn, mb in too_big:
