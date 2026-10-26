@@ -8562,6 +8562,11 @@ def procurement_drawings_sync():
     key = f"{case_no}|{kind}"
     parse = kind in CONTRACT_KINDS or kind == ENG_KIND
     store, note = data, ("（原檔太大，只存前 6 頁）" if body.get("trimmed") else "")   # trimmed：本機已切前 6 頁
+    # 2026-10-26：契約文字辨識（文字層＋Google OCR）搬到使用者電腦（drawing_sync.py）做，伺服器只用文字算容量／電價（很輕）。
+    # body.text＝本機讀到的文字；body.text_failed＝本機讀不到的原因。兩個都沒有（舊版同步程式、頁面手動上傳）才退回伺服器背景讀。
+    text_in = body.get("text") if isinstance(body.get("text"), str) else ""
+    text_failed = (body.get("text_failed") or "").strip() if isinstance(body.get("text_failed"), str) else ""
+    local_read = bool(parse and (text_in.strip() or text_failed))
     if len(data) > PDF_MAX_BYTES:
         store, note = _pdf_first_pages(data, 6), "（原檔太大，只存前 6 頁）"
         if len(store) > PDF_MAX_BYTES:
@@ -8578,7 +8583,7 @@ def procurement_drawings_sync():
             DRAWING_F["doc_date"]: (body.get("doc_date") or "")[:20], DRAWING_F["src_path"]: (body.get("src_path") or "")[:1000],
             DRAWING_F["mtime"]: (body.get("mtime") or "")[:30],
             DRAWING_F["size_kb"]: round((body.get("orig_size") or len(data)) / 1024),   # 原檔大小（本機切過頁也記原檔），同步程式比對用
-            **({DRAWING_F["cap_src"]: ("讀取中…" if store is not None else "原檔太大、沒存附件，讀不到") + note} if parse else {})}}, timeout=30)
+            **(_drawing_parse_fields(kind, text_in, text_failed, note, store is not None) if parse else {})}}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)
         rid = resp.json()["id"]
@@ -8590,9 +8595,75 @@ def procurement_drawings_sync():
                 raise
         for o in old:   # 新的上傳成功後才刪舊的
             requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
-        if parse and store is not None:
+        if parse and store is not None and not local_read:
             _parse_enqueue(rid)   # 只排記錄 ID，輪到時再從附件下載（2026-10-25：原本每份檔案留在記憶體排隊 → 記憶體爆掉、伺服器一直重開）
-        return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": parse, "note": note})
+        return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": bool(parse and not local_read), "local_read": local_read, "note": note})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+
+
+def _drawing_fields_from_text(kind, text, note=""):
+    """契約文字 → 容量（工程合約另有電價／單價）。純文字規則，很輕。"""
+    if kind == ENG_KIND:
+        ev = _eng_contract_values(text)
+        return {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
+                DRAWING_F["cap_src"]: (ev["src"] + note)[:200]}
+    v, why = _contract_capacity(text, kind)
+    return {DRAWING_F["cap"]: v, DRAWING_F["cap_src"]: ((why or "") + note)[:200]}
+
+
+def _drawing_parse_fields(kind, text_in, text_failed, note, has_attachment):
+    """上傳時一起寫進新記錄的讀取欄位：本機有文字就直接算；本機讀不到就記原因；都沒有才標「讀取中」交給伺服器背景讀。"""
+    if text_in.strip():
+        return {**_drawing_fields_from_text(kind, text_in, note + "（本機讀取）"), DRAWING_F["text"]: text_in[:3000]}
+    if text_failed:
+        return {DRAWING_F["cap_src"]: ("本機讀不到文字：" + text_failed + note)[:200]}
+    return {DRAWING_F["cap_src"]: ("讀取中…" if has_attachment else "原檔太大、沒存附件，讀不到") + note}
+
+
+@app.route("/api/procurement/drawings/unread")
+def procurement_drawings_unread():
+    """本機 drawing_sync.py --reparse 用：台電契約／細協／修約／工程合約裡「還沒讀到容量」的記錄（含附件網址），
+    由使用者電腦下載、本機辨識文字後用 /parsed 回傳。"""
+    kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
+    try:
+        recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())",
+                                [DRAWING_F[k] for k in ("key", "kind", "file", "cap_src", "text")])
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    items = []
+    for r in recs:
+        f = r["fields"]
+        att = (f.get(DRAWING_F["file"]) or [{}])[0]
+        items.append({"id": r["id"], "key": f.get(DRAWING_F["key"], ""), "kind": f.get(DRAWING_F["kind"], ""),
+                      "url": att.get("url", ""), "cap_src": f.get(DRAWING_F["cap_src"], ""), "has_text": bool((f.get(DRAWING_F["text"]) or "").strip())})
+    return jsonify({"items": items})
+
+
+@app.route("/api/procurement/drawings/parsed", methods=["POST"])
+def procurement_drawings_parsed():
+    """本機回傳辨識結果。body: {id, text} 或 {id, error}。"""
+    body = request.get_json(force=True) or {}
+    rid = (body.get("id") or "").strip()
+    if not rid.startswith("rec"):
+        return jsonify({"error": "缺少記錄 ID"}), 400
+    try:
+        r = requests.get(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=30)
+        if r.status_code == 404:
+            return jsonify({"ok": True, "gone": True})
+        r.raise_for_status()
+        f = r.json().get("fields", {})
+        kind = f.get(DRAWING_F["kind"])
+        if kind not in CONTRACT_KINDS + (ENG_KIND,):
+            return jsonify({"error": "這筆不是契約類"}), 400
+        note = "（原檔太大，只存前 6 頁）" if "只存前 6 頁" in (f.get(DRAWING_F["cap_src"]) or "") else ""
+        text = body.get("text") if isinstance(body.get("text"), str) else ""
+        if text.strip():
+            fields = {**_drawing_fields_from_text(kind, text, note + "（本機讀取）"), DRAWING_F["text"]: text[:3000]}
+        else:
+            fields = {DRAWING_F["cap_src"]: ("本機讀不到文字：" + str(body.get("error") or "沒有文字") + note)[:200]}
+        requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        return jsonify({"ok": True, "cap": fields.get(DRAWING_F["cap"]), "src": fields.get(DRAWING_F["cap_src"])})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
 
@@ -8674,19 +8745,27 @@ def _pdf_first_pages(data, n):
 
 
 def _reparse_unread_contracts(limit=3000):
-    """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的（讀不到、或重啟時卡在讀取中）→ 排進背景佇列。"""
+    """重讀案場圖面表裡「台電契約／細協／工程合約」還沒讀到數字的。
+    2026-10-26：有存文字的 → 用文字重算（很輕，排進背景佇列）；沒有文字的 → 要在使用者電腦做
+    （drawing_sync.py --reparse：本機下載、辨識），伺服器不再 OCR（會吃光 512MB 記憶體）。回傳 (排進佇列數, 需要本機處理數)。"""
     kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
-    recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())", [DRAWING_F["kind"]])
+    recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())", [DRAWING_F["kind"], DRAWING_F["text"]])
+    queued = need_local = 0
     for r in recs[:limit]:
-        _parse_enqueue(r["id"])
-    return min(len(recs), limit)
+        if (r["fields"].get(DRAWING_F["text"]) or "").strip():
+            _parse_enqueue(r["id"])
+            queued += 1
+        else:
+            need_local += 1
+    return queued, need_local
 
 
 @app.route("/api/procurement/drawings/reparse", methods=["POST"])
 def procurement_drawings_reparse():
     """掛表資訊確認頁「🔁 重讀讀不到的文件」。"""
     try:
-        return jsonify({"ok": True, "queued": _reparse_unread_contracts()})
+        queued, need_local = _reparse_unread_contracts()
+        return jsonify({"ok": True, "queued": queued, "need_local": need_local})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
 

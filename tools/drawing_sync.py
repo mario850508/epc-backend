@@ -9,6 +9,10 @@
   py drawing_sync.py "<root>" --dry-run                                                # 只列出會上傳什麼
   py drawing_sync.py "<root>\\06 潤特綠能" "<root>\\07 陽光工程" --contracts-only           # 只同步台電契約／細部協商（全部案場，檔案小）
 
+2026-10-26 起契約的文字辨識（PDF 文字層＋Google OCR）改在這台電腦做，再把文字傳給主控台算容量／電價
+（主控台只有 512MB 記憶體，辨識大檔會被系統殺掉、一直重開）。--reparse 會把主控台上「還沒讀到容量」的契約
+下載下來在本機重讀；平常執行完同步也會順便重讀一批（--reparse-limit，預設 100 份）。
+
 規則：每案每種類型只留「檔名日期最新」的一份 PDF；超過 5MB（Airtable 上限）的會列在最後面請人工處理；
 已經上傳過且檔名、修改時間都沒變的不重傳。需要環境變數 EPC_SERVICE_KEY（主控台有開登入保護時用）。
 """
@@ -115,6 +119,109 @@ def first_pages(path, n=6):
     return out.getvalue()
 
 
+_OCR_URL = {"v": None}
+
+
+def ocr_url():
+    """Google OCR（Apps Script）網址：跟「PDF 公文更名」同一個，從主控台設定讀。"""
+    if _OCR_URL["v"] is None:
+        try:
+            r = api("GET", "/api/pdf-rename/status", timeout=60)
+            _OCR_URL["v"] = ((r.json().get("settings") or {}).get("ocr_url") or "").strip()
+        except Exception as e:
+            log(f"讀取 OCR 設定失敗（之後的掃描檔會讀不到文字）：{e}")
+            _OCR_URL["v"] = ""
+    return _OCR_URL["v"]
+
+
+def _pdf_reader(data):
+    import io
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        from PyPDF2 import PdfReader
+    return PdfReader(io.BytesIO(data))
+
+
+def pdf_text_layer(data, pages=10):
+    return "\n".join((p.extract_text() or "") for p in _pdf_reader(data).pages[:pages])
+
+
+def first_pages_bytes(data, n=6):
+    import io
+    try:
+        from pypdf import PdfWriter
+    except ImportError:
+        from PyPDF2 import PdfWriter
+    reader = _pdf_reader(data)
+    if len(reader.pages) <= n:
+        return data
+    w = PdfWriter()
+    for pg in reader.pages[:n]:
+        w.add_page(pg)
+    out = io.BytesIO()
+    w.write(out)
+    return out.getvalue()
+
+
+def read_text(data, kind):
+    """契約 PDF → (文字, 讀不到的原因)。先讀文字層；沒有關鍵字（掃描檔）就用 Google OCR（只送前 6 頁）。"""
+    need = "躉購電價" if kind == "工程合約" else "總裝置容量"
+    text, err = "", ""
+    try:
+        text = pdf_text_layer(data)
+    except Exception as e:
+        err = f"讀文字層失敗：{e}"
+    if need in text:
+        return text, ""
+    url = ocr_url()
+    if not url:
+        return text, err or "掃描檔，主控台沒有設定 Google OCR"
+    try:
+        head = first_pages_bytes(data, 6)
+        resp = requests.post(url, json={"pdf": base64.b64encode(head).decode()}, timeout=300)
+        j = resp.json()
+        if not j.get("ok"):
+            return text, "OCR 失敗：" + str(j.get("error") or "未知錯誤")[:80]
+        return j.get("text") or text, ""
+    except Exception as e:
+        return text, f"OCR 失敗：{e}"[:120]
+
+
+def reparse_unread(limit):
+    """主控台上還沒讀到容量的契約：下載附件、本機辨識文字、回傳。"""
+    try:
+        items = api("GET", "/api/procurement/drawings/unread").json().get("items", [])
+    except Exception as e:
+        log(f"讀取待重讀清單失敗：{e}")
+        return
+    todo = [i for i in items if i.get("url")]
+    log(f"\n主控台上還沒讀到容量的契約 {len(items)} 份（有附件 {len(todo)} 份），這次處理 {min(limit, len(todo))} 份")
+    if not have_pdf_lib():
+        log("⚠️ 這台電腦沒有 PDF 套件（py -m pip install pypdf），沒辦法重讀")
+        return
+    ok = fail = 0
+    for it in todo[:limit]:
+        try:
+            data = requests.get(it["url"], timeout=180).content
+            text, why = read_text(data, it["kind"])
+            body = {"id": it["id"]}
+            if text.strip():
+                body["text"] = text[:6000]
+            else:
+                body["error"] = why or "沒有文字"
+            r = api("POST", "/api/procurement/drawings/parsed", json=body, timeout=120)
+            if r.status_code >= 400:
+                raise Exception(f"HTTP {r.status_code} {r.text[:120]}")
+            j = r.json()
+            log(f"  {'✓' if text.strip() else '·'} {it['key']}：{j.get('src') or why}")
+            ok += 1
+        except Exception as e:
+            log(f"  ✗ {it.get('key')}：{e}")
+            fail += 1
+    log(f"重讀完成：成功 {ok}、失敗 {fail}" + (f"，還有 {len(todo) - limit} 份下次再讀" if len(todo) > limit else ""))
+
+
 def pick_latest(case_dirs, cat, keywords, excludes=()):
     """案場資料夾（同一案可能有好幾個：地區資料夾、買賣合約相關、撤案案件…，2026-10-25 起合併看）底下，
     檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
@@ -152,6 +259,8 @@ def main():
     ap.add_argument("--open-orders", action="store_true",
                     help="只同步「還沒出貨」(已成立／可能撤案) 訂單的案件，省 Airtable 空間；全部案場約 1.4GB，不建議全傳")
     ap.add_argument("--contracts-only", action="store_true", help="只同步台電契約／細部協商／工程合約（掛表資訊確認用）")
+    ap.add_argument("--reparse", action="store_true", help="不掃資料夾，只把主控台上還沒讀到容量的契約下載下來在本機重讀")
+    ap.add_argument("--reparse-limit", type=int, default=100, help="每次最多重讀幾份（預設 100）")
     args = ap.parse_args()
     args.root = args.root or DEFAULT_ROOTS
     try:
@@ -160,6 +269,9 @@ def main():
         pass
     log(datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + " 開始同步")
     kinds = [k for k in KINDS if k[0] in CONTRACT_KINDS] if args.contracts_only else KINDS
+    if args.reparse:
+        reparse_unread(args.reparse_limit)
+        return 0
 
     try:
         r0 = api("GET", "/api/procurement/drawings/index")
@@ -237,12 +349,19 @@ def main():
                     with open(path, "rb") as f:
                         data_bytes = f.read()
                 data = base64.b64encode(data_bytes).decode()
+                extra = {}
+                if kind in CONTRACT_KINDS:    # 契約：文字在本機辨識，主控台只算容量／電價
+                    if have_pdf_lib():
+                        text, why = read_text(data_bytes, kind)
+                        extra = {"text": text[:6000]} if text.strip() else {"text_failed": why or "沒有文字"}
+                    else:
+                        extra = {"text_failed": "上傳的電腦沒有 PDF 套件（py -m pip install pypdf）"}
                 try:
                     for attempt in (1, 2, 3, 4):   # 主控台重開／部署時會 502 → 等 60 秒再試，最多 4 次
                         try:
                             r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
                                 "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
-                                "orig_size": size, "trimmed": len(data_bytes) < size, "data": data})
+                                "orig_size": size, "trimmed": len(data_bytes) < size, "data": data, **extra})
                             if r.status_code >= 400:
                                 raise Exception(f"HTTP {r.status_code} {r.text[:200]}")
                             break
@@ -252,7 +371,7 @@ def main():
                             log(f"    （主控台沒回應，60 秒後重試第 {attempt + 1} 次）")
                             time.sleep(60)
                     j = r.json()
-                    info = ("（容量／電價主控台背景讀取中）" if j.get("parsing") else "") + (j.get("note") or "")
+                    info = ("（本機已讀文字）" if j.get("local_read") else "（容量／電價主控台背景讀取中）" if j.get("parsing") else "") + (j.get("note") or "")
                     log(f"  ✓ {case_no} {kind}：{fn}{info}")
                     up += 1
                 except Exception as e:
@@ -260,6 +379,8 @@ def main():
                     failed.append((case_no, kind, fn, str(e)[:120]))
                     fail += 1
     log(f"\n完成：上傳 {up}、沒變略過 {skip}、失敗 {fail}")
+    if not args.dry_run and not args.case:
+        reparse_unread(args.reparse_limit)
     if failed:
         log(f"\n失敗清單（{len(failed)} 份，再跑一次會重試）：")
         for c, k, fn, why in failed:
