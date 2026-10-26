@@ -588,6 +588,8 @@ LINE_BIND_TABLE_ID = "tblkTLFeRSvqsVpBi"
 FIELD_BIND_NAME = "fldqJBVB9IYxnyWDR"
 FIELD_BIND_UID = "fld21MqIEDGkcJtl8"
 FIELD_BIND_DISPLAY = "fld5ebY8BPab9BotD"
+FIELD_BIND_SLACK_ID = "fldzoJNdxprGa6zJF"     # 2026-10-26 Slack 使用者ID（U 開頭）
+FIELD_BIND_SLACK_NAME = "fldZVMpSu6lNzr2vn"   # Slack 顯示名稱（辨認用）
 FIELD_BIND_SCHEDULER = "fldP46k7RInwCYXQV"  # 安排人員（checkbox）
 FIELD_BIND_BUYER = "fldVjHlrbO0SRTXQW"      # 採購（checkbox，2026-10-13）
 FIELD_BIND_DRIVER_NOTIFY = "fldju5cuteZnnsA5Q"  # 收出貨司機通知（checkbox）
@@ -1469,7 +1471,7 @@ def delete_vendor_slot_task(record_id):
 
 def _find_line_binding_record(name):
     escaped = (name or "").strip().replace("\\", "\\\\").replace("'", "\\'")
-    recs = airtable_get_all(LINE_BIND_API_URL, f"{{{FIELD_BIND_NAME}}}='{escaped}'", [FIELD_BIND_NAME, FIELD_BIND_UID])
+    recs = airtable_get_all(LINE_BIND_API_URL, f"{{{FIELD_BIND_NAME}}}='{escaped}'", [FIELD_BIND_NAME, FIELD_BIND_UID, FIELD_BIND_SLACK_ID, FIELD_BIND_SLACK_NAME])
     return recs[0] if recs else None
 
 
@@ -1536,13 +1538,36 @@ def _binding_name_candidates(name):
     return out
 
 
-def _get_line_binding(name):
+_BINDING_CACHE = {}   # 名字 → (時間, {"uid","slack"})；30 秒，綁定有變動就清掉
+
+
+def _get_binding(name):
+    """用名字查綁定：{"uid": LINE userId 或 None, "slack": Slack 使用者 ID 或 None}。名字的各種寫法都會試。"""
+    key = (name or "").strip()
+    hit = _BINDING_CACHE.get(key)
+    if hit and time.time() - hit[0] < 30:
+        return hit[1]
+    uid = slack = None
     for cand in _binding_name_candidates(name):
         rec = _find_line_binding_record(cand)
-        uid = (rec["fields"].get(FIELD_BIND_UID) if rec else None) or None
-        if uid:
-            return uid
-    return None
+        if not rec:
+            continue
+        f = rec["fields"]
+        uid = uid or (f.get(FIELD_BIND_UID) or None)
+        slack = slack or ((f.get(FIELD_BIND_SLACK_ID) or "").strip() or None)
+        if uid and slack:
+            break
+    out = {"uid": uid, "slack": slack}
+    _BINDING_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _get_line_binding(name):
+    return _get_binding(name)["uid"]
+
+
+def _get_slack_binding(name):
+    return _get_binding(name)["slack"]
 
 
 def _find_task_by_token(token):
@@ -6496,9 +6521,41 @@ scheduler.add_job(line_digest_tick, CronTrigger(minute="*/5", timezone="Asia/Tai
                   replace_existing=True, misfire_grace_time=900, coalesce=True, max_instances=1)
 
 
-def _line_push_text(text, to=None, immediate=False):
+SLACK_DEFAULT_KEY = "slack_default_user"    # 「我的通知」（沒有指定收件人的）同步到哪個 Slack 帳號：id|名稱
+
+
+def _slack_default_user():
+    try:
+        raw = _state_get(SLACK_DEFAULT_KEY)
+    except Exception:
+        return ""
+    return (raw or "").split("|")[0].strip()
+
+
+def _slack_notify(slack_id, payload):
+    """同步私訊到 Slack（payload 是卡片 dict 或純文字）；失敗只記 log、不影響 LINE。Slack 沒設定就直接略過。"""
+    if not slack_id or not _slack_token():
+        return False
+    try:
+        ok, err = _slack_dm(slack_id, card=payload) if isinstance(payload, dict) else _slack_dm(slack_id, text=str(payload))
+        if not ok:
+            print(f"[slack_notify] {slack_id} 失敗：{err}", flush=True)
+        return ok
+    except Exception as e:
+        print(f"[slack_notify] {slack_id} 例外：{e!r}", flush=True)
+        return False
+
+
+def _slack_notify_default(payload):
+    sid = _slack_default_user()
+    return _slack_notify(sid, payload) if sid else False
+
+
+def _line_push_text(text, to=None, immediate=False, slack=True):
     token, default_target = _line_config()
     target = to or default_target
+    if to is None and slack:
+        _slack_notify_default(text)    # 沒指定收件人＝「給你」的通知：同步到你的 Slack（Slack 沒有額度問題）
     if not token or not target:
         return False, "LINE 環境變數未設定"
     if _digest_should_queue(target, immediate) and _digest_enqueue(target, text=text):
@@ -6606,9 +6663,11 @@ def _card_plain_text(card):
     return "\n".join(lines)
 
 
-def _line_push_card(card, to=None, immediate=False):
+def _line_push_card(card, to=None, immediate=False, slack=True):
     token, default_target = _line_config()
     target = to or default_target
+    if to is None and slack:
+        _slack_notify_default(card)
     if not token or not target:
         return False, "LINE 環境變數未設定"
     if _digest_should_queue(target, immediate) and _digest_enqueue(target, card=card):
@@ -6629,7 +6688,7 @@ def _line_push_card(card, to=None, immediate=False):
         print(f"[_line_push_card] Flex 失敗，改用純文字：{resp.status_code} {resp.text[:200]}", flush=True)
     except Exception as e:
         print(f"[_line_push_card] Flex 例外，改用純文字：{e}", flush=True)
-    return _line_push_text(_card_plain_text(card), to=to, immediate=True)
+    return _line_push_text(_card_plain_text(card), to=to, immediate=True, slack=False)
 
 
 def _line_push_cards(cards, to):
@@ -6747,6 +6806,12 @@ def send_deadline_reminders():
             rep_ok, err = _line_push_card(rep_card, to=rep_uid)
             if not rep_ok:
                 print(f"[send_deadline_reminders] {case_no} 推播給業務失敗：{err}", flush=True)
+        try:   # 2026-10-26：業務有綁 Slack 就同步私訊
+            rep_slack = _get_slack_binding(f[FIELD_TASK_ASSIGNEE]) if f.get(FIELD_TASK_ASSIGNEE) else None
+            if rep_slack and _slack_notify(rep_slack, rep_card):
+                rep_ok = True
+        except Exception as e:
+            print(f"[send_deadline_reminders] Slack 失敗：{e}", flush=True)
         # 同時通知「安排人員」（建立任務的人）：期限快到、還沒安排完成＋目前狀態
         if owner_mode:
             stage_text = "已選好時間，等屋主按確認" if stage == TASK_STAGE_WAIT_REP else "屋主還沒填預約表"
@@ -6829,23 +6894,30 @@ def _notify_scheduler_one(creator, headline):
     if not token or not creator:
         return False
     try:
-        uid = _get_line_binding(creator)
-        if not uid:
+        b = _get_binding(creator)
+        if not b["uid"] and not b["slack"]:
             return False
         try:
             summary = _scheduler_summary(creator)
         except Exception as e:
             summary = ""
             print(f"[_notify_scheduler] 組狀態摘要失敗：{e}", flush=True)
+        ok = False
         if isinstance(headline, dict):
             card = dict(headline)
             card["footer"] = summary
-            ok, err = _line_push_card(card, to=uid)
+            if b["uid"]:
+                ok, err = _line_push_card(card, to=b["uid"])
+            payload = card
         else:
-            ok, err = _line_push_text(headline + ("\n\n" + summary if summary else ""), to=uid)
-        if not ok:
+            text = headline + ("\n\n" + summary if summary else "")
+            if b["uid"]:
+                ok, err = _line_push_text(text, to=b["uid"])
+            payload = text
+        if b["uid"] and not ok:
             print(f"[_notify_scheduler] 推播給 {creator} 失敗：{err}", flush=True)
-        return ok
+        slack_ok = _slack_notify(b["slack"], payload) if b["slack"] else False
+        return ok or slack_ok
     except Exception as e:
         print(f"[_notify_scheduler] 例外：{e}", flush=True)
         return False
@@ -6877,16 +6949,17 @@ def _push_to_name(name, text):
     if not name:
         return False
     try:
-        uid = _get_line_binding(name)
+        b = _get_binding(name)
     except Exception as e:
         print(f"[_push_to_name] 查綁定失敗：{e}", flush=True)
         return False
-    if not uid:
-        return False
-    ok, err = _line_push_card(text, to=uid) if isinstance(text, dict) else _line_push_text(text, to=uid)
-    if not ok:
-        print(f"[_push_to_name] 推播給 {name} 失敗：{err}", flush=True)
-    return ok
+    ok = False
+    if b["uid"]:
+        ok, err = _line_push_card(text, to=b["uid"]) if isinstance(text, dict) else _line_push_text(text, to=b["uid"])
+        if not ok:
+            print(f"[_push_to_name] 推播給 {name} 失敗：{err}", flush=True)
+    slack_ok = _slack_notify(b["slack"], text) if b["slack"] else False   # 2026-10-26：有綁 Slack 就同步私訊
+    return ok or slack_ok
 
 
 DAY_BEFORE_STATE = {}  # 最近一次前日提醒排程的執行狀態（給 /api/line/status 看，方便排查）
@@ -7531,6 +7604,104 @@ def _owner_invite_text(task, link):
     return (f"您好，我是陽光伏特家的業務{task.get('assignee') or ''}。\n"
             f"我們要幫您安排「{items}」，{ask}\n{link}\n\n{when}"
             "如果不方便操作，直接回覆我就可以了，謝謝您！")
+
+
+def _bind_people():
+    """Slack 綁定畫面的人員名單：綁定表（LINE／Slack 任一）＋業務名單＋公文更名的 PM。回 [{name, line, slack_id, slack_name, record_id}]。"""
+    recs = airtable_get_all(LINE_BIND_API_URL, "TRUE()", [FIELD_BIND_NAME, FIELD_BIND_UID, FIELD_BIND_SLACK_ID, FIELD_BIND_SLACK_NAME, FIELD_BIND_SCHEDULER])
+    people, seen = [], set()
+    for r in recs:
+        f = r["fields"]
+        name = (f.get(FIELD_BIND_NAME) or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        people.append({"name": name, "line": bool(f.get(FIELD_BIND_UID)), "slack_id": (f.get(FIELD_BIND_SLACK_ID) or "").strip(),
+                       "slack_name": (f.get(FIELD_BIND_SLACK_NAME) or "").strip(), "record_id": r["id"], "scheduler": bool(f.get(FIELD_BIND_SCHEDULER))})
+    extra = [x["name"] for x in _load_reps().get("reps", [])] + list(_pdf_settings().get("pm_names") or [])
+    for name in extra:
+        name = (name or "").strip()
+        if name and name not in seen and _canon_rep(name) not in seen:
+            seen.add(name)
+            people.append({"name": name, "line": False, "slack_id": "", "slack_name": "", "record_id": "", "scheduler": False})
+    people.sort(key=lambda x: (not (x["line"] or x["slack_id"]), x["name"]))
+    return people
+
+
+@app.route("/api/slack/bindings")
+def slack_bindings_list():
+    try:
+        people = _bind_people()
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    raw = ""
+    try:
+        raw = _state_get(SLACK_DEFAULT_KEY)
+    except Exception:
+        pass
+    did, _, dname = (raw or "").partition("|")
+    return jsonify({"configured": bool(_slack_token()), "people": people, "default": {"id": did.strip(), "name": dname.strip()}})
+
+
+@app.route("/api/slack/bindings", methods=["POST"])
+def slack_bindings_set():
+    """body: {name, slack_id, slack_name}；slack_id 空＝解除。沒有這個人的綁定記錄就新增一筆（只有 Slack、沒有 LINE 也可以）。"""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    sid = (body.get("slack_id") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少人員名字"}), 400
+    if sid and not re.fullmatch(r"[UW][A-Z0-9]{6,}", sid):
+        return jsonify({"error": "Slack 使用者 ID 格式不對"}), 400
+    try:
+        rec = None
+        for cand in _binding_name_candidates(name):
+            rec = _find_line_binding_record(cand)
+            if rec:
+                break
+        fields = {FIELD_BIND_SLACK_ID: sid, FIELD_BIND_SLACK_NAME: (body.get("slack_name") or "").strip()[:60] if sid else ""}
+        if rec:
+            resp = requests.patch(f"{LINE_BIND_API_URL}/{rec['id']}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        elif sid:
+            resp = requests.post(LINE_BIND_API_URL, headers=airtable_headers(), json={"fields": {FIELD_BIND_NAME: name, **fields}}, timeout=20)
+        else:
+            return jsonify({"ok": True})
+        if resp.status_code >= 400:
+            raise Exception(resp.text)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    _BINDING_CACHE.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/slack/default-user", methods=["POST"])
+def slack_default_user_set():
+    """「我的通知」（明日行程總覽、出貨日期更新、廠商申請…這些沒有指定收件人的）同步到哪個 Slack 帳號。slack_id 空＝關閉。"""
+    body = request.get_json(silent=True) or {}
+    sid = (body.get("slack_id") or "").strip()
+    if sid and not re.fullmatch(r"[UW][A-Z0-9]{6,}", sid):
+        return jsonify({"error": "Slack 使用者 ID 格式不對"}), 400
+    try:
+        _state_set(SLACK_DEFAULT_KEY, f"{sid}|{(body.get('slack_name') or '').strip()[:60]}" if sid else "")
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/slack/test", methods=["POST"])
+def slack_test_dm():
+    """傳一則測試私訊確認綁定正確。body: {slack_id} 或 {name}。"""
+    body = request.get_json(silent=True) or {}
+    sid = (body.get("slack_id") or "").strip()
+    if not sid and body.get("name"):
+        sid = _get_slack_binding(body["name"]) or ""
+    if not sid:
+        return jsonify({"error": "還沒有綁定 Slack"}), 400
+    ok, err = _slack_dm(sid, card=_card("✅ Slack 綁定成功", "#2B5FF6", "陽光機器人測試訊息",
+                                        note="之後業務／安排人員的通知（預約確認、期限提醒、明日行程…）會同步私訊到這裡。這則是測試，請忽略。"))
+    if not ok:
+        return jsonify({"error": f"Slack 傳送失敗：{err}"}), 502
+    return jsonify({"ok": True})
 
 
 @app.route("/api/slack/task-card", methods=["POST"])
