@@ -8951,7 +8951,11 @@ def _contract_capacity(text, kind):
             # 台電契約移轉函：「(電號:…)裝置容量為19.68kWp之再生能源發電系統」
             r"裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
             # 雲林區細協：「不需要(原因:17.16kwp-1433110/220V)」（要有 p，避免抓到「100kW以上者」）
-            r"(?<![\d.])" + _CAP_NUM + r"\s*[kK][wW][pP]"]
+            r"(?<![\d.])" + _CAP_NUM + r"\s*[kK][wW][pP]",
+            # 2026-10-26：OCR 把「合計總裝置容量為 14.62」跟「(峰)瓩」拆到不同行 → 數字後面沒單位也收（要有小數或在行尾）
+            r"合計總裝置容量\s*為?\s*(\d+(?:\.\d+)?)(?=\s)",
+            # 彰化區細協：「受理編號:106115PV0184潤特綠能股份有限公司 9.45kw」（要有小數，避免「100KW以上者」）
+            r"(?<![\d.])(\d+\.\d+)\s*[kK][wW](?![hH])"]
     for p in pats:
         ms = list(re.finditer(p, t))
         if ms:
@@ -9018,6 +9022,12 @@ def _eng_contract_values(text):
     m = re.search(r"工程總價\s*:?\s*(?:新台幣|新臺幣)?\s*([\d,]{5,})\s*元", t) or re.search(r"([\d,]{6,})\s*元\s*\(\s*含稅", t)
     if m:
         out["total"] = num(m.group(1))
+    # 2026-10-26：容量讀不到（OCR 常把「12.6 kWp」讀成「12. kWp」）→ 用 工程總價(含稅) ÷ 1.05 ÷ 工程單價 算回來
+    if out["cap"] is None and out["total"] and out["unit_price"]:
+        v = round(out["total"] / 1.05 / out["unit_price"], 3)
+        if 0 < v < 100000:
+            out["cap"] = v
+            out["src"].insert(0, f"容量 {v} kWp（總價÷1.05÷單價）")
     out["src"] = "、".join(out["src"]) or "合約裡找不到容量／電價"
     return out
 
