@@ -7695,6 +7695,164 @@ def slack_default_user_set():
     return jsonify({"ok": True})
 
 
+# ---- 2026-10-26：人員離職＋職務代理人 ----
+# 離職人員從「Slack、LINE 綁定」名單刪除：解除 LINE／Slack 綁定、業務名單標為停用，並可選一位職務代理人，
+# 把這個人還沒完成的指派任務（業務／安排人員）、今天起的預約（登記人）、進行中的聯合排程（安排人員）轉給代理人；
+# 舊名字另外記成代理人的別名（業務名單），之後用舊名字（例如業務自治區案件的業務欄）查人，都會對到代理人。
+def _resign_variants(name):
+    """這個人所有可能的寫法（括號、別名、統一名字）。"""
+    name = (name or "").strip()
+    v = {name} | set(_binding_name_candidates(name))
+    canon = _canon_rep(name)
+    for r in _load_reps(force=True).get("reps", []):
+        if r["name"] == canon or r["name"] == name:
+            v |= {r["name"]} | set(r.get("aliases") or [])
+    return {x for x in v if x}
+
+
+def _resign_scan(name):
+    """離職人員名下還沒結束的資料：任務、預約、聯合排程。回 (variants, tasks, bookings, groups)，每筆是 Airtable 記錄。"""
+    variants = _resign_variants(name)
+    orv = lambda fn: "OR(" + ",".join(fn(_vp_esc(v)) for v in sorted(variants)) + ")"
+    tasks = airtable_get_all(
+        TASK_API_URL,
+        f"AND({{{FIELD_TASK_STATUS}}}='{TASK_STATUS_PENDING}'," + orv(lambda v: f"{{{FIELD_TASK_ASSIGNEE}}}='{v}',FIND('{v}',{{{FIELD_TASK_CREATOR}}}&'')>0") + ")",
+        [FIELD_TASK_ASSIGNEE, FIELD_TASK_CREATOR, FIELD_TASK_CASE_NO, FIELD_TASK_TYPE])
+    bookings = airtable_get_all(
+        SLOT_API_URL,
+        f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days'))," + orv(lambda v: f"{{{FIELD_SLOT_REGISTRANT}}}='{v}'") + ")",
+        [FIELD_SLOT_REGISTRANT, FIELD_SLOT_CASE_NO, FIELD_SLOT_DATE, FIELD_SLOT_TYPE])
+    groups = airtable_get_all(
+        GROUP_API_URL,
+        f"AND(NOT({{{G_STATUS}}}='{GS_DONE}'),NOT({{{G_STATUS}}}='{GS_CANCEL}')," + orv(lambda v: f"FIND('{v}',{{{G_CREATORS}}}&'')>0") + ")",
+        [G_TITLE, G_CREATORS])
+    return variants, tasks, bookings, groups
+
+
+@app.route("/api/people/resign-preview", methods=["POST"])
+def people_resign_preview():
+    name = ((request.get_json(silent=True) or {}).get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少人員名字"}), 400
+    try:
+        variants, tasks, bookings, groups = _resign_scan(name)
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+    as_rep = [t for t in tasks if (t["fields"].get(FIELD_TASK_ASSIGNEE) or "") in variants]
+    as_creator = [t for t in tasks if any(n in variants for n in _split_names(t["fields"].get(FIELD_TASK_CREATOR) or ""))]
+    label = lambda t: f"{t['fields'].get(FIELD_TASK_CASE_NO, '')} {'、'.join(t['fields'].get(FIELD_TASK_TYPE) or [])}".strip()
+    return jsonify({"name": name, "variants": sorted(variants),
+                    "tasks_as_rep": len(as_rep), "tasks_as_creator": len(as_creator),
+                    "bookings": len(bookings), "groups": len(groups),
+                    "samples": [label(t) for t in tasks[:8]]})
+
+
+@app.route("/api/people/resign", methods=["POST"])
+def people_resign():
+    """body: {name, replacement?}。replacement＝職務代理人（名字）；沒填就只做刪除（任務維持原樣）。"""
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    replacement = (body.get("replacement") or "").strip()
+    if not name:
+        return jsonify({"error": "缺少人員名字"}), 400
+    try:
+        b = _get_binding(name)
+        if b["slack"] and b["slack"] == _slack_default_user():
+            return jsonify({"error": "這位是「我的通知」的收件人（你本人），不能當離職人員刪除；要刪請先把「我的通知」改成別人"}), 400
+        variants, tasks, bookings, groups = _resign_scan(name)
+        if replacement and (replacement in variants or _canon_rep(replacement) in variants):
+            return jsonify({"error": "職務代理人不能是本人"}), 400
+        done = {"tasks": 0, "bookings": 0, "groups": 0}
+        errors = []
+
+        def swap(csv):
+            names = _split_names(csv)
+            out = []
+            for n in names:
+                n2 = replacement if n in variants else n
+                if n2 and n2 not in out:
+                    out.append(n2)
+            return "、".join(out)
+
+        if replacement:
+            for t in tasks:
+                f, fields = t["fields"], {}
+                if (f.get(FIELD_TASK_ASSIGNEE) or "") in variants:
+                    fields[FIELD_TASK_ASSIGNEE] = replacement
+                cr = f.get(FIELD_TASK_CREATOR) or ""
+                if any(n in variants for n in _split_names(cr)):
+                    fields[FIELD_TASK_CREATOR] = swap(cr)
+                if fields:
+                    try:
+                        _patch_task(t["id"], fields, typecast=True)
+                        done["tasks"] += 1
+                    except Exception as e:
+                        errors.append(f"任務 {f.get(FIELD_TASK_CASE_NO, '')}：{str(e)[:80]}")
+                    time.sleep(0.22)
+            for b in bookings:
+                try:
+                    r = requests.patch(f"{SLOT_API_URL}/{b['id']}", headers=airtable_headers(),
+                                       json={"fields": {FIELD_SLOT_REGISTRANT: replacement}, "typecast": True}, timeout=20)
+                    if r.status_code >= 400:
+                        raise Exception(r.text)
+                    done["bookings"] += 1
+                except Exception as e:
+                    errors.append(f"預約 {b['fields'].get(FIELD_SLOT_CASE_NO, '')}：{str(e)[:80]}")
+                time.sleep(0.22)
+            for g in groups:
+                try:
+                    _patch_group(g["id"], {G_CREATORS: swap(g["fields"].get(G_CREATORS) or "")})
+                    done["groups"] += 1
+                except Exception as e:
+                    errors.append(f"聯合排程 {g['fields'].get(G_TITLE, '')}：{str(e)[:80]}")
+                time.sleep(0.22)
+        # 解除 LINE／Slack 綁定（刪掉這個人所有寫法的綁定記錄）
+        removed_bind = 0
+        for v in variants:
+            rec = _find_line_binding_record(v)
+            while rec:
+                requests.delete(f"{LINE_BIND_API_URL}/{rec['id']}", headers=airtable_headers(), timeout=20).raise_for_status()
+                removed_bind += 1
+                time.sleep(0.22)
+                rec = _find_line_binding_record(v)
+        # 業務名單：本人標為停用；舊名字記成代理人的別名
+        rep_info = ""
+        try:
+            reps = airtable_get_all(REP_API_URL, "TRUE()", [REP_FIELD_NAME, REP_FIELD_ALIASES, REP_FIELD_ACTIVE])
+            repl_rec = next((r for r in reps if (r["fields"].get(REP_FIELD_NAME) or "").strip() in (replacement, _canon_rep(replacement))), None) if replacement else None
+            for r in reps:
+                rn = (r["fields"].get(REP_FIELD_NAME) or "").strip()
+                if rn in variants and (not repl_rec or r["id"] != repl_rec["id"]):
+                    requests.patch(f"{REP_API_URL}/{r['id']}", headers=airtable_headers(), json={"fields": {REP_FIELD_ACTIVE: False}}, timeout=20).raise_for_status()
+                    rep_info = "已從業務名單停用"
+                    time.sleep(0.22)
+            if repl_rec:
+                old_aliases = [a.strip() for a in (repl_rec["fields"].get(REP_FIELD_ALIASES) or "").replace("，", "\n").replace(",", "\n").splitlines() if a.strip()]
+                new_aliases = list(dict.fromkeys(old_aliases + [v for v in sorted(variants) if v != (repl_rec["fields"].get(REP_FIELD_NAME) or "").strip()]))
+                if new_aliases != old_aliases:
+                    requests.patch(f"{REP_API_URL}/{repl_rec['id']}", headers=airtable_headers(),
+                                   json={"fields": {REP_FIELD_ALIASES: "\n".join(new_aliases)}}, timeout=20).raise_for_status()
+                    rep_info += "；舊名字已記為代理人的別名"
+        except Exception as e:
+            errors.append(f"業務名單：{str(e)[:100]}")
+        _REP_CACHE["at"] = 0
+        _BINDING_CACHE.clear()
+        # 公文更名的 PM 名單也拿掉
+        try:
+            ps = dict(_pdf_settings())
+            pm = [x for x in (ps.get("pm_names") or []) if x not in variants]
+            if len(pm) != len(ps.get("pm_names") or []):
+                ps["pm_names"] = pm
+                _pdf_save_settings(ps)
+        except Exception as e:
+            errors.append(f"PM 名單：{str(e)[:100]}")
+        print(f"[people_resign] {name} → {replacement or '（無代理人）'}：{done}、綁定 {removed_bind}、{rep_info}、錯誤 {errors}", flush=True)
+        return jsonify({"ok": not errors, "name": name, "replacement": replacement, "moved": done, "bindings_removed": removed_bind,
+                        "rep_info": rep_info, "unmoved_tasks": 0 if replacement else len(tasks), "errors": errors})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+
+
 @app.route("/api/slack/test", methods=["POST"])
 def slack_test_dm():
     """傳一則測試私訊確認綁定正確。body: {slack_id} 或 {name}。"""
