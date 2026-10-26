@@ -8760,6 +8760,27 @@ def _reparse_unread_contracts(limit=3000):
     return queued, need_local
 
 
+def _resume_stuck_parses(batch=20):
+    """每 10 分鐘：背景佇列空著的時候，挑最多 20 份卡在「讀取中…」的契約排進去（伺服器重開會丟掉佇列）。
+    一次只排一小批，不會像以前開機重讀一次排幾百份把記憶體塞爆（2026-10-25 拿掉的原因）。"""
+    if _PARSE_Q.qsize() > 0 or _PARSE_PENDING:
+        return
+    try:
+        kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
+        recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK(),FIND('讀取中',{"
+                                + DRAWING_F["cap_src"] + "})=1)", [DRAWING_F["kind"]])
+        for r in recs[:batch]:
+            _parse_enqueue(r["id"])
+        if recs:
+            print(f"[resume_stuck_parses] 卡在讀取中 {len(recs)} 份，這輪排 {min(len(recs), batch)} 份", flush=True)
+    except Exception as e:
+        print(f"[resume_stuck_parses] 失敗：{e}", flush=True)
+
+
+scheduler.add_job(_resume_stuck_parses, CronTrigger(minute="*/10", timezone="Asia/Taipei"), id="resume_stuck_parses",
+                  replace_existing=True, misfire_grace_time=300, max_instances=1)
+
+
 @app.route("/api/procurement/drawings/reparse", methods=["POST"])
 def procurement_drawings_reparse():
     """掛表資訊確認頁「🔁 重讀讀不到的文件」。"""
