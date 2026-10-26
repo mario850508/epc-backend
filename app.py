@@ -9122,7 +9122,10 @@ def procurement_drawings_unread():
     由使用者電腦下載、本機辨識文字後用 /parsed 回傳。"""
     kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
     # 本機已經讀過（讀到文字但文件裡真的沒有容量、或本機讀不到文字）的不再列，不然每天重讀同一批；?all=1 才全列
-    skip_done = "" if request.args.get("all") else ",NOT(FIND('本機讀', {" + DRAWING_F["cap_src"] + "}&'')>0)"
+    # 2026-10-26：但「OCR 失敗／下載到的不是 PDF」是一時的（例如附件網址過期），要再列出來重讀
+    src = "{" + DRAWING_F["cap_src"] + "}&''"
+    retry = "OR(" + ",".join(f"FIND('{w}',{src})>0" for w in ("OCR 失敗", "不是 PDF", "Stream has ended", "讀檔失敗", "timed out", "Timeout")) + ")"
+    skip_done = "" if request.args.get("all") else f",OR(NOT(FIND('本機讀',{src})>0),{retry})"
     try:
         recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK()" + skip_done + ")",
                                 [DRAWING_F[k] for k in ("key", "kind", "file", "cap_src", "text")])
