@@ -8626,8 +8626,10 @@ def procurement_drawings_unread():
     """本機 drawing_sync.py --reparse 用：台電契約／細協／修約／工程合約裡「還沒讀到容量」的記錄（含附件網址），
     由使用者電腦下載、本機辨識文字後用 /parsed 回傳。"""
     kinds = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + k + "'" for k in CONTRACT_KINDS + (ENG_KIND,)) + ")"
+    # 本機已經讀過（讀到文字但文件裡真的沒有容量、或本機讀不到文字）的不再列，不然每天重讀同一批；?all=1 才全列
+    skip_done = "" if request.args.get("all") else ",NOT(FIND('本機讀', {" + DRAWING_F["cap_src"] + "}&'')>0)"
     try:
-        recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK())",
+        recs = airtable_get_all(DRAWING_API_URL, "AND(" + kinds + ",{" + DRAWING_F["cap"] + "}=BLANK()" + skip_done + ")",
                                 [DRAWING_F[k] for k in ("key", "kind", "file", "cap_src", "text")])
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
