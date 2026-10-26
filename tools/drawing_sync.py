@@ -189,21 +189,44 @@ def read_text(data, kind):
 
 
 def reparse_unread(limit):
-    """主控台上還沒讀到容量的契約：下載附件、本機辨識文字、回傳。"""
+    """主控台上還沒讀到容量的契約：下載附件、本機辨識文字、回傳。
+    2026-10-26：Airtable 附件網址約 2 小時就過期（下載到的會是「This URL has expired…」文字），
+    一次重讀幾百份要跑好幾小時 → 每 45 分鐘重拿一次網址；下載到的不是 PDF 也會換新網址再試一次。"""
+    def fetch_urls():
+        return {i["id"]: i for i in api("GET", "/api/procurement/drawings/unread").json().get("items", [])}
     try:
-        items = api("GET", "/api/procurement/drawings/unread").json().get("items", [])
+        items = fetch_urls()
     except Exception as e:
         log(f"讀取待重讀清單失敗：{e}")
         return
-    todo = [i for i in items if i.get("url")]
+    fetched_at = time.time()
+    todo = [i for i in items.values() if i.get("url")]
     log(f"\n主控台上還沒讀到容量的契約 {len(items)} 份（有附件 {len(todo)} 份），這次處理 {min(limit, len(todo))} 份")
     if not have_pdf_lib():
         log("⚠️ 這台電腦沒有 PDF 套件（py -m pip install pypdf），沒辦法重讀")
         return
+
+    def download(rid):
+        nonlocal items, fetched_at
+        if time.time() - fetched_at > 45 * 60:
+            items, fetched_at = fetch_urls(), time.time()
+        for attempt in (1, 2):
+            it = items.get(rid)
+            if not it or not it.get("url"):
+                return None
+            data = requests.get(it["url"], timeout=180).content
+            if data[:5] == b"%PDF-":
+                return data
+            if attempt == 1:   # 網址過期 → 重拿一次再試
+                items, fetched_at = fetch_urls(), time.time()
+        raise Exception("下載到的不是 PDF（附件網址過期或檔案壞掉）")
+
     ok = fail = 0
     for it in todo[:limit]:
         try:
-            data = requests.get(it["url"], timeout=180).content
+            data = download(it["id"])
+            if data is None:
+                continue   # 這期間已經被讀好或被新的一份取代
             text, why = read_text(data, it["kind"])
             body = {"id": it["id"]}
             if text.strip():
