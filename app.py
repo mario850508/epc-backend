@@ -8433,7 +8433,8 @@ DRAWING_F = {"key": "fldFRnNFLJ0O23ozF", "case_no": "fldDPePQKWpuWUT2t", "kind":
              "cap": "fldmW0clYf0kURjci", "cap_src": "fldUS2ZHK8m84yj2C",
              "price": "fldRYllqHOgNJ88XR", "unit_price": "fldQn3CMIcspK7szP", "text": "fldgnC30TIZmNHUTs"}
 # 2026-10-22：台電契約／細部協商也從 G 槽同步上來，上傳時讀出總裝置容量（掛表資訊確認的容量確認用）
-CONTRACT_KINDS = ("台電契約", "細部協商")
+# 2026-10-26：加「換文修約」（跟台電換文修改購售契約，例如容量 14.4 → 12.15），排第一＝比對時優先用修約後的容量
+CONTRACT_KINDS = ("換文修約", "台電契約", "細部協商")
 # 2026-10-23：03 資料夾的工程合約（跟 EPC 簽的；容量、躉購電價、工程單價）＝掛表資訊確認的比對基準
 ENG_KIND = "工程合約"
 DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS + (ENG_KIND,)
@@ -8449,7 +8450,9 @@ def _contract_capacity(text, kind):
     t = re.sub(r"(?<=\d),(?=\d{3})", "", t)                # 1,000 → 1000
     unit = r"\s*(?:\(\s*峰\s*\))?\s*(?:瓩|[kK][wW]p?)"
     pats = ([r"合計總裝置容量\s*為?\s*" + _CAP_NUM + unit, r"總購售電容量\s*為?\s*" + _CAP_NUM + unit]
-            if kind == "台電契約" else []) + [r"總裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
+            if kind == "台電契約" else []) + (
+            # 換文修約：「…裝置容量由14.4瓩修正為12.15瓩」→ 取「修正／變更／改為」後面那個
+            [r"(?:修正|變更|修改|調整|更正|改)\s*為\s*" + _CAP_NUM + unit] if kind == "換文修約" else []) + [r"總裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
             # 台電契約移轉函：「(電號:…)裝置容量為19.68kWp之再生能源發電系統」
             r"裝置容量\s*[為:]?\s*" + _CAP_NUM + unit,
             # 雲林區細協：「不需要(原因:17.16kwp-1433110/220V)」（要有 p，避免抓到「100kW以上者」）
