@@ -1522,6 +1522,11 @@ def _canon_rep(name):
     return name
 
 
+# 2026-10-26：同一個人在不同地方的寫法（公文更名的 PM 名單「家豪」＝綁定表的「Mario」；「敏萱」＝「敏瑄」），
+# 綁定畫面不重複列、通知也對得上綁定（使用者指定：留已經綁定過的那個）
+BIND_NAME_ALIASES = {"家豪": "Mario", "許家豪": "Mario", "敏萱": "敏瑄"}
+
+
 def _binding_name_candidates(name):
     """「林嘉偉(Mika)」這種寫法也要對得上只綁「Mika」或「林嘉偉」的人：依序試完整名字、括號內、括號外。"""
     import re
@@ -1530,6 +1535,8 @@ def _binding_name_candidates(name):
     out = [canon] if canon else []
     if name and name not in out:
         out.append(name)
+    if BIND_NAME_ALIASES.get(name) and BIND_NAME_ALIASES[name] not in out:
+        out.append(BIND_NAME_ALIASES[name])
     m = re.match(r"^(.*?)[(（]\s*(.+?)\s*[)）]\s*$", name)
     if m:
         for part in (m.group(2).strip(), m.group(1).strip()):
@@ -7621,7 +7628,7 @@ def _bind_people():
     extra = [x["name"] for x in _load_reps().get("reps", [])] + list(_pdf_settings().get("pm_names") or [])
     for name in extra:
         name = (name or "").strip()
-        if name and name not in seen and _canon_rep(name) not in seen:
+        if name and name not in seen and _canon_rep(name) not in seen and BIND_NAME_ALIASES.get(name) not in seen:
             seen.add(name)
             people.append({"name": name, "line": False, "slack_id": "", "slack_name": "", "record_id": "", "scheduler": False})
     people.sort(key=lambda x: (not (x["line"] or x["slack_id"]), x["name"]))
