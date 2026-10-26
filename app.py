@@ -11275,11 +11275,12 @@ def _pdf_flat(text):
 
 def _pdf_stamp_date(flat):
     """台電「審核訖」印章日期（民國）。OCR 常見雜訊：114.2.-6、113.1211、4113.8.22、日期跑到字前面、
-    14.3.28（掉了開頭的 1）。取離「審核訖」最近的合理日期。回傳 (YYYY-MM-DD, 原文) 或 None。"""
+    14.3.28（掉了開頭的 1）。取離「審核訖」最近的合理日期。
+    2026-10-26：也認「審查之章」「有效期限」、視窗加大（歷史審訖圖印章日期抓對 46% → 64%）。回傳 (YYYY-MM-DD, 原文) 或 None。"""
     from datetime import date as _date
     cands = []
-    for m in re.finditer(r"審[核查]?[訖迄讫]", flat):
-        a, b = max(0, m.start() - 25), min(len(flat), m.end() + 45)
+    for m in re.finditer(r"審[核查]?[訖迄讫]|審查之章|有效期限", flat):
+        a, b = max(0, m.start() - 40), min(len(flat), m.end() + 60)
         win = flat[a:b]
         for d in re.finditer(r"(\d{2,3})\s*[.．,、]\s*-?\s*(\d{1,2})\s*[.．,、]\s*-?\s*(\d{1,2})"
                              r"|(1[01]\d)\s*[.．]\s*(\d{2})(\d{2})(?!\d)", win):
@@ -11300,8 +11301,27 @@ def _pdf_stamp_date(flat):
     return cands[0][1], cands[0][2]
 
 
+
 def _pdf_rule_date(flat, date_keys=""):
-    """回傳 (YYYY-MM-DD, 文件原文, 信心)。date_keys＝這類文件日期前面會出現的字（規則設定），先找這些。"""
+    """回傳 (YYYY-MM-DD, 文件原文, 信心)。date_keys＝這類文件日期前面會出現的字（規則設定），先找這些。
+    2026-10-26 用 3,919 份有日期的歷史檔案調整（66.1% → 67.3%；檔名日期有印在文件上的 2,777 份裡抓對 95%）：
+    「發文日期」最優先（台電契約常附函，關鍵字「中華民國」會抓到契約裡別的日期）；圖框「日期 115.06.22」民國點分格式。"""
+    first = [
+        (r"發文日期:?(?:中華民國)?(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 95),
+        (r"發文日期:?(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})", True, 90),
+    ]
+    def scan(pats):
+        for pat, roc, conf in pats:
+            for m in re.finditer(pat, flat):
+                y, mo, d = (int(x) for x in m.groups())
+                if roc or y < 1000:
+                    y += 1911
+                iso = f"{y:04d}-{mo:02d}-{d:02d}"
+                if _pdf_valid_date(iso):
+                    return iso, m.group(0), conf
+        return None
+    r = scan(first)
+    if r: return r
     for key in [k.strip() for k in re.split(r"[、,，;；]", date_keys or "") if k.strip()]:
         pat = re.escape(_pdf_flat(key)) + r"[^0-9]{0,6}?(?:中華民國|民國)?(\d{2,4})\s*[年./-]\s*(\d{1,2})\s*[月./-]\s*(\d{1,2})"
         for m in re.finditer(pat, flat):
@@ -11311,23 +11331,17 @@ def _pdf_rule_date(flat, date_keys=""):
             iso = f"{y:04d}-{mo:02d}-{d:02d}"
             if _pdf_valid_date(iso):
                 return iso, m.group(0), 90
-    pats = [
-        (r"發文日期:?(?:中華民國)?(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 95),
-        (r"發文日期:?(\d{2,3})[./-](\d{1,2})[./-](\d{1,2})", True, 90),
+    r = scan([
         (r"中華民國(\d{2,3})年(\d{1,2})月(\d{1,2})日", True, 65),
+        (r"(?:圖號)?日期[^0-9]{0,8}?(1[01]\d)\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)", True, 75),   # 圖框：日期 115.06.22
+        (r"(?:圖號)?日期[^0-9]{0,8}?(20\d{2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)", False, 75),
         (r"(20\d{2})年(\d{1,2})月(\d{1,2})日", False, 55),
-        (r"(?<!\d)(20\d{2})[/.-](\d{1,2})[/.-](\d{1,2})(?!\d)", False, 50),   # 設計圖圖框常見 2023/12/01
+        (r"(?<!\d)(20\d{2})[/.-](\d{1,2})[/.-](\d{1,2})(?!\d)", False, 50),
         (r"(?<!\d)(\d{3})年(\d{1,2})月(\d{1,2})日", True, 55),
-    ]
-    for pat, roc, conf in pats:
-        for m in re.finditer(pat, flat):
-            y, mo, d = (int(x) for x in m.groups())
-            if roc:
-                y += 1911
-            iso = f"{y:04d}-{mo:02d}-{d:02d}"
-            if _pdf_valid_date(iso):
-                return iso, m.group(0), conf
-    return "", "", 0
+        (r"(?<![\d.])(1[01]\d)\.(\d{1,2})\.(\d{1,2})(?![\d.])", True, 40),   # 圖框民國 115.6.22
+    ])
+    return r or ("", "", 0)
+
 
 
 # 從使用者 G 槽已改名歷史檔案學來的分類模型（tools/pdf_train.py 產生 pdf_model.json）
@@ -11769,7 +11783,9 @@ def _pdf_recognize(rec):
     if not out["doc_date"]:
         received = (f.get(PDF_F["uploaded_at"]) or rec.get("createdTime") or "")[:10]
         if _pdf_valid_date(received):
-            normal = _pdf_doc_category(out["doc_type"]) == "07" or rule.get("date_mode") == "received"
+            # 圖面（04）、合約（03）、設備文件（07）、結構計算書、匯款帳戶本來就常沒有日期（歷史檔案 48～100% 讀不到），用收件日是正常的
+            normal = (_pdf_doc_category(out["doc_type"]) in ("03", "04", "07") or rule.get("date_mode") == "received"
+                      or out["doc_type"] in ("結構計算書", "臺電契約匯款帳戶"))
             out["doc_date"] = received
             out["issues"] = [x for x in out["issues"] if x != "找不到發文日期"]
             out["issues"].append(f"文件上沒有日期，先用收件日 {received}" + ("" if normal else "（這類文件通常有日期，可能是沒讀到，請確認）"))
