@@ -10146,6 +10146,7 @@ PDF_F = {
 PDF_ST_QUEUED, PDF_ST_RUNNING, PDF_ST_REVIEW = "待辨識", "辨識中", "待確認"
 PDF_ST_CONFIRMED, PDF_ST_ARCHIVED, PDF_ST_FAILED = "已確認", "已歸檔", "辨識失敗"
 PDF_MAX_BYTES = 5 * 1024 * 1024   # Airtable uploadAttachment 單檔上限
+PDF_HARD_MAX_BYTES = 60 * 1024 * 1024   # 超過就不收（主機記憶體）；5MB～60MB 會縮小或只存前 6 頁
 PDF_UPLOAD_MAX_BYTES = 30 * 1024 * 1024   # 收件上限：超過 5MB 的 PDF 會在後端縮小後再存（2026-10-19）
 PDF_MAX_ATTEMPTS = 3
 PDF_STALE_MINUTES = 30
@@ -11793,8 +11794,14 @@ def _pdf_recognize(rec):
     suggested = _pdf_build_name(settings.get("template"), case, doc_type, doc_date,
                                 ext_name if ext_name in PDF_OFFICE_EXTS else ".pdf")
     # pred＝系統一開始的判斷；使用者確認（可能有修改）後拿來算真實準確度，也是自動重新學習的依據
+    try:   # 建立時就標記的大檔（只存前幾頁）：提醒留著，重新辨識也不會不見
+        trimmed_note = json.loads(f.get(PDF_F["result_json"]) or "{}").get("trimmed_note") or ""
+    except ValueError:
+        trimmed_note = ""
+    if trimmed_note and trimmed_note not in out["issues"]:
+        out["issues"].insert(0, trimmed_note)
     result = dict(out["result"], issues=out["issues"], notes=out.get("notes") or [], ids=ids, same_type=same,
-                  conf_parts=out.get("conf_parts") or [],
+                  conf_parts=out.get("conf_parts") or [], trimmed_note=trimmed_note,
                   pred={"case_no": case_no, "doc_type": doc_type, "doc_date": doc_date, "name": suggested}, candidates=[
         {"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "score": s["score"],
          "why": s["why"], "strong": s["strong"]} for s in out["ranked"]])
@@ -12451,6 +12458,9 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
     """建立一筆待辨識記錄並上傳檔案。同一份內容（SHA1 相同）已經在佇列裡就不重複建立。
     PDF 原樣；照片轉成 PDF；Word／Excel（.docx／.xlsx）原樣保存。"""
     import hashlib
+    orig_size = len(data or b"")
+    if orig_size > PDF_HARD_MAX_BYTES:   # 免費主機記憶體有限，太大的直接請 PM 手動處理
+        return {"name": name, "ok": False, "error": f"檔案 {orig_size // 1024 // 1024}MB 太大（上限 {PDF_HARD_MAX_BYTES // 1024 // 1024}MB），請從 LINE 下載後自己歸檔"}
     name = os.path.basename((name or "未命名.pdf").replace("\\", "/"))
     ext = _pdf_ext(name)
     digest = hashlib.sha1(data).hexdigest()   # 用原始內容算：同一張照片再下載一次也認得出來
@@ -12477,6 +12487,21 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
             print(f"[pdf_rename] {name} 超過 5MB，縮小 {before // 1024}KB → {len(data) // 1024}KB（{'OK' if fit else '還是太大'}）", flush=True)
         except Exception as e:
             print(f"[pdf_rename] 縮小 PDF 失敗：{e}", flush=True)
+    trimmed_note = ""
+    if len(data) > PDF_MAX_BYTES and data.startswith(b"%PDF"):
+        # 縮小後還是太大（例如整套竣工圖）：只留前幾頁辨識、取檔名，不自動歸檔（歸檔的檔案一定要是完整原檔），
+        # 主控台會提醒 PM 從 LINE 下載原檔自己放進 G 槽（2026-10-26：原本直接拒收，PM 看不到這份）
+        orig_mb = round((orig_size or len(data)) / 1024 / 1024, 1)
+        try:
+            part = _pdf_first_pages(data, 6)
+            if len(part) > PDF_MAX_BYTES:
+                part, _ = _pdf_shrink(part)
+            if len(part) <= PDF_MAX_BYTES:
+                data = part
+                trimmed_note = (f"原檔太大（{orig_mb}MB），主控台只存前 6 頁用來辨識、取檔名，不會自動歸檔；"
+                                "確認後請從 LINE 下載原檔，用新檔名自己放進 G 槽")
+        except Exception as e:
+            print(f"[pdf_rename] 大檔只留前幾頁失敗：{e}", flush=True)
     if len(data) > PDF_MAX_BYTES:
         return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限），而且自動縮小後還是太大，請先用 PDF 壓縮工具縮小再上傳"}
     try:
@@ -12498,6 +12523,8 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
             PDF_F["uploader"]: (uploader or "")[:50], PDF_F["uploaded_at"]: (received_at or "")[:30] or _tw_now_iso(),
             PDF_F["attempts"]: 0,
             PDF_F["hash"]: digest, PDF_F["src_path"]: (src_path or "")[:500],
+            **({PDF_F["no_archive"]: True, PDF_F["result_json"]: json.dumps({"trimmed_note": trimmed_note}, ensure_ascii=False)}
+               if trimmed_note else {}),
         }}, timeout=30)
         if resp.status_code >= 400:
             raise Exception(resp.text)
@@ -12929,7 +12956,7 @@ def pdf_rename_confirm(record_id):
             PDF_F["case_no"]: case_no, PDF_F["alias"]: (case or {}).get("alias", ""),
             PDF_F["doc_type"]: doc_type, PDF_F["doc_date"]: doc_date or None,
             PDF_F["final_name"]: final_name, PDF_F["status"]: PDF_ST_CONFIRMED,
-            PDF_F["no_archive"]: not body.get("archive", True),
+            PDF_F["no_archive"]: bool(result.get("trimmed_note")) or not body.get("archive", True),   # 只存前幾頁的大檔不歸檔
             PDF_F["confirmed_at"]: _tw_now_iso(), PDF_F["confirmed_by"]: (body.get("user") or "主控台").strip()[:50],
         }))
     except Exception as e:
