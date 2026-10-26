@@ -540,6 +540,10 @@ FIELD_SLOT_OWNER_NAME = "fld3ljzB0bpzQzaXL"  # 屋主姓名，2026-10-01 新增
 FIELD_SLOT_VENDOR_TOKEN = "fldny0M5w7oBVr14z"     # 廠商通知Token
 FIELD_SLOT_PM_NOTE = "flddfOVk2OdqMElSm"          # 給廠商備註
 FIELD_SLOT_VENDOR_NOTIFIED = "fldCC1k8KciTDtK61"  # 廠商通知時間（ISO 字串）
+# 2026-10-26：廠商確認收到行程（廠商預約頁按「確認收到」；改日期／時間就清掉，要重新確認）、廠商回報問題
+FIELD_SLOT_ACK_AT = "fldUarZvKLgExs5bZ"
+FIELD_SLOT_ACK_BY = "fldeyB0u53bK4hPh5"
+FIELD_SLOT_ISSUE = "fld2wNkcCreNUf73E"
 FIELD_SLOT_COMPANIONS = "fldlxoJL1pxlXnmxV"        # 同時預約案號（2026-10-12：拆成兩案的同一個案場，一起施作；「、」分隔）
 FIELD_TASK_COMPANIONS = "fldz9O4lPkdYpTA0l"        # 任務：預約時要一起預約的其他案件
 FIELD_SLOT_OWNER_PHONE = "fldT1YrJY2Rp8L33S"  # 屋主電話，2026-10-01 新增
@@ -647,6 +651,7 @@ def list_vendor_slots():
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
             FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
             FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_CANCEL_REASON, FIELD_SLOT_CANCELLED_AT, FIELD_SLOT_COMPANIONS,
+            FIELD_SLOT_ACK_AT, FIELD_SLOT_ACK_BY, FIELD_SLOT_ISSUE,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
@@ -682,6 +687,9 @@ def list_vendor_slots():
                 "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""),
                 "vendor_notified_at": f.get(FIELD_SLOT_VENDOR_NOTIFIED, ""),
                 "companions": f.get(FIELD_SLOT_COMPANIONS, ""),
+                "vendor_ack_at": f.get(FIELD_SLOT_ACK_AT, ""), "vendor_ack_by": f.get(FIELD_SLOT_ACK_BY, ""),
+                "vendor_issue": f.get(FIELD_SLOT_ISSUE, ""),
+                "vendor_can_ack": (f.get(FIELD_SLOT_VENDOR) or "") in VP_VENDORS,
             })
             bookings.append(item)
         else:
@@ -2679,8 +2687,16 @@ def _vendor_notice_card(rec):
               ("屋主", _owner_str(f.get(FIELD_SLOT_OWNER_NAME), f.get(FIELD_SLOT_OWNER_PHONE))),
               ("業務", rep_name), ("現場備註", (f.get(FIELD_SLOT_NOTE) or "").strip()),
               ("陽光備註", (f.get(FIELD_SLOT_PM_NOTE) or "").strip())],
-        buttons=_vendor_card_buttons(f, address, coords) + _vendor_forward_button(f),
+        buttons=_vendor_ack_button(rec) + _vendor_card_buttons(f, address, coords) + _vendor_forward_button(f),
     )
+
+
+def _vendor_ack_button(rec):
+    """2026-10-26：廠商卡片第一顆按鈕＝開廠商預約頁（直接打開這筆行程，可按「確認收到」，也看得到自己的行程日曆）。"""
+    vendor = (rec.get("fields", {}).get(FIELD_SLOT_VENDOR) or "")
+    if vendor not in VP_VENDORS or not rec.get("id"):
+        return []
+    return [("✅ 確認收到／行程日曆", f"{_dash_url()}/vendor.html?v={_vp_token_make(vendor)}&b={rec['id']}")]
 
 
 # 2026-10-08：案件表「電廠座標」（業務標的，格式像「24.921159,121.071300」，偶爾有空白/tab）
@@ -5108,6 +5124,121 @@ def _vp_stage_cases(vendor):
     return out
 
 
+def _vp_bookings(vendor):
+    """廠商行程日曆用的預約清單（這家廠商、30 天前起、已預約）。"""
+    formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{_vp_esc(vendor)}',"
+               f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-31,'days')))")
+    recs = airtable_get_all(SLOT_API_URL, formula, [
+        FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
+        FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE, FIELD_SLOT_NOTE, FIELD_SLOT_PM_NOTE, FIELD_SLOT_COMPANIONS,
+        FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_ACK_AT, FIELD_SLOT_ACK_BY, FIELD_SLOT_ISSUE])
+    cases = sorted({r["fields"].get(FIELD_SLOT_CASE_NO, "") for r in recs} - {""})
+    addr = {}
+    for i in range(0, len(cases), 30):
+        chunk = cases[i:i + 30]
+        f2 = "OR(" + ",".join("{" + FIELD_CASE_NO + "}='" + _vp_esc(c) + "'" for c in chunk) + ")"
+        try:
+            for r in airtable_get_all(CASE_API_URL, f2, [FIELD_CASE_NO, FIELD_ADDRESS, FIELD_PLANT_COORDS]):
+                ff = r["fields"]
+                addr[ff.get(FIELD_CASE_NO, "")] = (" ".join((ff.get(FIELD_ADDRESS) or "").split()), _parse_coords(ff.get(FIELD_PLANT_COORDS)))
+        except Exception as e:
+            print(f"[vendor-portal] 查案件地址失敗：{e}", flush=True)
+    try:
+        _ensure_biz_snapshots_loaded()
+    except Exception:
+        pass
+    out = []
+    for r in recs:
+        f = r["fields"]
+        case_no = f.get(FIELD_SLOT_CASE_NO, "")
+        a, co = addr.get(case_no, ("", None))
+        a = a or _addr_fallback(case_no)
+        co = _parse_coords(BIZ_COORDS_CACHE.get(case_no)) or co
+        q = co or a
+        out.append({"id": r["id"], "date": f.get(FIELD_SLOT_DATE, ""), "start": f.get(FIELD_SLOT_START, ""), "end": f.get(FIELD_SLOT_END, ""),
+                    "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""), "types": f.get(FIELD_SLOT_TYPE) or [],
+                    "time_text": _booking_time_text(f), "address": a, "owner_name": f.get(FIELD_SLOT_OWNER_NAME, ""),
+                    "owner_phone": f.get(FIELD_SLOT_OWNER_PHONE, ""), "companions": f.get(FIELD_SLOT_COMPANIONS, ""),
+                    "note": (f.get(FIELD_SLOT_NOTE) or "").strip(), "pm_note": (f.get(FIELD_SLOT_PM_NOTE) or "").strip(),
+                    "map": ("https://www.google.com/maps/search/?api=1&query=" + requests.utils.quote(q)) if q else "",
+                    "ack_at": f.get(FIELD_SLOT_ACK_AT, ""), "ack_by": f.get(FIELD_SLOT_ACK_BY, ""), "issue": f.get(FIELD_SLOT_ISSUE, "")})
+    out.sort(key=lambda b: (b["date"], b["start"]))
+    return out
+
+
+def _vp_own_booking(token, bid):
+    """廠商只能動自己廠商的預約。回 (vendor, rec, 錯誤回應)。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return None, None, (jsonify({"error": "連結不正確或已失效"}), 404)
+    rec = _get_booking(bid)
+    f = (rec or {}).get("fields", {})
+    if not rec or f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING or (f.get(FIELD_SLOT_VENDOR) or "") != vendor:
+        return vendor, None, (jsonify({"error": "找不到這筆行程（可能已被取消或改期，請重新整理）"}), 404)
+    return vendor, rec, None
+
+
+def _vp_notify_pm(rec, card_fn):
+    """通知陽光窗口（預設收件人，Slack 即時＋LINE 進每日彙整）與這筆預約任務的安排人員。"""
+    f = rec["fields"]
+    card = card_fn(f)
+    try:
+        _line_push_card(card)
+    except Exception as e:
+        print(f"[vendor-portal] 通知 PM 失敗：{e}", flush=True)
+    try:
+        trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + rec["id"] + "'", [FIELD_TASK_CREATOR])
+        creator = (trs[0]["fields"].get(FIELD_TASK_CREATOR) or "").strip() if trs else ""
+        if creator:
+            _notify_scheduler(creator, card)
+    except Exception as e:
+        print(f"[vendor-portal] 通知安排人員失敗：{e}", flush=True)
+
+
+@app.route("/api/vendor-portal/<token>/bookings/<bid>/ack", methods=["POST"])
+def vendor_portal_booking_ack(token, bid):
+    """廠商按「確認收到這筆行程」。body: {by}（確認人，選填）。"""
+    vendor, rec, err = _vp_own_booking(token, bid)
+    if err:
+        return err
+    by = re.sub(r"\s+", " ", str(((request.get_json(silent=True) or {}).get("by") or ""))).strip()[:30]
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    r = requests.patch(f"{SLOT_API_URL}/{bid}", headers=airtable_headers(),
+                       json={"fields": {FIELD_SLOT_ACK_AT: now, FIELD_SLOT_ACK_BY: by, FIELD_SLOT_ISSUE: ""}}, timeout=20)
+    if r.status_code >= 400:
+        return jsonify({"error": "儲存失敗，請稍後再試"}), 502
+    f = rec["fields"]
+    _vp_notify_pm(rec, lambda f: _card("✅ 廠商已確認行程", "#16A34A", f"{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
+                                      rows=[("廠商", vendor), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])), ("時間", _booking_time_text(f)),
+                                            ("確認人", by or "（沒填名字）")]))
+    return jsonify({"ok": True, "ack_at": now, "ack_by": by})
+
+
+@app.route("/api/vendor-portal/<token>/bookings/<bid>/issue", methods=["POST"])
+def vendor_portal_booking_issue(token, bid):
+    """廠商「回報問題」（這個時間不行、資訊有誤…）。body: {message, by}。會通知窗口與安排人員。"""
+    vendor, rec, err = _vp_own_booking(token, bid)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    msg = str(body.get("message") or "").strip()[:500]
+    by = re.sub(r"\s+", " ", str(body.get("by") or "")).strip()[:30]
+    if not msg:
+        return jsonify({"error": "請寫一下是什麼問題"}), 400
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%m/%d %H:%M")
+    old = (rec["fields"].get(FIELD_SLOT_ISSUE) or "").strip()
+    line = f"{now}｜{by or '（沒填名字）'}｜{msg}"
+    r = requests.patch(f"{SLOT_API_URL}/{bid}", headers=airtable_headers(),
+                       json={"fields": {FIELD_SLOT_ISSUE: (old + "\n" if old else "") + line, FIELD_SLOT_ACK_AT: "", FIELD_SLOT_ACK_BY: ""}}, timeout=20)
+    if r.status_code >= 400:
+        return jsonify({"error": "儲存失敗，請稍後再試"}), 502
+    _vp_notify_pm(rec, lambda f: _card("⚠️ 廠商回報行程問題", "#DC2626", f"{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}".strip(),
+                                      rows=[("廠商", vendor), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])), ("時間", _booking_time_text(f)),
+                                            ("回報人", by or "（沒填名字）"), ("內容", msg)],
+                                      note="請盡快跟廠商聯絡確認；改時間後廠商需要重新確認", button=("開啟主控台", _dash_url() + "/")))
+    return jsonify({"ok": True, "issue": (old + "\n" if old else "") + line})
+
+
 def _vp_contacts_get(vendor):
     try:
         raw = _state_get_long(f"vp_contacts|{vendor}")
@@ -5145,6 +5276,36 @@ def vendor_portal_contacts(token):
     except Exception as e:
         return jsonify({"error": f"儲存失敗：{e}"}), 502
     return jsonify({"ok": True, "contacts": contacts})
+
+
+def check_vendor_unacked():
+    """今天、明天的預約，廠商（有預約頁的）還沒按確認 → 一張卡片列給窗口（Slack 即時、LINE 進每日彙整）。每天 08:30、15:30。"""
+    try:
+        tw = timezone(timedelta(hours=8))
+        today = datetime.now(tw)
+        days = [today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")]
+        recs = airtable_get_all(
+            SLOT_API_URL,
+            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',OR(" + ",".join(f"IS_SAME({{{FIELD_SLOT_DATE}}},'{d}','day')" for d in days) + "))",
+            [FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
+             FIELD_SLOT_ACK_AT, FIELD_SLOT_ISSUE])
+        lines = []
+        for r in sorted(recs, key=lambda x: (x["fields"].get(FIELD_SLOT_DATE, ""), x["fields"].get(FIELD_SLOT_START, ""))):
+            f = r["fields"]
+            if (f.get(FIELD_SLOT_VENDOR) or "") not in VP_VENDORS or f.get(FIELD_SLOT_ACK_AT):
+                continue
+            d = f.get(FIELD_SLOT_DATE, "")
+            lines.append(f"• {'今天' if d == days[0] else '明天'} {f.get(FIELD_SLOT_START, '')} {f.get(FIELD_SLOT_VENDOR, '')}｜{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}"
+                         f"（{'、'.join(f.get(FIELD_SLOT_TYPE) or [])}）" + ("　⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else ""))
+        if lines:
+            _line_push_card(_card("⏳ 廠商還沒確認行程", "#D97706", f"共 {len(lines)} 筆（今天、明天）", sections=[("尚未確認", lines)],
+                                 note="請直接打給廠商確認；他們在預約頁按「確認收到」後就會消失", button=("開啟主控台", _dash_url() + "/")))
+    except Exception as e:
+        print(f"[check_vendor_unacked] 例外：{e!r}", flush=True)
+
+
+scheduler.add_job(check_vendor_unacked, CronTrigger(hour="8,15", minute=30, timezone="Asia/Taipei"), id="vendor_unacked",
+                  replace_existing=True, misfire_grace_time=1800, coalesce=True, max_instances=1)
 
 
 @app.route("/api/vendor-portal/<token>/info")
@@ -5185,16 +5346,10 @@ def vendor_portal_info(token):
         print(f"[vendor-portal] 查案件階段失敗：{e}", flush=True)
     for e in sugg.values():
         e["pending"] = [t for t in e["types"] if (e["case"], t) in waiting]
-    # 這家廠商已排定的時段（今天起）
+    # 這家廠商的行程日曆（30 天前起）：含確認狀態、地址、屋主、備註
     bookings = []
     try:
-        formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{_vp_esc(vendor)}',"
-                   f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
-        for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE]):
-            bf = br["fields"]
-            bookings.append({"date": bf.get(FIELD_SLOT_DATE, ""), "start": bf.get(FIELD_SLOT_START, ""), "end": bf.get(FIELD_SLOT_END, ""),
-                             "case": bf.get(FIELD_SLOT_CASE_NO, ""), "alias": bf.get(FIELD_SLOT_ALIAS, ""), "types": bf.get(FIELD_SLOT_TYPE) or []})
-        bookings.sort(key=lambda b: (b["date"], b["start"]))
+        bookings = _vp_bookings(vendor)
     except Exception as e:
         print(f"[vendor-portal] 查已排定時段失敗：{e}", flush=True)
     order = {s: i for i, s in enumerate(VP_STAGES)}
@@ -7127,7 +7282,7 @@ def _collect_tomorrow_events(tmr):
         SLOT_API_URL,
         f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',IS_SAME({{{FIELD_SLOT_DATE}}},'{tmr}','day'))",
         [FIELD_SLOT_VENDOR, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS,
-         FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
+         FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT, FIELD_SLOT_ACK_AT, FIELD_SLOT_ISSUE],
     )
     for r in recs:
         f = r["fields"]
@@ -7135,11 +7290,15 @@ def _collect_tomorrow_events(tmr):
         case_no = f.get(FIELD_SLOT_CASE_NO, "")
         for t in types:
             seen.add((case_no, t))
+        extra = f"業務：{f.get(FIELD_SLOT_REGISTRANT)}" if (f.get(FIELD_SLOT_REGISTRANT) and not f.get(FIELD_SLOT_REGISTRANT).startswith("屋主")) else ""
+        if (f.get(FIELD_SLOT_VENDOR) or "") in VP_VENDORS:   # 廠商能在預約頁確認的，標出還沒確認／有回報問題的
+            tag = "⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else ("" if f.get(FIELD_SLOT_ACK_AT) else "⚠️廠商未確認")
+            extra = (extra + "｜" if extra and tag else extra) + tag
         events.append({
             "vendor": f.get(FIELD_SLOT_VENDOR) or "", "kind": "/".join(types),
             "time": f"{f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}",
             "case": case_no, "alias": f.get(FIELD_SLOT_ALIAS, ""),
-            "extra": f"業務：{f.get(FIELD_SLOT_REGISTRANT)}" if (f.get(FIELD_SLOT_REGISTRANT) and not f.get(FIELD_SLOT_REGISTRANT).startswith("屋主")) else "",
+            "extra": extra,
         })
     # 2. 出貨／進場（來自出貨進場排程快取）
     case_vendor = {}
@@ -13974,6 +14133,8 @@ def update_vendor_slot_booking(record_id):
     for r in group:
         rf = r["fields"]
         patch = {FIELD_SLOT_DATE: date, FIELD_SLOT_START: start, FIELD_SLOT_END: end, FIELD_SLOT_TITLE: title}
+        if changed_time:   # 行程改了：廠商之前的確認／回報作廢，要重新確認
+            patch.update({FIELD_SLOT_ACK_AT: "", FIELD_SLOT_ACK_BY: "", FIELD_SLOT_ISSUE: ""})
         if "owner_name" in body:
             patch[FIELD_SLOT_OWNER_NAME] = (body.get("owner_name") or "").strip()[:40]
         if "owner_phone" in body:
