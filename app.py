@@ -10196,7 +10196,7 @@ PDF_DEFAULT_DOC_TYPES = [
     # 台電函「修訂貴我雙方簽訂之…購售契約…內容」（例如變更變流器型號後修訂契約附件），2026-10-12 使用者指定叫「換文修約」（一開始叫範本修約，同日改名）。
     # 很少見、學習模型沒看過，所以主旨符合 subject_regex 就直接判定（比學習模型優先）
     {"name": "換文修約", "category": "06", "milestone": "", "synonyms": "換文修約函、範本修約、契約修訂",
-     "keywords": "修訂、修約、契約附件、責任分界圖面、內容如說明", "subject_regex": "修訂.{0,40}契約|契約.{0,20}修訂|修約"},
+     "keywords": "修訂、修約、契約附件、責任分界圖面、內容如說明", "subject_regex": "修訂.{0,40}購售契約|換文修約"},
     {"name": "台電契約移轉", "category": "06", "milestone": "移轉契約", "synonyms": "",
      "keywords": "契約移轉、移轉、承受、過戶、轉讓"},
     {"name": "設備登記", "category": "06", "milestone": "設備登記", "synonyms": "設備登記函",
@@ -10207,7 +10207,7 @@ PDF_DEFAULT_DOC_TYPES = [
     # 日期＝計費期間的結束日（使用者習慣：計費期間 115/09/15～115/10/04 → 1151004）；
     # 寫回「第一張電費單」里程碑只填空白，之後每個月的電費單日期比較晚是正常的，不提醒（milestone_first）
     {"name": "電費單", "category": "06", "milestone": "第一張電費單", "synonyms": "第一張電費單、電費通知單、躉購電費通知單",
-     "keywords": "電費通知單、躉購電費、計費期間、應付總金額、購電度數", "text_regex": "電費通知單|躉購電費",
+     "keywords": "電費通知單、躉購電費、計費期間、應付總金額、購電度數", "text_regex": "電費通知單",
      "date_mode": "bill_period", "milestone_first": True},
     {"name": "電表租約", "category": "06", "milestone": "電表租約", "synonyms": "電表租約(屋主)、電表租約函",
      "keywords": "電表租約、租用電表、電表租用、表租"},
@@ -11395,8 +11395,9 @@ def _pdf_rule_doc_type(flat, subject, settings):
     """先用學習模型；沒有模型或判斷不出來時，用關鍵字打分：主旨命中 ×3、全文命中 ×1。回傳 (類型, 信心, 理由)。
     類型設了 subject_regex（主旨規則）且主旨符合時直接判定，比學習模型優先（給少見、模型沒學過的類型用）。"""
     for t in settings.get("doc_types") or []:
-        # subject_regex 比對主旨；text_regex 比對文件開頭（沒有主旨的表單，例如工程確認單的標題）
-        for key, hay, where in (("subject_regex", subject, "主旨"), ("text_regex", flat[:1500], "文件")):
+        # subject_regex 比對主旨；text_regex 比對文件開頭 400 字（標題；沒有主旨的表單，例如工程確認單）。
+        # 2026-10-26 用歷史檔案驗證：比太後面會誤判（屋頂租賃合約書內文也提到電費通知單）
+        for key, hay, where in (("subject_regex", subject, "主旨"), ("text_regex", flat[:400], "文件標題")):
             rx = (t.get(key) or "").strip()
             if not rx or not hay or not t.get("name"):
                 continue
@@ -11457,6 +11458,32 @@ def _pdf_rule_doc_type(flat, subject, settings):
 PDF_COUNTY_RE = re.compile(r"(?:臺北|台北|新北|桃園|臺中|台中|臺南|台南|高雄|基隆|新竹|嘉義)[市縣]|(?:苗栗|彰化|南投|雲林|屏東|宜蘭|花蓮|臺東|台東|澎湖|金門|連江)縣")
 
 
+def _pdf_pair_fix(doc_type, flat, subject, settings):
+    """學習模型常搞混的幾組類型，用文件上的關鍵差異再判一次（2026-10-26 用 6,486 份已改名歷史檔案驗證：
+    整體正確率 86.3% → 88.5%）。回傳 (新類型, 理由) 或 None。審訖圖 vs 系統送審圖 另外在 _pdf_recognize 看印章。"""
+    names = {t.get("name") for t in settings.get("doc_types") or []}
+    rules = [
+        # 單線圖 vs 系統送審圖：系統送審圖會附昇位圖（94% 有、單線圖 17%）
+        ({"單線圖"}, "系統送審圖", lambda: "昇位" in flat, "圖面有昇位圖（系統送審圖才有）"),
+        ({"系統送審圖"}, "單線圖", lambda: "昇位" not in flat, "沒有昇位圖（只有單線圖）"),
+        # 模組出廠證明書 vs 模組出廠暨保固證明書：有「保固」字樣（99% 準）
+        ({"模組出廠證明書"}, "模組出廠暨保固證明書", lambda: "保固" in flat, "文件有「保固」字樣"),
+        # 台電契約／契約函 vs 電表租約：主旨講電表租用（97% 準）
+        ({"台電契約", "台電契約函"}, "電表租約", lambda: bool(re.search("電表|表租|計量設備", subject)), "主旨講電表租用"),
+        # 免雜 vs 竣工備查：看主旨講竣工還是雜項執照
+        ({"免雜"}, "竣工備查", lambda: "竣工" in subject, "主旨有「竣工」"),
+        ({"竣工備查"}, "免雜", lambda: "雜項" in subject and "竣工" not in subject, "主旨講雜項執照、沒提竣工"),
+        # 免雜 vs 免雜附件：附件（簽證表、證明書）沒有主旨
+        ({"免雜附件"}, "免雜", lambda: bool(subject), "有主旨（函文，不是附件）"),
+        ({"免雜"}, "免雜附件", lambda: not subject and bool(re.search("簽證表|結構安全證明書|完竣證明書", flat[:800])),
+         "沒有主旨、是簽證表／證明書"),
+    ]
+    for src, dst, cond, why in rules:
+        if doc_type in src and dst in names and cond():
+            return dst, f"改判{dst}：{why}"
+    return None
+
+
 def _pdf_rule_extract(text, settings):
     flat = _pdf_flat(text)
     m = re.search(r"主旨:(.+?)(?:說明:|辦法:|正本:|附件:|$)", flat)
@@ -11467,6 +11494,9 @@ def _pdf_rule_extract(text, settings):
                   r"|經濟部能源署|經濟部[一-鿿]{0,6}局|[一-鿿]{2,3}[縣市]政府(?:[一-鿿]{1,6}?(?:局|處))?)", flat)
     issuer = m.group(1) if m else ""
     doc_type, type_conf, type_reason = _pdf_rule_doc_type(flat, subject or flat[:200], settings)
+    fix = _pdf_pair_fix(doc_type, flat, subject, settings)
+    if fix:
+        doc_type, type_conf, type_reason = fix[0], max(type_conf, 85), f"{type_reason}；{fix[1]}"
     rule = next((t for t in settings.get("doc_types") or [] if t.get("name") == doc_type), {})
     if rule.get("date_mode") == "bill_period":
         # 計費期間：115年09月15日～115年10月04日 → 取結束日
