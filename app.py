@@ -9997,7 +9997,9 @@ def shipping_candidates():
         return jsonify({"error": str(e)}), 502
 
     def order_state(case_no, vendor):
-        sts = {o.get("status") for o in orders if o.get("case_no") == case_no and o.get("vendor") == vendor}
+        # 模組訂單不分經銷商（元晶直接下單或丸紅，2026-10-27）→ 用設備種類判斷
+        eq = "模組" if vendor == "元晶" else "變流器"
+        sts = {o.get("status") for o in orders if o.get("case_no") == case_no and o.get("equipment") == eq}
         if "已成立" in sts:
             return "已成立"
         if "已出貨" in sts:
