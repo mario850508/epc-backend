@@ -9216,12 +9216,14 @@ def _eng_contract_values(text):
 def procurement_drawings_index():
     """本機同步程式用：目前已上傳的圖面（案號＋類型＋檔名＋來源修改時間），沒變的就不重傳。"""
     try:
-        recs = airtable_get_all(DRAWING_API_URL, None, [DRAWING_F[k] for k in ("key", "case_no", "kind", "filename", "mtime", "doc_date", "size_kb")])
+        recs = airtable_get_all(DRAWING_API_URL, None, [DRAWING_F[k] for k in ("key", "case_no", "kind", "filename", "mtime", "doc_date", "size_kb", "src_path")])
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"items": [{"id": r["id"], "key": r["fields"].get(DRAWING_F["key"], ""), "filename": r["fields"].get(DRAWING_F["filename"], ""),
                                "mtime": r["fields"].get(DRAWING_F["mtime"], ""), "doc_date": r["fields"].get(DRAWING_F["doc_date"], ""),
-                               "size_kb": r["fields"].get(DRAWING_F["size_kb"])} for r in recs]})
+                               "size_kb": r["fields"].get(DRAWING_F["size_kb"]),
+                               # 主控台頁面手動上傳的：同步程式不要用 G 槽的檔案蓋掉（2026-10-27）
+                               "manual": (r["fields"].get(DRAWING_F["src_path"]) or "").startswith("主控台上傳")} for r in recs]})
 
 
 @app.route("/api/procurement/drawings/sync", methods=["POST"])
@@ -9280,6 +9282,7 @@ def procurement_drawings_sync():
             requests.delete(f"{DRAWING_API_URL}/{o['id']}", headers=airtable_headers(), timeout=20)
         if parse and store is not None and not local_read:
             _parse_enqueue(rid)   # 只排記錄 ID，輪到時再從附件下載（2026-10-25：原本每份檔案留在記憶體排隊 → 記憶體爆掉、伺服器一直重開）
+        _mc_cache_clear()
         return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": bool(parse and not local_read), "local_read": local_read, "note": note})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
@@ -9351,6 +9354,7 @@ def procurement_drawings_parsed():
         else:
             fields = {DRAWING_F["cap_src"]: ("本機讀不到文字：" + str(body.get("error") or "沒有文字") + note)[:200]}
         requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        _mc_cache_clear()
         return jsonify({"ok": True, "cap": fields.get(DRAWING_F["cap"]), "src": fields.get(DRAWING_F["cap_src"])})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
@@ -9407,6 +9411,7 @@ def _parse_record(rid):
             v, why = _contract_capacity(text, kind)
             fields = {DRAWING_F["cap"]: v, DRAWING_F["cap_src"]: ((why or "") + note)[:200]}
         requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        _mc_cache_clear()
         return
     att = (f.get(DRAWING_F["file"]) or [{}])[0]
     if not att.get("url"):
@@ -9478,6 +9483,7 @@ def _drawing_parse_job(rid, kind, data, note=""):
             fields = {DRAWING_F["cap_src"]: ("讀取失敗：" + str(e))[:200]}
         try:
             requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+            _mc_cache_clear()
         except Exception as e:
             print(f"[drawing_parse_job] 寫回 {rid} 失敗：{e}", flush=True)
 
@@ -14609,18 +14615,36 @@ def _mc_eng_contracts(case_nos):
     return out
 
 
+_MC_CACHE = {}          # 月份 → (時間, 回應 dict)；2026-10-27 頁面每次切月份要 10～15 秒 → 暫存 10 分鐘
+_MC_CACHE_TTL = 600
+
+
+def _mc_cache_clear(month=None):
+    """資料有改（確認值、上傳／重讀契約）就清掉暫存；month＝None 全清。"""
+    if month:
+        _MC_CACHE.pop(month, None)
+    else:
+        _MC_CACHE.clear()
+
+
 @app.route("/api/meter-check", methods=["GET"])
 def get_meter_check():
-    """?month=YYYY-MM → 當月掛表案件（依掛表日期排序）＋人工確認值、當月撤案案件。"""
+    """?month=YYYY-MM → 當月掛表案件（依掛表日期排序）＋人工確認值、當月撤案案件。?refresh=1 不用暫存。"""
     month = (request.args.get("month") or "").strip()
     if not _re.fullmatch(r"\d{4}-\d{2}", month):
         return jsonify({"error": "month 格式要是 YYYY-MM"}), 400
+    hit = _MC_CACHE.get(month)
+    if hit and not request.args.get("refresh") and time.time() - hit[0] < _MC_CACHE_TTL:
+        return jsonify({**hit[1], "cached_at": hit[0]})
     try:
-        ms = airtable_get_all(
-            MILESTONE_API_URL,
-            f"AND({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_METER}',DATETIME_FORMAT({{{FIELD_MS_ACTUAL_DATE}}},'YYYY-MM')='{month}')",
-            [FIELD_MS_CASE_LINK, FIELD_MS_ACTUAL_DATE],
-        )
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=3)
+        # 彼此不相干的查詢一起發：掛表里程碑（最慢，掃整張進度管理表）＋這個月的確認值
+        f_ms = pool.submit(airtable_get_all, MILESTONE_API_URL,
+                           f"AND({{{FIELD_MS_TYPE}}}='{MILESTONE_TYPE_METER}',DATETIME_FORMAT({{{FIELD_MS_ACTUAL_DATE}}},'YYYY-MM')='{month}')",
+                           [FIELD_MS_CASE_LINK, FIELD_MS_ACTUAL_DATE])
+        f_checks = pool.submit(airtable_get_all, MC_API_URL, f"{{{MC_F['month']}}}='{month}'", list(MC_F.values()))
+        ms = f_ms.result()
         meter_date = {}   # case record id → 掛表日期（同案有重複里程碑時取最晚那筆）
         for r in ms:
             f = r.get("fields", {})
@@ -14629,8 +14653,10 @@ def get_meter_check():
                 if d > meter_date.get(cid, ""):
                     meter_date[cid] = d
         cases = _mc_case_info([f"RECORD_ID()='{cid}'" for cid in meter_date])
-
-        checks = airtable_get_all(MC_API_URL, f"{{{MC_F['month']}}}='{month}'", list(MC_F.values()))
+        case_nos = [c["case_no"] for c in cases.values() if c["case_no"]]
+        f_docs = pool.submit(_mc_doc_capacities, case_nos)   # 台電契約／細協 和 工程合約 也一起查
+        f_engs = pool.submit(_mc_eng_contracts, case_nos)
+        checks = f_checks.result()
         chk = {}
         for r in checks:
             f = r.get("fields", {})
@@ -14641,8 +14667,8 @@ def get_meter_check():
                 "adj_status": f.get(MC_F["adj_status"]) or "",
             }
 
-        doc_caps = _mc_doc_capacities([c["case_no"] for c in cases.values() if c["case_no"]])
-        engs = _mc_eng_contracts([c["case_no"] for c in cases.values() if c["case_no"]])
+        doc_caps, engs = f_docs.result(), f_engs.result()
+        pool.shutdown(wait=False)
         rows = []
         for cid, c in cases.items():
             rows.append({**c, "meter_date": meter_date.get(cid, ""), "doc_cap": doc_caps.get(c["case_no"]), "eng": engs.get(c["case_no"]),
@@ -14662,7 +14688,9 @@ def get_meter_check():
                                "close_status": "", "agree_date": "", "address": ""})
             withdrawn.append({**c, **chk[("撤案", n)]})
         withdrawn.sort(key=lambda x: (x["note"], x["case_no"]))
-        return jsonify({"month": month, "cases": rows, "withdrawn": withdrawn})
+        out = {"month": month, "cases": rows, "withdrawn": withdrawn}
+        _MC_CACHE[month] = (time.time(), out)
+        return jsonify(out)
     except Exception as e:
         print(f"[get_meter_check] {month} 失敗：{e}", flush=True)
         return jsonify({"error": str(e)}), 502
@@ -14720,6 +14748,7 @@ def upsert_meter_check():
                            MC_F["case_no"]: case_no, MC_F["kind"]: kind})
             resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         resp.raise_for_status()
+        _mc_cache_clear(month)
         return jsonify({"ok": True, "check_id": resp.json()["id"]})
     except Exception as e:
         print(f"[upsert_meter_check] {month} {case_no} 失敗：{e}", flush=True)
@@ -14732,6 +14761,7 @@ def delete_meter_check(record_id):
         return jsonify({"error": "record_id 不正確"}), 400
     try:
         requests.delete(f"{MC_API_URL}/{record_id}", headers=airtable_headers(), timeout=20).raise_for_status()
+        _mc_cache_clear()
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 502

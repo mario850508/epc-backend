@@ -349,6 +349,9 @@ def main():
                 doc_date, mtime, path, fn = best
                 mt = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
                 old = idx.get(f"{case_no}|{kind}")
+                if old and old.get("manual"):   # 主控台頁面手動上傳過的就以那份為準，不用 G 槽的蓋掉
+                    skip += 1
+                    continue
                 size = os.path.getsize(path)
                 # 檔名一樣，而且（修改時間一樣 或 大小一樣）就當沒變。G 槽（Google 雲端硬碟）回報的修改時間偶爾會跳，
                 # 2026-10-24 只靠修改時間時，台電契約／細協被整批重傳。
