@@ -228,6 +228,7 @@ from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 app = Flask(__name__)
 
@@ -5350,15 +5351,27 @@ scheduler.add_job(check_vendor_unacked, CronTrigger(hour="8,15", minute=30, time
                   replace_existing=True, misfire_grace_time=1800, coalesce=True, max_instances=1)
 
 
-@app.route("/api/vendor-portal/<token>/info")
-def vendor_portal_info(token):
-    vendor = _vp_vendor_from_token(token)
-    if not vendor:
-        return jsonify({"error": "連結不正確或已失效，請向陽光伏特家窗口索取新的連結"}), 404
+# 2026-10-27：廠商頁的 /info 要查很多東西（申請、案件階段、行程＋地址…），冷的時候要 10～30 秒。
+# 每家廠商的結果存在記憶體：頁面先用 ?cache=1 拿上次的結果（秒開），再背景拿最新的更新畫面；
+# 另外開機後與每 8 分鐘背景預先算好（_vp_info_warm_all），所以平常第一次點開也是秒開。
+_VP_INFO_CACHE = {}   # vendor -> {"ts": 秒, "data": dict}
+_VP_INFO_MAX_STALE = 6 * 3600
+
+
+def _vp_shipments(vendor):
+    """這家廠商（EPC）的模組／變流器到貨（出貨日曆事件，30 天前起）。"""
     try:
-        reqs = _vp_requests(vendor)[:60]
+        cache = _load_order_snapshots()
+        today = _tw_now().date()
+        return [e for e in _order_calendar_events(cache, today - timedelta(days=31), today + timedelta(days=400))
+                if (e.get("epc") or "") == vendor]
     except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        print(f"[vendor-portal] 查到貨日曆失敗：{e}", flush=True)
+        return []
+
+
+def _vp_info_compute(vendor):
+    reqs = _vp_requests(vendor)[:60]
     waiting = {(r["case"], t) for r in reqs if r["status"] == VP_ST_WAIT for t in r["items"]}
     # 重啟後場勘快取是空的：先補載一次（背景已在跑就最多等 25 秒），不然「場勘」區會暫時消失
     if SURVEY_CACHE["updated_at"] is None:
@@ -5395,9 +5408,38 @@ def vendor_portal_info(token):
     except Exception as e:
         print(f"[vendor-portal] 查已排定時段失敗：{e}", flush=True)
     order = {s: i for i, s in enumerate(VP_STAGES)}
-    return jsonify({"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES, "contacts": _vp_contacts_get(vendor),
-                    "suggestions": sorted(sugg.values(), key=lambda e: (order.get(e["stage"], 9), e["case"])),
-                    "requests": reqs, "bookings": bookings})
+    return {"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES, "contacts": _vp_contacts_get(vendor),
+            "suggestions": sorted(sugg.values(), key=lambda e: (order.get(e["stage"], 9), e["case"])),
+            "requests": reqs, "bookings": bookings, "shipments": _vp_shipments(vendor)}
+
+
+@app.route("/api/vendor-portal/<token>/info")
+def vendor_portal_info(token):
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效，請向陽光伏特家窗口索取新的連結"}), 404
+    ent = _VP_INFO_CACHE.get(vendor)
+    if request.args.get("cache") == "1" and ent and time.time() - ent["ts"] < _VP_INFO_MAX_STALE:
+        return jsonify(dict(ent["data"], cached=True))   # 秒開用；前端會再要一次最新的
+    try:
+        data = _vp_info_compute(vendor)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    _VP_INFO_CACHE[vendor] = {"ts": time.time(), "data": data}
+    return jsonify(data)
+
+
+def _vp_info_warm_all():
+    for v in list(VP_VENDORS):
+        try:
+            _VP_INFO_CACHE[v] = {"ts": time.time(), "data": _vp_info_compute(v)}
+        except Exception as e:
+            print(f"[vp_info_warm] {v} 失敗：{e}", flush=True)
+        time.sleep(1)
+
+
+scheduler.add_job(_vp_info_warm_all, IntervalTrigger(minutes=8), id="vp_info_warm", replace_existing=True,
+                  next_run_time=datetime.now(TW_TZ) + timedelta(seconds=90), max_instances=1, coalesce=True)
 
 
 @app.route("/api/vendor-portal/<token>/cases")
@@ -10082,21 +10124,8 @@ def shipping_generate():
                              "X-Base-File": _q(raw.get("filename", "")), "X-Results": _q(json.dumps(results, ensure_ascii=False))})
 
 
-@app.route("/api/procurement/order-calendar")
-def procurement_order_calendar():
-    """出貨日曆（2026-10-14）：元晶／碩天訂單裡「預計到貨時間」是明確日期的（已成立＋已出貨，不含取消／可能撤案），
-    同一案同一廠商同一天合併成一筆。from/to（YYYY-MM-DD）預設 今天前 45 天 ～ 今天後 400 天。
-    模組廠／變流器廠／EPC 的篩選在前端做，這裡一併回傳可選的值。"""
-    try:
-        cache = _load_order_snapshots()
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-    today = _tw_now().date()
-    try:
-        d_from = datetime.strptime(request.args["from"], "%Y-%m-%d").date() if request.args.get("from") else today - timedelta(days=45)
-        d_to = datetime.strptime(request.args["to"], "%Y-%m-%d").date() if request.args.get("to") else today + timedelta(days=400)
-    except ValueError:
-        return jsonify({"error": "日期格式要 YYYY-MM-DD"}), 400
+def _order_calendar_events(cache, d_from, d_to):
+    """出貨日曆事件（同一案同一廠商同一天合併成一筆）。出貨日曆頁、廠商行程日曆共用。"""
     events = {}
     for r in cache["rows"]:
         if r.get("status") not in ("已成立", "已出貨"):
@@ -10112,7 +10141,25 @@ def procurement_order_calendar():
                                "epc": r.get("epc", ""), "arrival": r.get("arrival", ""), "receiver": r.get("receiver", ""),
                                "phone": r.get("phone", ""), "ship_to": r.get("ship_to", ""), "items": []}
         e["items"].append({"model": r.get("model", ""), "qty": r.get("qty", "")})
-    out = sorted(events.values(), key=lambda e: (e["date"], e["equipment"], e["case_no"]))
+    return sorted(events.values(), key=lambda e: (e["date"], e["equipment"], e["case_no"]))
+
+
+@app.route("/api/procurement/order-calendar")
+def procurement_order_calendar():
+    """出貨日曆（2026-10-14）：元晶／碩天訂單裡「預計到貨時間」是明確日期的（已成立＋已出貨，不含取消／可能撤案），
+    同一案同一廠商同一天合併成一筆。from/to（YYYY-MM-DD）預設 今天前 45 天 ～ 今天後 400 天。
+    模組廠／變流器廠／EPC 的篩選在前端做，這裡一併回傳可選的值。"""
+    try:
+        cache = _load_order_snapshots()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    today = _tw_now().date()
+    try:
+        d_from = datetime.strptime(request.args["from"], "%Y-%m-%d").date() if request.args.get("from") else today - timedelta(days=45)
+        d_to = datetime.strptime(request.args["to"], "%Y-%m-%d").date() if request.args.get("to") else today + timedelta(days=400)
+    except ValueError:
+        return jsonify({"error": "日期格式要 YYYY-MM-DD"}), 400
+    out = _order_calendar_events(cache, d_from, d_to)
     opts = lambda eq: sorted({e["vendor"] for e in out if e["equipment"] == eq and e["vendor"]})
     return jsonify({"from": d_from.isoformat(), "to": d_to.isoformat(), "events": out,
                     "module_vendors": opts("模組"), "inverter_vendors": opts("變流器"),
