@@ -14257,6 +14257,13 @@ def _vendor_batch_build(booking_ids, note=""):
         contents.append({"type": "separator", "margin": "lg"})
         contents.append({"type": "text", "text": "備註：" + note.strip(), "size": "sm", "wrap": True, "color": "#B45309", "weight": "bold", "margin": "md"})
         plain.append("備註：" + note.strip())
+    # 2026-10-27：一起通知的卡片也要有「確認收到」——開廠商的行程日曆，裡面每一筆都能按確認
+    if vendor in VP_VENDORS:
+        cal_url = f"{_dash_url()}/vendor.html?v={_vp_token_make(vendor)}&tab=booked"
+        contents.append({"type": "separator", "margin": "lg"})
+        contents.append({"type": "button", "style": "primary", "color": "#16A34A", "height": "sm", "margin": "md",
+                         "action": {"type": "uri", "label": "✅ 確認收到／行程日曆", "uri": cal_url}})
+        plain += ["", f"✅ 請點連結確認收到、查看行程日曆：{cal_url}"]
     flex = {"type": "bubble", "size": "giga",
             "header": {"type": "box", "layout": "vertical", "backgroundColor": "#2563EB", "paddingAll": "12px",
                        "contents": [{"type": "text", "text": "📋 施工排程通知｜給廠商", "color": "#FFFFFF", "weight": "bold", "size": "sm"}]},
