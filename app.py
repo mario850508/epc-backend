@@ -8134,6 +8134,48 @@ def slack_booking_card():
     return jsonify({"ok": True})
 
 
+@app.route("/api/vendor-slots/<record_id>/vendor-card-test", methods=["POST"])
+def vendor_card_test(record_id):
+    """2026-10-26 試看「廠商通知卡片」（含 ✅確認收到／行程日曆 按鈕）：用這筆預約的真實內容，標上「測試」，
+    同時傳到「我的通知」的 Slack 和 LINE（LINE 額度用完會失敗，結果會回報）。不會通知廠商、不會改任何資料。"""
+    rec = _get_booking(record_id)
+    if not rec or rec.get("fields", {}).get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "找不到這筆預約"}), 404
+    card = _vendor_notice_card(rec)
+    card["tag"] = "🧪 測試｜" + card["tag"]
+    card["note"] = "這是測試卡片，不是真的通知廠商。請不要按「確認收到」（會真的把這筆行程標成廠商已確認）。"
+    out = {"slack": None, "line": None}
+    sid = _slack_default_user()
+    if sid:
+        ok, err = _slack_dm(sid, card=card)
+        out["slack"] = "ok" if ok else f"失敗：{err}"
+    else:
+        out["slack"] = "還沒設定「我的通知」的 Slack 帳號"
+    ok, err = _line_push_card(card, immediate=True, slack=False)
+    out["line"] = "ok" if ok else f"失敗：{str(err)[:160]}"
+    return jsonify(out)
+
+
+@app.route("/api/vendor-slots/<record_id>/vendor-ack", methods=["POST"])
+def vendor_ack_by_pm(record_id):
+    """窗口代廠商確認（廠商沒按、已經電話確認過等）。body: {by: 備註（例如：電話跟王先生確認）, unack: true 取消確認}。"""
+    rec = _get_booking(record_id)
+    f = (rec or {}).get("fields", {})
+    if not rec or f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING:
+        return jsonify({"error": "找不到這筆預約（可能已取消）"}), 404
+    body = request.get_json(silent=True) or {}
+    if body.get("unack"):
+        fields = {FIELD_SLOT_ACK_AT: "", FIELD_SLOT_ACK_BY: ""}
+    else:
+        by = re.sub(r"\s+", " ", str(body.get("by") or "")).strip()[:40]
+        now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        fields = {FIELD_SLOT_ACK_AT: now, FIELD_SLOT_ACK_BY: "窗口代確認" + (f"（{by}）" if by else ""), FIELD_SLOT_ISSUE: ""}
+    r = requests.patch(f"{SLOT_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if r.status_code >= 400:
+        return jsonify({"error": "儲存失敗", "detail": r.text[:200]}), 502
+    return jsonify({"ok": True, "ack_at": fields[FIELD_SLOT_ACK_AT], "ack_by": fields[FIELD_SLOT_ACK_BY]})
+
+
 @app.route("/api/line/quota")
 def line_quota():
     """LINE 官方帳號本月推播額度與已用量（給主控台顯示「額度用完」警告用）。"""
