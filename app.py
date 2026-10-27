@@ -5399,6 +5399,29 @@ def _vp_shipments(vendor):
         return []
 
 
+def _vp_stock(vendor):
+    """2026-10-27 廠商頁「料件庫存」：APP資料「未使用料件」清單裡屬於這家廠商（EPC）的料件，給廠商核對現場是否還有。
+    清單有存廠商就用它；舊資料沒存廠商時，用案號對應排程快取裡案件的廠商。"""
+    case_vendor = {}
+    for lst in (DATA_CACHE.get("pending") or [], DATA_CACHE.get("entry") or [], DATA_CACHE.get("completed") or []):
+        for c in lst:
+            case_vendor[c.get("case")] = c.get("vendor") or ""
+    out = []
+    try:
+        for r in app_data_get_all("{類型}='未使用料件'"):
+            f = r["fields"]
+            case_text = f.get("案號或別名") or ""
+            v = f.get("廠商") or case_vendor.get(case_text, "")
+            if v != vendor or not (f.get("內容") or "").strip():
+                continue
+            out.append({"id": r["id"], "case_text": case_text, "content": f.get("內容") or "",
+                        "ship_date": f.get("出貨日期") or "", "date": f.get("記錄日期") or ""})
+    except Exception as e:
+        print(f"[vendor-portal] 查料件庫存失敗：{e}", flush=True)
+    out.sort(key=lambda x: (x["case_text"], x["ship_date"]))
+    return out
+
+
 def _vp_info_compute(vendor):
     reqs = _vp_requests(vendor)[:60]
     waiting = {(r["case"], t) for r in reqs if r["status"] == VP_ST_WAIT for t in r["items"]}
@@ -5439,7 +5462,7 @@ def _vp_info_compute(vendor):
     order = {s: i for i, s in enumerate(VP_STAGES)}
     return {"vendor": vendor, "types": VP_TYPES, "stages": VP_STAGES, "contacts": _vp_contacts_get(vendor),
             "suggestions": sorted(sugg.values(), key=lambda e: (order.get(e["stage"], 9), e["case"])),
-            "requests": reqs, "bookings": bookings, "shipments": _vp_shipments(vendor)}
+            "requests": reqs, "bookings": bookings, "shipments": _vp_shipments(vendor), "stock": _vp_stock(vendor)}
 
 
 @app.route("/api/vendor-portal/<token>/info")
