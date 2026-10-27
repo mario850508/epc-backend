@@ -4868,7 +4868,7 @@ def add_no_cache_headers(response):
 def pending_cases():
     return jsonify({
         "count": len(DATA_CACHE["pending"]),
-        "cases": DATA_CACHE["pending"],
+        "cases": _with_inverter_order_dates(DATA_CACHE["pending"]),
         "updated_at": DATA_CACHE["updated_at"],
         "refreshing": DATA_CACHE["refreshing"],
         "refreshing_started_at": (
@@ -4906,6 +4906,28 @@ def _entry_with_order_dates(cases):
             c = {**c, "ship_date": b[1], "ship_date_milestone": c.get("ship_date"), "ship_date_from_order": True}
         out.append(c)
     return out
+
+
+def _with_inverter_order_dates(cases):
+    """2026-10-27：變流器訂單（碩天，沒取消的）上有確定日期的「預計到貨時間」時，帶成 inverter_order_date，
+    給排定出貨時間視窗預設填入變流器出貨時間。模組常只寫「11月中旬」這種預估，不帶（解析不出日期就沒有）。"""
+    try:
+        rows = _load_order_snapshots()["rows"]
+    except Exception as e:
+        print(f"[inverter-order-dates] 讀訂單表失敗：{e}", flush=True)
+        return cases
+    best = {}
+    for r in rows:
+        if r.get("equipment") != "變流器" or r.get("status") in ("取消", "可能撤案"):
+            continue
+        d = _parse_arrival_date(r.get("arrival"))
+        if not d:
+            continue
+        key = str(r.get("order_date") or "")
+        cur = best.get(r.get("case_no"))
+        if cur is None or key > cur[0]:
+            best[r.get("case_no")] = (key, d.isoformat())
+    return [{**c, "inverter_order_date": best[c.get("case")][1]} if c.get("case") in best else c for c in cases]
 
 
 SHIP_SYNC_LAST = {"at": None, "changed": [], "error": None}
@@ -5608,7 +5630,7 @@ def ship_date_sync_api():
 
 @app.route("/api/entry-cases")
 def entry_cases():
-    entry = _entry_with_order_dates(DATA_CACHE["entry"])
+    entry = _with_inverter_order_dates(_entry_with_order_dates(DATA_CACHE["entry"]))
     return jsonify({
         "count": len(entry),
         "cases": entry,
