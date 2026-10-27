@@ -758,6 +758,7 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
         SLOT_API_URL, formula,
         [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
     )
+    found = []
     for r in existing:
         if ignore_ids and r["id"] in ignore_ids:   # 變更預約時，自己（和同時預約的案件）不算衝突
             continue
@@ -773,7 +774,7 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
             if not (buffer_min and _parse_hhmm(start_time) < _parse_hhmm(ee) + buffer_min and _parse_hhmm(es) < _parse_hhmm(end_time) + buffer_min):
                 continue
             near = True
-        return {
+        found.append({
             "buffer": near,
             "case": ef.get(FIELD_SLOT_CASE_NO, ""),
             "alias": ef.get(FIELD_SLOT_ALIAS, ""),
@@ -781,8 +782,32 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
             "start_time": es,
             "end_time": ee,
             "registrant": ef.get(FIELD_SLOT_REGISTRANT, ""),
-        }
-    return None
+        })
+    if not found:
+        return None
+    # 2026-10-27：回第一筆，另外附上所有衝突到的行程（"all"），讓窗口判斷這天同廠商的其他行程會不會互相阻擋
+    return dict(found[0], all=found)
+
+
+def _vendor_day_conflict_text(vendor, date, types=None):
+    """某廠商某天（同班別）已有的行程文字，給通知卡用；沒有回空字串。"""
+    try:
+        esc = vendor.replace("'", chr(92) + "'")
+        recs = airtable_get_all(
+            SLOT_API_URL,
+            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',IS_SAME({{{FIELD_SLOT_DATE}}},'{date}','day'))",
+            [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE])
+    except Exception as e:
+        print(f"[_vendor_day_conflict_text] {e}", flush=True)
+        return ""
+    items = []
+    for r in recs:
+        ef = r["fields"]
+        if types is not None and not _same_crew(types, ef.get(FIELD_SLOT_TYPE) or []):
+            continue
+        items.append((ef.get(FIELD_SLOT_START) or "", f"{ef.get(FIELD_SLOT_START, '')}-{ef.get(FIELD_SLOT_END, '')} {'+'.join(ef.get(FIELD_SLOT_TYPE) or [])} {ef.get(FIELD_SLOT_CASE_NO, '')}"))
+    items.sort()
+    return "、".join(t for _, t in items)
 
 
 def _clean_companions(raw, primary=""):
@@ -811,7 +836,7 @@ def _case_alias(case_no):
 
 
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None, companions=None, buffer_min=0):
+                       owner_name=None, owner_phone=None, companions=None, buffer_min=0, allow_overlap=False):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -838,10 +863,12 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     if _parse_hhmm(start_time) >= _parse_hhmm(end_time):
         return None, ({"error": "開始時間要早於結束時間"}, 400)
 
-    try:
-        conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=slot_type)
-    except Exception as e:
-        return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
+    conflict = None
+    if not allow_overlap:   # allow_overlap：窗口看過同廠商當天的其他行程，判斷不會互相阻擋，才允許同時段預約
+        try:
+            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=slot_type)
+        except Exception as e:
+            return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
         if conflict.get("buffer"):
             return None, ({"error": f"跟同一天 {conflict['start_time']}–{conflict['end_time']} 的預約太近了，中間要留 {buffer_min} 分鐘的車程時間，請換一個時間", "conflict": conflict}, 409)
@@ -1185,7 +1212,7 @@ def create_vendor_slot_booking():
     record, err = _book_vendor_slot(
         body.get("vendor"), body.get("date"), body.get("start_time"), body.get("end_time"),
         body.get("case"), body.get("alias"), body.get("type"), body.get("registrant"), body.get("note"),
-        companions=body.get("companions"),
+        companions=body.get("companions"), allow_overlap=bool(body.get("allow_overlap")),
     )
     if err:
         err_body, status = err
@@ -1806,6 +1833,7 @@ def complete_vendor_slot_task(record_id):
     record, err = _book_vendor_slot(
         task["vendor"], date, start, end, task["case"], task["alias"], task["type"], registrant, db_note,
         owner_name=owner_name, owner_phone=owner_phone, companions=task.get("companions"),
+        allow_overlap=bool(body.get("allow_overlap")),
     )
     if err:
         err_body, status = err
@@ -1964,12 +1992,17 @@ def choose_vendor_slot_alternative(record_id):
         slot["start_time"], slot["end_time"] = f"{st // 60:02d}:{st % 60:02d}", f"{et // 60:02d}:{et % 60:02d}"
     if not slot.get("start_time") or not slot.get("end_time"):
         return jsonify({"error": "這個備選只有日期，請先填開始時間"}), 400
-    try:
-        conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"], types=task["type"])
-    except Exception as e:
-        return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
-    if conflict:
-        return jsonify({"error": "這個時段已經被佔用了", "conflict": conflict}), 409
+    allow_overlap = bool(body.get("allow_overlap"))
+    if allow_overlap:
+        slot["overlap_ok"] = True   # 窗口已確認同時段沒問題；屋主／業務按確認時不再擋衝突
+    else:
+        slot.pop("overlap_ok", None)
+        try:
+            conflict = _find_slot_conflict(task["vendor"], slot["date"], slot["start_time"], slot["end_time"], types=task["type"])
+        except Exception as e:
+            return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+        if conflict:
+            return jsonify({"error": "這個時段已經被佔用了", "conflict": conflict}), 409
     try:
         _patch_task(record_id, {
             FIELD_TASK_CHOSEN_SLOT: json.dumps(slot, ensure_ascii=False),
@@ -2030,6 +2063,7 @@ def confirm_vendor_slot_chosen(token):
         task["case"], task["alias"], task["type"],
         (body.get("registrant") or task["assignee"] or "").strip(), body.get("note"),
         owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
+        allow_overlap=bool(chosen.get("overlap_ok")),
     )
     if err:
         err_body, status = err
@@ -2451,10 +2485,17 @@ def owner_booking_propose(otoken):
         except Exception as e:
             print(f"[owner_booking_propose] 更新聯合排程狀態失敗：{e}", flush=True)
     slot_lines = "\n".join(f"{i + 1}. {_wd_label(sl['date'])}" for i, sl in enumerate(slots))
+    # 2026-10-27：屋主選了「同廠商那天已有行程」的日期 → 列出那天已有的行程，讓窗口判斷會不會互相阻擋、要不要同時段預約
+    busy_lines = []
+    for sl in slots:
+        txt = _vendor_day_conflict_text(task["vendor"], sl["date"], task["type"])
+        if txt:
+            busy_lines.append(f"{_wd_label(sl['date'])}：{txt}")
+    busy_rows = [("⚠️ 廠商那天已有行程", "\n".join(busy_lines))] if busy_lines else []
     _notify_owner_action(
         task, "🏠 屋主提供其他日期｜給安排人員", "🏠 屋主提供其他日期｜給業務", "#D97706",
         [("業務", task["assignee"]), ("項目", "、".join(task["type"])), ("廠商", task["vendor"]),
-         (f"屋主方便的日期（{len(slots)} 天）", slot_lines), ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
+         (f"屋主方便的日期（{len(slots)} 天）", slot_lines), *busy_rows, ("屋主", _owner_str(name, phone)), ("屋主備註", note)],
         note_rep="窗口跟廠商確認後會選一天並決定時間，屋主可以在同一個連結按確認",
     )
     return jsonify({"ok": True, "slots": slots})
@@ -2521,6 +2562,7 @@ def owner_booking_confirm(otoken):
     record, err = _book_vendor_slot(
         task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
         task["type"], f"屋主 {name}", note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
+        allow_overlap=bool(chosen.get("overlap_ok")),
     )
     if err:
         err_body, status = err
@@ -14246,7 +14288,7 @@ def update_vendor_slot_booking(record_id):
         return jsonify({"error": "查詢同時預約的案件失敗", "detail": str(e)}), 502
     group = [rec] + siblings
     changed_time = (date, start, end) != (date0, start0, end0)
-    if changed_time:
+    if changed_time and not body.get("allow_overlap"):
         try:
             conflict = _find_slot_conflict(vendor, date, start, end, ignore_ids={r["id"] for r in group}, types=types)
         except Exception as e:
