@@ -4379,6 +4379,9 @@ def format_module(fields):
         # 四捨五入成整數（22 片），不顯示一長串小數。
         if isinstance(qty, float) and qty > 0:
             qty = int(qty + 0.5)
+        # 算出來離譜的數字（例：型號沒有「500W_」前綴，Airtable 公式抓不到瓦數 → 2333 片）不顯示，只顯示型號，免得誤導
+        if qty > 300:
+            return model
         return f"{model} ×{qty}"
     return model
 
