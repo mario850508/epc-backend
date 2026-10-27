@@ -4375,6 +4375,10 @@ def format_module(fields):
         # 改成「跟最接近的整數相差在極小誤差內」就視為整數。
         rounded = round(qty)
         qty = rounded if abs(qty - rounded) < 1e-6 else qty
+        # 2026-10-27：片數一定是整數。容量÷瓦數除不盡時（例：潤特新竹79號 495W、10.8kW → 21.8181…）
+        # 四捨五入成整數（22 片），不顯示一長串小數。
+        if isinstance(qty, float) and qty > 0:
+            qty = int(qty + 0.5)
         return f"{model} ×{qty}"
     return model
 
