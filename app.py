@@ -5439,7 +5439,7 @@ def _vp_info_warm_all():
 
 
 scheduler.add_job(_vp_info_warm_all, IntervalTrigger(minutes=8), id="vp_info_warm", replace_existing=True,
-                  next_run_time=datetime.now(TW_TZ) + timedelta(seconds=90), max_instances=1, coalesce=True)
+                  next_run_time=datetime.now(timezone(timedelta(hours=8))) + timedelta(seconds=90), max_instances=1, coalesce=True)
 
 
 @app.route("/api/vendor-portal/<token>/cases")
