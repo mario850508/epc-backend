@@ -14985,6 +14985,7 @@ INV_F = {
     "check_json": "fldHfd38JiUHJMefq", "ext_json": "fldlrNDXy8gXryMYH", "file": "fldaBhRf5gScr3OEf",
     "src_name": "fldiuITVL4vPzzSoe", "page": "fldSNje5iGISsPDYO", "uploader": "fld2Rw6rgFoOZmJ6w",
     "uploaded_at": "fldx1ukFP2fIFiuIW", "note": "fldGBqgwXryUYGNTU", "manual": "fld2k5K4eEdvjfKXm",
+    "pay_date": "fldxdgoHgllUU3NXs", "payable_at": "fldALqbvJphxw75O3",
 }
 INV_STATUSES = ("待確認", "可付款", "退回", "已付款")
 INV_NODES = ("簽約款", "同意備案款", "材料訂購款", "工班進場款", "掛錶驗收款", "設備登記款", "正式售電款")
@@ -15816,23 +15817,128 @@ def invoice_recheck(record_id):
         return jsonify({"error": str(e)}), 502
 
 
+# ---------------- 付款批次（2026-10-28 使用者說明的付款節奏）----------------
+# 每兩週一次：週五「收件截止」→ 下週五「付款」（雲端資料夾「2026-11-06付款，收件截止1030」）。
+# 只有資料夾名稱有「收件截止」的才是發票請款的付款日（沒寫的是別的款項，不算）。
+# 標「可付款」時自動歸到「收件截止 ≥ 當天」的第一個付款日；付款日當天自動轉「已付款」（使用者同意）。
+# 已付款的同一批＝付款清單，給同仁跟會計核對金額。不寫回 Airtable 進度管理（使用者：先不用）。
+INV_PAY_KEY = "invoice_pay_schedule"
+INV_PAY_DEFAULT = [("2026-09-24", "2026-09-18"), ("2026-10-08", "2026-10-02"), ("2026-10-23", "2026-10-16"),
+                   ("2026-11-06", "2026-10-30"), ("2026-11-20", "2026-11-13"), ("2026-12-04", "2026-11-27"),
+                   ("2026-12-18", "2026-12-11"), ("2026-12-31", "2026-12-24")]
+
+
+def _inv_pay_schedule():
+    """[{pay, cutoff, auto}]：存的表（頁面可改）優先，沒有用預設；最後一筆之後照「每兩週，截止＋7 天付款」自動往後排到一年後。"""
+    items = None
+    try:
+        raw = _state_get_chunked(INV_PAY_KEY)
+        if raw:
+            items = [(x["pay"], x["cutoff"]) for x in json.loads(raw) if x.get("pay") and x.get("cutoff")]
+    except Exception as e:
+        print(f"[invoice] 讀付款日期表失敗：{e}", flush=True)
+    items = sorted(items or INV_PAY_DEFAULT, key=lambda x: x[1])
+    out = [{"pay": a, "cutoff": b, "auto": False} for a, b in items]
+    last = datetime.strptime(items[-1][1], "%Y-%m-%d")
+    horizon = datetime.now(TW_TZ).replace(tzinfo=None) + timedelta(days=365)
+    while last < horizon:
+        last += timedelta(days=14)
+        last += timedelta(days=(4 - last.weekday()) % 7)   # 收件截止對齊週五（12/24 這種因假日提前的不要一路錯下去）
+        out.append({"pay": (last + timedelta(days=7)).strftime("%Y-%m-%d"), "cutoff": last.strftime("%Y-%m-%d"), "auto": True})
+    return out
+
+
+def _inv_batch_for(day):
+    """day（YYYY-MM-DD）這天標可付款 → 歸哪一個付款日：收件截止 ≥ day 的第一個。"""
+    return next((x["pay"] for x in _inv_pay_schedule() if x["cutoff"] >= day), "")
+
+
+@app.route("/api/invoice/schedule", methods=["GET", "POST"])
+def invoice_schedule():
+    if request.method == "POST":
+        items = [{"pay": (x.get("pay") or "").strip(), "cutoff": (x.get("cutoff") or "").strip()}
+                 for x in (request.get_json(silent=True) or {}).get("items") or []]
+        items = [x for x in items if re.fullmatch(r"\d{4}-\d{2}-\d{2}", x["pay"]) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", x["cutoff"])]
+        if not items:
+            return jsonify({"error": "沒有有效的日期"}), 400
+        _state_put_chunked(INV_PAY_KEY, json.dumps(items, ensure_ascii=False))
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    sched = _inv_pay_schedule()
+    return jsonify({"items": sched, "today": today, "next": next((x for x in sched if x["cutoff"] >= today), None)})
+
+
 @app.route("/api/invoice/<record_id>/status", methods=["POST"])
 def invoice_set_status(record_id):
+    """body: {status?, note?, pay_date?}。改成可付款時沒有付款日就自動歸批次；改回待確認／退回就清掉付款日。"""
     if not re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
         return jsonify({"error": "record_id 不正確"}), 400
     body = request.get_json(silent=True) or {}
     fields = {}
-    if body.get("status"):
-        if body["status"] not in INV_STATUSES:
-            return jsonify({"error": "狀態不正確"}), 400
-        fields[INV_F["status"]] = body["status"]
-    if "note" in body:
-        fields[INV_F["note"]] = (body.get("note") or "")[:5000]
     try:
+        status = body.get("status")
+        if status:
+            if status not in INV_STATUSES:
+                return jsonify({"error": "狀態不正確"}), 400
+            fields[INV_F["status"]] = status
+            cur = _inv_get(record_id).get("fields", {})
+            today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+            if status in ("可付款", "已付款"):
+                if not cur.get(INV_F["pay_date"]) and not body.get("pay_date"):
+                    fields[INV_F["pay_date"]] = _inv_batch_for(today) or None
+                if status == "可付款" and cur.get(INV_F["status"]) != "可付款":
+                    fields[INV_F["payable_at"]] = _inv_now()
+            else:
+                fields[INV_F["pay_date"]] = None
+                fields[INV_F["payable_at"]] = ""
+        if body.get("pay_date"):
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body["pay_date"]):
+                return jsonify({"error": "付款日格式不對"}), 400
+            fields[INV_F["pay_date"]] = body["pay_date"]
+        if "note" in body:
+            fields[INV_F["note"]] = (body.get("note") or "")[:5000]
         requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "pay_date": fields.get(INV_F["pay_date"], "")})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+def _inv_auto_paid():
+    """每小時：①「可付款」還沒有付款日的補上批次（依標記可付款的日期）；②付款日已到（≤ 今天）的「可付款」→「已付款」。"""
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    try:
+        recs = airtable_get_all(INV_API_URL, "{" + INV_F["status"] + "}='可付款'", [INV_F["pay_date"], INV_F["payable_at"]])
+    except Exception as e:
+        print(f"[invoice] 自動已付款查詢失敗：{e}", flush=True)
+        return
+    ups = []
+    for r in recs:
+        f = r["fields"]
+        pay = f.get(INV_F["pay_date"]) or _inv_batch_for((f.get(INV_F["payable_at"]) or today)[:10])
+        fields = {}
+        if pay and not f.get(INV_F["pay_date"]):
+            fields[INV_F["pay_date"]] = pay
+        if pay and pay <= today:
+            fields[INV_F["status"]] = "已付款"
+        if fields:
+            ups.append({"id": r["id"], "fields": fields})
+    for i in range(0, len(ups), 10):
+        try:
+            requests.patch(INV_API_URL, headers=airtable_headers(), json={"records": ups[i:i + 10]}, timeout=30).raise_for_status()
+        except Exception as e:
+            print(f"[invoice] 自動已付款寫入失敗：{e}", flush=True)
+    if ups:
+        print(f"[invoice] 付款批次：更新 {len(ups)} 張（補批次／轉已付款）", flush=True)
+
+
+scheduler.add_job(_inv_auto_paid, CronTrigger(minute=5, timezone="Asia/Taipei"), id="invoice_auto_paid", replace_existing=True,
+                  max_instances=1, coalesce=True, misfire_grace_time=600)
+
+
+@app.route("/api/invoice/auto-paid", methods=["POST"])
+def invoice_auto_paid_now():
+    """手動立刻跑一次付款批次整理（補批次、到期轉已付款）。"""
+    _inv_auto_paid()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/invoice/<record_id>", methods=["DELETE"])
