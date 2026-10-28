@@ -14767,6 +14767,645 @@ def delete_meter_check(record_id):
         return jsonify({"error": str(e)}), 502
 
 
+# ===================================================================
+# 發票請款（2026-10-28 新增）
+# ===================================================================
+# 廠商（EPC 施作廠商）開發票向我們請款。主控台上傳發票掃描檔（一個 PDF 可以多頁、一頁一張發票），
+# 後端用 Claude 讀出：發票號碼／日期／賣方／品名／金額／備註（備註通常寫合約編號＋案號或簡寫，例如
+# 「H11509251C 潤桃87」「O11505093C 工程新竹6號」），再由程式：
+#   1. 比對是哪個案場：合約編號（專案細節「合約編號」）＞案號＞案號簡寫（潤桃87＝潤特桃園87號）＞別名。
+#   2. 判斷請款節點（工程合約七期：簽約款／同意備案款／材料訂購款／工班進場款／掛錶驗收款／設備登記款／
+#      正式售電款）；一張發票可能同時請好幾期（例如「簽約+同備+材料+進場」）。廠商寫法各不相同：
+#      尚展「文件款2%」＝正式售電款、「設登款8%」＝設備登記款；曙光「掛表款」；三創「光電工程款-簽約」。
+#   3. 金額：發票總計（含稅）對工程合約該期（多期就加總）的含稅金額。合約金額從工程合約 OCR 文字的
+#      「參. 付款期程」讀（每期都有「新台幣 X 元整(含稅)」）；讀不到就用 工程總價×比例；文字裡沒有付款
+#      期程（文字摘錄被截斷）時，再請 Claude 讀工程合約 PDF 本身。
+#   4. 函文是否已取得（使用者 2026-10-28 指定的對應）：
+#      簽約款→工程合約；同意備案款→同意備案函；材料訂購款→支架拆圖＋系統送審圖；
+#      工班進場款→進場屋主預約時間＋串併圖；掛錶驗收款→掛表通知＋驗收單（驗收合格）；
+#      設備登記款→設備登記函（或設備移轉函）；正式售電款→正式售電函。
+#      來源：進度管理里程碑（有完成日期）、PDF 公文更名（已確認／已歸檔）、案場圖面（G 槽同步）、
+#      專案細節的編號欄位、維運驗收（驗收結果含「合格」）。
+# 結果存 Airtable「發票請款」表（一張發票一筆，附件是那一頁 PDF），人工可改案號／節點後重新檢查，
+# 狀態：待確認 → 可付款／退回 → 已付款。
+INV_TABLE_ID = "tblcBT2NWJ26ZDVIX"
+INV_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{INV_TABLE_ID}"
+INV_F = {
+    "invoice_no": "fldcU4rvV9W229Xjh", "status": "fldXp4g0u7CoUGsD4", "case_no": "fldbwxmXBIaEFOTrz",
+    "alias": "fldWN8KjWe8hNjPF0", "vendor": "fldElQF27gJcjRojl", "seller": "flds0niZMxKItsrtq",
+    "date": "fldFPhvkDg9UKV7uQ", "items": "fldWEMKiMvVgbOABW", "nodes": "fldyRzEAJ49icyl8E",
+    "sales": "fldd6YFEBa2tILHyY", "tax": "fld3B47pamLMNC10i", "total": "fldcHlzwS3p9v9D5Z",
+    "expected": "fldzJzmnptMfTJyOc", "amount_check": "fld7U4UgGRSXuRlW4", "doc_check": "fld10QfQcc8oVEJw9",
+    "check_json": "fldHfd38JiUHJMefq", "ext_json": "fldlrNDXy8gXryMYH", "file": "fldaBhRf5gScr3OEf",
+    "src_name": "fldiuITVL4vPzzSoe", "page": "fldSNje5iGISsPDYO", "uploader": "fld2Rw6rgFoOZmJ6w",
+    "uploaded_at": "fldx1ukFP2fIFiuIW", "note": "fldGBqgwXryUYGNTU", "manual": "fld2k5K4eEdvjfKXm",
+}
+INV_STATUSES = ("待確認", "可付款", "退回", "已付款")
+INV_NODES = ("簽約款", "同意備案款", "材料訂購款", "工班進場款", "掛錶驗收款", "設備登記款", "正式售電款")
+# 每期要有的文件。ms＝進度管理里程碑類型（有完成日期就算有）、pdf＝PDF 公文更名的函文類型、
+# draw＝案場圖面的類型、id＝專案細節的編號欄位（有填就算有）、past＝里程碑日期要是今天以前（掛表）、
+# ops＝維運驗收要「合格」
+INV_REQS = {
+    "簽約款": [{"label": "工程合約", "ms": ["工程合約簽約"], "pdf": ["工程合約"], "draw": ["工程合約"], "id": "合約編號"}],
+    "同意備案款": [{"label": "同意備案函", "ms": ["同意備案"], "pdf": ["同意備案"], "id": "同意備案編號"}],
+    "材料訂購款": [{"label": "支架拆圖", "ms": ["支架拆圖"], "pdf": ["支架拆圖"]},
+                {"label": "系統送審圖", "ms": ["系統送審圖"], "pdf": ["系統送審圖"], "draw": ["系統送審圖"]}],
+    "工班進場款": [{"label": "進場屋主預約時間", "ms": ["進場屋主預約"]},
+                {"label": "串併圖", "ms": ["串並圖"], "pdf": ["串併圖"]}],
+    "掛錶驗收款": [{"label": "掛表通知", "ms": ["掛表", "併聯試運轉"], "pdf": ["併聯試運轉函"], "past": True},
+                {"label": "驗收單（驗收合格）", "ops": True}],
+    "設備登記款": [{"label": "設備登記函／設備移轉函", "ms": ["設備登記", "移轉設備"], "pdf": ["設備登記", "設備登記移轉"], "id": "設備登記編號"}],
+    "正式售電款": [{"label": "正式售電函", "ms": ["正式售電函"], "pdf": ["正式售電函"]}],
+}
+# 合約「參. 付款期程」裡各期的寫法（OCR 會「錶／表」混用）
+_INV_SCHED_RE = re.compile(r"(簽約款|同意備案款|材料訂購款|工班進場款|掛[錶表]驗收款|設備登記款|正式售電款)\s*(\d{1,2}(?:\.\d+)?)\s*%")
+_INV_COUNTY_SHORT = {"桃園": ["桃"], "新竹": ["竹", "新竹"], "苗栗": ["苗"], "宜蘭": ["宜"], "臺中": ["中"], "台中": ["中"],
+                     "彰化": ["彰"], "雲林": ["雲"], "南投": ["投"], "嘉義": ["嘉"], "臺南": ["南"], "台南": ["南"],
+                     "高雄": ["高"], "屏東": ["屏"], "臺北": ["北"], "台北": ["北"], "新北": ["新北"], "基隆": ["基"],
+                     "花蓮": ["花"], "臺東": ["東"], "台東": ["東"]}
+INV_JOBS = {}             # job_id → {status, done, total, results, error, at}
+_INV_SCHED_CACHE = {}     # 案號 → Claude 讀工程合約 PDF 得到的付款期程（同一次開機內不重讀）
+
+
+def _inv_now():
+    return datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _inv_esc(s):
+    return (s or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+# ---------------- 1. Claude 讀發票 ----------------
+
+def _inv_extract(pdf_b64):
+    schema = {
+        "type": "object",
+        "properties": {"invoices": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "page": {"type": "integer"},
+                "invoice_no": {"type": "string"},
+                "date": {"type": "string"},
+                "seller": {"type": "string"},
+                "seller_tax_id": {"type": "string"},
+                "buyer": {"type": "string"},
+                "items": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"}, "amount": {"type": "number"}},
+                    "required": ["name", "amount"], "additionalProperties": False}},
+                "sales_amount": {"type": "number"},
+                "tax": {"type": "number"},
+                "total": {"type": "number"},
+                "remarks": {"type": "string"},
+                "contract_nos": _str_list(),
+                "case_refs": _str_list(),
+                "nodes": {"type": "array", "items": {"type": "string", "enum": list(INV_NODES)}},
+                "notes": {"type": "string"},
+            },
+            "required": ["page", "invoice_no", "date", "seller", "seller_tax_id", "buyer", "items", "sales_amount",
+                         "tax", "total", "remarks", "contract_nos", "case_refs", "nodes", "notes"],
+            "additionalProperties": False}}},
+        "required": ["invoices"], "additionalProperties": False,
+    }
+    system = (
+        "你是台灣太陽光電 EPC 公司的會計助理，負責判讀施工廠商開給公司（買方：綠點能創股份有限公司）的請款發票。"
+        "發票有電子發票證明聯（印刷）、手寫三聯式統一發票兩種，一個檔案每一頁通常是一張發票。準確比速度重要，"
+        "看不清楚或沒寫的欄位留空字串（數字填 0），不要猜。\n"
+        "- 發票日期：民國年換算西元（民國年＋1911），輸出 YYYY-MM-DD。\n"
+        "- 金額：銷售額（未稅）、營業稅、總計（含稅）照抄成數字；品名每一行一筆（手寫的一格寫好幾期就拆開，"
+        "沒有個別金額的 amount 填 0）。\n"
+        "- 備註欄通常寫「合約編號」（1 個英文字母＋9～10 位數字＋C，例如 K11505039C、H11509251C）和案號或簡寫"
+        "（例如 工程新竹6號、潤桃87＝潤特桃園87號、潤宜28＝潤特宜蘭28號）。合約編號放 contract_nos（手寫的請逐字"
+        "仔細看，數字位數要對），案號／簡寫／案場名稱放 case_refs。\n"
+        "- nodes：這張發票請的是工程合約哪幾期，只能用這七個名稱：簽約款、同意備案款、材料訂購款、工班進場款、"
+        "掛錶驗收款、設備登記款、正式售電款。各廠商寫法不同：同備＝同意備案款；材料／材料款＝材料訂購款；"
+        "進場／進場款＝工班進場款；掛表款／掛錶款／驗收款＝掛錶驗收款；設登款＝設備登記款；文件款＝正式售電款"
+        "（通常是 2%）；「光電工程款-簽約」＝簽約款。一張發票可以有多期。\n"
+        "- notes 寫任何不確定的地方（例如手寫數字難辨認）。"
+    )
+    instruction = "請讀完每一頁，每一張發票輸出一筆（page 從 1 開始，是這張發票在檔案裡的頁碼）。不是發票的頁面（空白、附件）不要輸出。"
+    return _pdf_ask(system, pdf_b64, instruction, schema).get("invoices") or []
+
+
+# ---------------- 2. 比對案場 ----------------
+
+def _inv_case_abbrevs(case_no):
+    """潤特桃園87號 → {潤桃87, 潤特桃園87, 潤特桃園87號}；工程新竹6號 → {工竹6, 工新竹6, …}"""
+    out = {_norm_text(case_no), _norm_text(case_no).rstrip("號")}
+    m = re.match(r"^(\D{2})(\D+?)(\d+)號?$", case_no or "")
+    if m:
+        series, county, num = m.groups()
+        for short in _INV_COUNTY_SHORT.get(county, [county[:1]]) + [county]:
+            out.add(_norm_text(series[:1] + short + num))
+            out.add(_norm_text(series + short + num))
+    return {x for x in out if x}
+
+
+def _inv_match_case(inv):
+    cases = _pdf_case_ref()
+    cnos = [_norm_id(x) for x in inv.get("contract_nos") or [] if len(_norm_id(x)) >= 6]
+    refs = [_norm_text(x).rstrip("號") for x in (inv.get("case_refs") or []) if _norm_text(x)]
+    remarks = _norm_text(inv.get("remarks") or "")
+    scored = []
+    for c in cases:
+        score, why = 0, []
+        own = _norm_id(c["ids"].get("合約編號", ""))
+        if own:
+            for x in cnos:
+                if x == own:
+                    score += 100; why.append(f"合約編號 {c['ids']['合約編號']} 完全相同"); break
+                if len(x) == len(own) and sum(a != b for a, b in zip(x, own)) == 1:
+                    score += 60; why.append(f"合約編號 {c['ids']['合約編號']} 差一個字（發票上 {x}）"); break
+        abbrs = _inv_case_abbrevs(c["case_no"])
+        if any(r in abbrs for r in refs) or _norm_text(c["case_no"]) in remarks:
+            score += 90; why.append("案號／簡寫相符")
+        elif c["alias"] and (_norm_text(c["alias"]) in remarks or any(r == _norm_text(c["alias"]) for r in refs)):
+            score += 50; why.append(f"別名 {c['alias']} 相符")
+        if score:
+            scored.append({"case": c, "score": score, "why": "；".join(why)})
+    scored.sort(key=lambda s: -s["score"])
+    return scored[:5]
+
+
+# ---------------- 3. 工程合約付款期程 ----------------
+
+def _inv_parse_schedule(text):
+    """工程合約 OCR 文字 → {節點: {pct, amount}}、工程總價(含稅)。"""
+    t = (text or "").replace("（", "(").replace("）", ")").replace("：", ":").replace("　", " ")
+    t = re.sub(r"(?<=\d)\s*,\s*(?=\d{3}(?!\d))", ",", t)
+    start = t.find("付款期程")
+    body = t[start:] if start >= 0 else t
+    hits = list(_INV_SCHED_RE.finditer(body))
+    sched = {}
+    for i, m in enumerate(hits):
+        node = m.group(1).replace("掛表", "掛錶")
+        if node in sched:
+            continue
+        seg = body[m.end(): hits[i + 1].start() if i + 1 < len(hits) else m.end() + 400]
+        am = re.search(r"新[台臺]幣\s*([\d,]{3,})\s*元", seg)
+        sched[node] = {"pct": float(m.group(2)), "amount": float(am.group(1).replace(",", "")) if am else None}
+    total = _eng_contract_values(text).get("total")
+    for v in sched.values():
+        if v["amount"] is None and total:
+            v["amount"] = round(total * v["pct"] / 100)
+            v["calc"] = True
+    return sched, total
+
+
+def _inv_contract_doc(case_no):
+    """這案的工程合約：案場圖面（G 槽同步）優先，沒有就 PDF 公文更名。回 {text, file_url, filename, origin}。"""
+    esc = _inv_esc(case_no)
+    try:
+        recs = airtable_get_all(DRAWING_API_URL, "AND({" + DRAWING_F["kind"] + "}='" + ENG_KIND + "',{" + DRAWING_F["case_no"] + "}='" + esc + "')",
+                                [DRAWING_F[k] for k in ("text", "file", "filename", "doc_date")])
+        recs.sort(key=lambda r: r["fields"].get(DRAWING_F["doc_date"], ""), reverse=True)
+        if recs:
+            f = recs[0]["fields"]
+            return {"text": f.get(DRAWING_F["text"], ""), "file_url": ((f.get(DRAWING_F["file"]) or [{}])[0]).get("url", ""),
+                    "filename": f.get(DRAWING_F["filename"], ""), "origin": "案場圖面"}
+    except Exception as e:
+        print(f"[invoice] 查案場圖面工程合約失敗 {case_no}：{e}", flush=True)
+    try:
+        recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["doc_type"] + "}='" + ENG_KIND + "',{" + PDF_F["case_no"] + "}='" + esc + "')",
+                                [PDF_F[k] for k in ("result_json", "file", "final_name")])
+        if recs:
+            f = recs[0]["fields"]
+            try:
+                text = json.loads(f.get(PDF_F["result_json"]) or "{}").get("text_excerpt", "")
+            except ValueError:
+                text = ""
+            return {"text": text, "file_url": ((f.get(PDF_F["file"]) or [{}])[0]).get("url", ""),
+                    "filename": f.get(PDF_F["final_name"], ""), "origin": "公文更名"}
+    except Exception as e:
+        print(f"[invoice] 查公文更名工程合約失敗 {case_no}：{e}", flush=True)
+    return None
+
+
+def _inv_schedule_by_ai(case_no, file_url):
+    """文字摘錄裡沒有付款期程 → 請 Claude 直接讀工程合約 PDF（掃描檔，付款期程在第 3～4 頁）。"""
+    if case_no in _INV_SCHED_CACHE:
+        return _INV_SCHED_CACHE[case_no]
+    data = requests.get(file_url, timeout=60).content
+    schema = {"type": "object", "properties": {
+        "total": {"type": "number"},
+        "items": {"type": "array", "items": {"type": "object", "properties": {
+            "node": {"type": "string", "enum": list(INV_NODES)}, "pct": {"type": "number"}, "amount": {"type": "number"}},
+            "required": ["node", "pct", "amount"], "additionalProperties": False}}},
+        "required": ["total", "items"], "additionalProperties": False}
+    res = _pdf_ask("你是台灣太陽光電 EPC 公司的合約判讀助理。看不清楚的數字填 0，不要猜。",
+                   base64.b64encode(data).decode(),
+                   "這是一份太陽光電工程合約。請找出「工程總價（含稅）」，以及「付款期程」每一期的名稱、比例(%)、"
+                   "含稅金額（新台幣 X 元整）。期別名稱對應到：簽約款、同意備案款、材料訂購款、工班進場款、掛錶驗收款"
+                   "（掛表驗收款）、設備登記款、正式售電款。", schema)
+    sched = {it["node"]: {"pct": it["pct"], "amount": it["amount"] or (round(res["total"] * it["pct"] / 100) if res.get("total") else None)}
+             for it in res.get("items") or []}
+    _INV_SCHED_CACHE[case_no] = (sched, res.get("total") or None)
+    return _INV_SCHED_CACHE[case_no]
+
+
+def _inv_contract_schedule(case_no):
+    doc = _inv_contract_doc(case_no)
+    if not doc:
+        return {"found": False, "note": "找不到這案的工程合約（案場圖面／公文更名都沒有）", "sched": {}}
+    sched, total = _inv_parse_schedule(doc["text"])
+    how = "合約文字"
+    if len(sched) < 3 and doc.get("file_url"):
+        try:
+            sched, total = _inv_schedule_by_ai(case_no, doc["file_url"])
+            how = "AI 讀合約 PDF"
+        except Exception as e:
+            print(f"[invoice] AI 讀工程合約失敗 {case_no}：{e}", flush=True)
+    return {"found": True, "sched": sched, "total": total, "how": how, "filename": doc["filename"],
+            "file_url": doc["file_url"], "origin": doc["origin"],
+            "note": "" if sched else "工程合約裡讀不到付款期程"}
+
+
+# ---------------- 4. 函文檢查 ----------------
+
+def _inv_case_docs(case):
+    """這案現有的文件：{ms: {類型: [日期]}, pdf: {類型: [檔名]}, draw: {類型: [檔名]}, ids: {...}, ops: [...]}"""
+    case_no, esc = case["case_no"], _inv_esc(case["case_no"])
+    out = {"ms": {}, "pdf": {}, "draw": {}, "ids": dict(case.get("ids") or {}), "ops": []}
+    if case.get("record_id"):
+        try:
+            r = requests.get(f"{CASE_API_URL}/{case['record_id']}", headers=airtable_headers(),
+                             params={"returnFieldsByFieldId": "true", "fields[]": [FIELD_MS_LINK_ON_CASE]}, timeout=30)
+            r.raise_for_status()
+            ms_ids = r.json().get("fields", {}).get(FIELD_MS_LINK_ON_CASE) or []
+            for i in range(0, len(ms_ids), 50):
+                formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ms_ids[i:i + 50]) + ")"
+                for m in airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE]):
+                    mf = m["fields"]
+                    if mf.get(FIELD_MS_TYPE) and mf.get(FIELD_MS_ACTUAL_DATE):
+                        out["ms"].setdefault(mf[FIELD_MS_TYPE], []).append(mf[FIELD_MS_ACTUAL_DATE])
+        except Exception as e:
+            print(f"[invoice] 查里程碑失敗 {case_no}：{e}", flush=True)
+    try:
+        for p in airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc + "',OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED
+                                  + "',{" + PDF_F["status"] + "}='" + PDF_ST_ARCHIVED + "'))", [PDF_F["doc_type"], PDF_F["final_name"]]):
+            pf = p["fields"]
+            if pf.get(PDF_F["doc_type"]):
+                out["pdf"].setdefault(pf[PDF_F["doc_type"]], []).append(pf.get(PDF_F["final_name"], ""))
+    except Exception as e:
+        print(f"[invoice] 查公文更名失敗 {case_no}：{e}", flush=True)
+    try:
+        for d in airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["case_no"] + "}='" + esc + "'", [DRAWING_F["kind"], DRAWING_F["filename"]]):
+            df = d["fields"]
+            if df.get(DRAWING_F["kind"]):
+                out["draw"].setdefault(df[DRAWING_F["kind"]], []).append(df.get(DRAWING_F["filename"], ""))
+    except Exception as e:
+        print(f"[invoice] 查案場圖面失敗 {case_no}：{e}", flush=True)
+    try:
+        for o in airtable_get_all(OPS_API_URL, "{" + OPS_FIELD_CASE_NO + "}='" + esc + "'", [OPS_FIELD_RESULT, OPS_FIELD_STATUS, OPS_FIELD_OWNER_SIGN_DATE]):
+            of = o["fields"]
+            out["ops"].append({"result": of.get(OPS_FIELD_RESULT) or [], "status": of.get(OPS_FIELD_STATUS) or "",
+                               "date": of.get(OPS_FIELD_OWNER_SIGN_DATE) or ""})
+    except Exception as e:
+        print(f"[invoice] 查維運驗收失敗 {case_no}：{e}", flush=True)
+    return out
+
+
+def _inv_check_req(req, docs, today):
+    found, pending = [], []
+    for t in req.get("ms") or []:
+        for d in sorted(docs["ms"].get(t) or [], reverse=True):
+            if req.get("past") and d > today:
+                pending.append(f"進度管理「{t}」日期 {d} 還沒到")
+            else:
+                found.append(f"進度管理「{t}」{d}")
+    for t in req.get("pdf") or []:
+        found += [f"公文更名：{n or t}" for n in docs["pdf"].get(t) or []]
+    for t in req.get("draw") or []:
+        found += [f"案場圖面：{n or t}" for n in docs["draw"].get(t) or []]
+    if req.get("id") and docs["ids"].get(req["id"]):
+        found.append(f"專案細節{req['id']} {docs['ids'][req['id']]}")
+    if req.get("ops"):
+        for o in docs["ops"]:
+            if "合格" in o["result"]:
+                found.append(f"維運驗收：合格" + (f"（{o['date']}）" if o["date"] else ""))
+            elif o["result"] or o["status"]:
+                pending.append(f"維運驗收：{'、'.join(o['result']) or o['status']}（不是合格）")
+        if not docs["ops"]:
+            pending.append("維運驗收沒有這案的驗收單")
+    return {"label": req["label"], "ok": bool(found), "found": found, "pending": pending}
+
+
+# ---------------- 5. 組合檢查結果 ----------------
+
+def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
+    """inv＝Claude 讀到的一張發票；case_no／nodes 有給就用人工指定的。回傳檢查結果 dict。"""
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    res = {"checked_at": _inv_now(), "warnings": []}
+    cands = _inv_match_case(inv)
+    res["candidates"] = [{"case_no": s["case"]["case_no"], "alias": s["case"]["alias"], "vendor": s["case"]["vendor"],
+                          "score": s["score"], "why": s["why"]} for s in cands]
+    case = None
+    if case_no:
+        case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
+        res["case_how"] = "人工指定"
+        if not case:
+            res["warnings"].append(f"案號 {case_no} 在專案細節找不到")
+            case = {"record_id": "", "case_no": case_no, "alias": "", "vendor": "", "ids": {}}
+    elif cands:
+        case = cands[0]["case"]
+        res["case_how"] = cands[0]["why"]
+        if len(cands) > 1 and cands[1]["score"] >= cands[0]["score"] - 20:
+            res["warnings"].append(f"案場不確定：也可能是 {cands[1]['case']['case_no']}（{cands[1]['why']}）")
+        if cands[0]["score"] < 90:
+            res["warnings"].append("案場比對信心偏低，請確認")
+    if not case:
+        res["case"] = None
+        res["warnings"].append("比對不到案場，請手動選案號")
+        return res
+    res["case"] = {"case_no": case["case_no"], "alias": case.get("alias", ""), "vendor": case.get("vendor", ""),
+                   "contract_no": (case.get("ids") or {}).get("合約編號", "")}
+    vendor = case.get("vendor") or ""
+    if vendor and inv.get("seller") and vendor[:2] not in inv["seller"]:
+        res["warnings"].append(f"賣方「{inv['seller']}」跟這案的施作廠商「{vendor}」不同")
+
+    nodes = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_NODES]
+    res["nodes"] = nodes
+    if not nodes:
+        res["warnings"].append("看不出是哪一期款，請手動選節點")
+
+    # 金額
+    sc = _inv_contract_schedule(case["case_no"])
+    res["contract"] = {k: sc.get(k) for k in ("found", "total", "how", "filename", "file_url", "origin", "note")}
+    res["contract"]["sched"] = sc["sched"]
+    total = float(inv.get("total") or 0)
+    missing = [n for n in nodes if not (sc["sched"].get(n) or {}).get("amount")]
+    if nodes and not missing:
+        expected = sum(sc["sched"][n]["amount"] for n in nodes)
+        diff = round(total - expected)
+        res["amount"] = {"expected": expected, "invoice_total": total, "diff": diff,
+                         "ok": abs(diff) <= 1, "label": "相符" if abs(diff) <= 1 else f"不符（差 {diff:+,}）"}
+        if abs(diff) > 1:
+            res["warnings"].append(f"金額不符：發票總計 {total:,.0f}，合約 {'+'.join(nodes)} 共 {expected:,.0f}（含稅）"
+                                   "。合約約定依實際掛表容量結算，容量有變時後面幾期金額會不同")
+    else:
+        res["amount"] = {"expected": None, "invoice_total": total, "diff": None, "ok": False,
+                         "label": "無合約金額" if nodes else "未判斷節點"}
+        if nodes:
+            res["warnings"].append("工程合約讀不到 " + "、".join(missing or nodes) + " 的金額" + (f"（{sc['note']}）" if sc.get("note") else ""))
+    # 跟發票上印的未稅金額交叉核對（抓辨識錯誤）
+    sales, tax = float(inv.get("sales_amount") or 0), float(inv.get("tax") or 0)
+    if sales and total and abs(sales + tax - total) > 1:
+        res["warnings"].append(f"發票上 銷售額 {sales:,.0f} ＋ 稅額 {tax:,.0f} ≠ 總計 {total:,.0f}，可能辨識錯誤")
+
+    # 函文
+    docs = _inv_case_docs(case)
+    res["docs"] = []
+    for n in nodes:
+        res["docs"].append({"node": n, "reqs": [_inv_check_req(r, docs, today) for r in INV_REQS[n]]})
+    lacking = [f"{d['node']}：{r['label']}" for d in res["docs"] for r in d["reqs"] if not r["ok"]]
+    res["docs_ok"] = bool(nodes) and not lacking
+    res["docs_label"] = ("齊全" if res["docs_ok"] else "缺：" + "、".join(r.split("：", 1)[1] for r in lacking)) if nodes else ""
+
+    # 同一期是不是已經請過款
+    try:
+        for r in airtable_get_all(INV_API_URL, "{" + INV_F["case_no"] + "}='" + _inv_esc(case["case_no"]) + "'",
+                                  [INV_F[k] for k in ("invoice_no", "nodes", "status")]):
+            if r["id"] == exclude_id or r["fields"].get(INV_F["status"]) == "退回":
+                continue
+            dup = set(nodes) & set((r["fields"].get(INV_F["nodes"]) or "").split("、"))
+            if dup and r["fields"].get(INV_F["invoice_no"]) != inv.get("invoice_no"):
+                res["warnings"].append(f"{'、'.join(dup)} 已經請過款（發票 {r['fields'].get(INV_F['invoice_no'], '')}）")
+    except Exception as e:
+        print(f"[invoice] 查重複請款失敗：{e}", flush=True)
+    return res
+
+
+def _inv_fields_from_check(res):
+    case = res.get("case") or {}
+    amt = res.get("amount") or {}
+    return {
+        INV_F["case_no"]: case.get("case_no", ""), INV_F["alias"]: case.get("alias", ""), INV_F["vendor"]: case.get("vendor", ""),
+        INV_F["nodes"]: "、".join(res.get("nodes") or []), INV_F["expected"]: amt.get("expected"),
+        INV_F["amount_check"]: amt.get("label", ""), INV_F["doc_check"]: res.get("docs_label", ""),
+        INV_F["check_json"]: json.dumps(res, ensure_ascii=False)[:95000],
+    }
+
+
+# ---------------- 6. 上傳流程（背景）----------------
+
+def _inv_page_pdf(data, page_no):
+    """把第 page_no 頁（1 起算）切成單頁 PDF；切不了就回整份。"""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(data))
+        if not 1 <= page_no <= len(reader.pages) or len(reader.pages) == 1:
+            return data
+        w = PdfWriter()
+        w.add_page(reader.pages[page_no - 1])
+        buf = io.BytesIO()
+        w.write(buf)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"[invoice] 切頁失敗：{e}", flush=True)
+        return data
+
+
+def _inv_process_file(job, filename, data, uploader):
+    if len(data) > 25 * 1024 * 1024:
+        job["results"].append({"file": filename, "error": "檔案超過 25MB"})
+        job["done"] += 1
+        return
+    try:
+        invoices = _inv_extract(base64.b64encode(data).decode())
+    except Exception as e:
+        job["results"].append({"file": filename, "error": f"辨識失敗：{e}"})
+        job["done"] += 1
+        return
+    if not invoices:
+        job["results"].append({"file": filename, "error": "檔案裡沒有讀到發票"})
+        job["done"] += 1
+        return
+    existing = {}
+    try:
+        nos = [i["invoice_no"] for i in invoices if i.get("invoice_no")]
+        if nos:
+            for r in airtable_get_all(INV_API_URL, "OR(" + ",".join("{" + INV_F["invoice_no"] + "}='" + _inv_esc(n) + "'" for n in nos) + ")",
+                                      [INV_F["invoice_no"]]):
+                existing[r["fields"].get(INV_F["invoice_no"], "")] = r["id"]
+    except Exception as e:
+        print(f"[invoice] 查重複發票失敗：{e}", flush=True)
+    job["total"] += len(invoices) - 1
+    for inv in invoices:
+        no = (inv.get("invoice_no") or "").replace(" ", "")
+        inv["invoice_no"] = no
+        try:
+            if no and no in existing:
+                job["results"].append({"file": filename, "invoice_no": no, "duplicate": True, "record_id": existing[no]})
+                continue
+            res = _inv_check(inv)
+            fields = {
+                INV_F["invoice_no"]: no or f"(未讀到號碼) {filename} p{inv.get('page')}", INV_F["status"]: "待確認",
+                INV_F["seller"]: inv.get("seller", ""), INV_F["items"]: "、".join(i["name"] for i in inv.get("items") or [])[:500],
+                INV_F["sales"]: inv.get("sales_amount") or None, INV_F["tax"]: inv.get("tax") or None, INV_F["total"]: inv.get("total") or None,
+                INV_F["ext_json"]: json.dumps(inv, ensure_ascii=False), INV_F["src_name"]: filename, INV_F["page"]: inv.get("page"),
+                INV_F["uploader"]: uploader, INV_F["uploaded_at"]: _inv_now(), **_inv_fields_from_check(res),
+            }
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv.get("date") or ""):
+                fields[INV_F["date"]] = inv["date"]
+            resp = requests.post(INV_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=30)
+            resp.raise_for_status()
+            rid = resp.json()["id"]
+            try:
+                page_pdf = _inv_page_pdf(data, int(inv.get("page") or 1))
+                base = re.sub(r"\.pdf$", "", filename, flags=re.I)
+                upload_attachment_to_ops_record(rid, INV_F["file"], base64.b64encode(page_pdf).decode(),
+                                                f"{(res.get('case') or {}).get('case_no') or base}_{no or 'p' + str(inv.get('page'))}.pdf", "application/pdf")
+            except Exception as e:
+                print(f"[invoice] 上傳發票附件失敗 {no}：{e}", flush=True)
+            job["results"].append({"file": filename, "invoice_no": no, "record_id": rid,
+                                   "case_no": (res.get("case") or {}).get("case_no", ""), "nodes": res.get("nodes"),
+                                   "amount": (res.get("amount") or {}).get("label"), "docs": res.get("docs_label")})
+        except Exception as e:
+            job["results"].append({"file": filename, "invoice_no": no, "error": str(e)})
+        finally:
+            job["done"] += 1
+
+
+def _inv_run_job(job_id, files, uploader):
+    job = INV_JOBS[job_id]
+    try:
+        for name, data in files:
+            _inv_process_file(job, name, data, uploader)
+        job["status"] = "done"
+    except Exception as e:
+        job["status"], job["error"] = "error", str(e)
+    finally:
+        job["at"] = time.time()
+
+
+@app.route("/api/invoice/upload", methods=["POST"])
+def invoice_upload():
+    """multipart：files（可多份 PDF）、uploader。在背景辨識，回 job_id，前端輪詢 /api/invoice/jobs/<id>。"""
+    files = request.files.getlist("files") or request.files.getlist("files[]")
+    if not files:
+        return jsonify({"error": "沒有收到檔案"}), 400
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return jsonify({"error": "後端沒有設定 ANTHROPIC_API_KEY"}), 500
+    payload = [(fs.filename or "invoice.pdf", fs.read()) for fs in files[:10]]
+    for k in [k for k, v in INV_JOBS.items() if time.time() - v.get("at", 0) > 3600 and v["status"] != "running"]:
+        INV_JOBS.pop(k, None)
+    job_id = uuid.uuid4().hex[:12]
+    INV_JOBS[job_id] = {"status": "running", "done": 0, "total": len(payload), "results": [], "error": "", "at": time.time()}
+    threading.Thread(target=_inv_run_job, args=(job_id, payload, (request.form.get("uploader") or "").strip()[:50]), daemon=True).start()
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/invoice/jobs/<job_id>")
+def invoice_job(job_id):
+    job = INV_JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "找不到這個工作（可能伺服器重新啟動了），請重新上傳"}), 404
+    return jsonify(job)
+
+
+def _inv_record_out(r):
+    f = r.get("fields", {})
+    try:
+        check = json.loads(f.get(INV_F["check_json"]) or "{}")
+    except ValueError:
+        check = {}
+    try:
+        ext = json.loads(f.get(INV_F["ext_json"]) or "{}")
+    except ValueError:
+        ext = {}
+    att = (f.get(INV_F["file"]) or [{}])[0]
+    return {"id": r["id"], **{k: f.get(v) for k, v in INV_F.items() if k not in ("check_json", "ext_json", "file")},
+            "file_url": att.get("url", ""), "check": check, "ext": ext, "created": r.get("createdTime", "")}
+
+
+@app.route("/api/invoice/list")
+def invoice_list():
+    try:
+        recs = airtable_get_all(INV_API_URL, None, list(INV_F.values()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    items = [_inv_record_out(r) for r in recs]
+    items.sort(key=lambda x: x.get("created") or "", reverse=True)
+    return jsonify({"items": items, "nodes": list(INV_NODES), "statuses": list(INV_STATUSES)})
+
+
+def _inv_get(record_id):
+    r = requests.get(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+@app.route("/api/invoice/<record_id>/recheck", methods=["POST"])
+def invoice_recheck(record_id):
+    """重新檢查（函文可能後來才拿到）。body 可帶 case_no、nodes（人工修正，之後重新檢查都沿用）。"""
+    if not re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
+        return jsonify({"error": "record_id 不正確"}), 400
+    body = request.get_json(silent=True) or {}
+    try:
+        rec = _inv_get(record_id)
+        f = rec.get("fields", {})
+        inv = json.loads(f.get(INV_F["ext_json"]) or "{}")
+        try:
+            manual = json.loads(f.get(INV_F["manual"]) or "{}")
+        except ValueError:
+            manual = {}
+        if "case_no" in body:
+            manual["case_no"] = (body.get("case_no") or "").strip()
+        if "nodes" in body:
+            manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
+        for k in ("total", "sales_amount", "tax"):
+            if body.get(k) not in (None, ""):
+                inv[k] = float(body[k]); manual[k] = inv[k]
+        res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
+        fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
+        for k, fk in (("total", "total"), ("sales_amount", "sales"), ("tax", "tax")):
+            if k in manual:
+                fields[INV_F[fk]] = manual[k]
+        fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
+        resp = requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30)
+        resp.raise_for_status()
+        return jsonify({"ok": True, "item": _inv_record_out(_inv_get(record_id))})
+    except Exception as e:
+        print(f"[invoice] 重新檢查失敗 {record_id}：{e}", flush=True)
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/invoice/<record_id>/status", methods=["POST"])
+def invoice_set_status(record_id):
+    if not re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
+        return jsonify({"error": "record_id 不正確"}), 400
+    body = request.get_json(silent=True) or {}
+    fields = {}
+    if body.get("status"):
+        if body["status"] not in INV_STATUSES:
+            return jsonify({"error": "狀態不正確"}), 400
+        fields[INV_F["status"]] = body["status"]
+    if "note" in body:
+        fields[INV_F["note"]] = (body.get("note") or "")[:5000]
+    try:
+        requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/invoice/<record_id>", methods=["DELETE"])
+def invoice_delete(record_id):
+    if not re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
+        return jsonify({"error": "record_id 不正確"}), 400
+    try:
+        requests.delete(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), timeout=20).raise_for_status()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/invoice/cases")
+def invoice_cases():
+    """手動選案號用的清單（案號／別名／廠商）。"""
+    return jsonify({"cases": [{"case_no": c["case_no"], "alias": c["alias"], "vendor": c["vendor"]} for c in _pdf_case_ref()]})
+
+
+
 if __name__ == "__main__":
     # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
     # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
