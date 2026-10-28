@@ -15270,10 +15270,10 @@ def _inv_case_docs(case):
     out = {"ms": {}, "pdf": {}, "draw": {}, "ids": dict(case.get("ids") or {}), "ops": []}
     if case.get("record_id"):
         try:
-            r = requests.get(f"{CASE_API_URL}/{case['record_id']}", headers=airtable_headers(),
-                             params={"returnFieldsByFieldId": "true", "fields[]": [FIELD_MS_LINK_ON_CASE]}, timeout=30)
-            r.raise_for_status()
-            ms_ids = r.json().get("fields", {}).get(FIELD_MS_LINK_ON_CASE) or []
+            # 2026-10-28 修：原本用單筆記錄 API（/{record_id}）帶 fields[]，Airtable 單筆 API 不收 fields[] → 422 被吃掉，
+            # 里程碑從來沒讀到（工程宜蘭9號 掛表已完成仍顯示缺）。改用清單 API＋RECORD_ID() 篩選。
+            recs = airtable_get_all(CASE_API_URL, f"RECORD_ID()='{case['record_id']}'", [FIELD_MS_LINK_ON_CASE])
+            ms_ids = (recs[0]["fields"].get(FIELD_MS_LINK_ON_CASE) if recs else None) or []
             for i in range(0, len(ms_ids), 50):
                 formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ms_ids[i:i + 50]) + ")"
                 for m in airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS]):
