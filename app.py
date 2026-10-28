@@ -15133,7 +15133,7 @@ def _inv_parse_free(text, vendors):
         inv["seller"] = next((v for v in vendors if v and v in t), "")
     # 合約編號：英文字母（OCR 常把 O 讀成 0）＋9 位數字＋C（常讀成 < c 0）
     head_fix = {"0": "O", "6": "G", "8": "B", "5": "S", "1": "I"}
-    for m in re.finditer(r"(?<![A-Za-z\d])([A-Z0-9])\s?(\d{8,9})\s?([C<cO(])?(?![\d])", t):
+    for m in re.finditer(r"(?<![A-Za-z\d])([A-Z0-9])\s?(\d{7,9})\s?([C<cO(])?(?![\d])", t):
         head, num, tail = m.group(1), m.group(2), m.group(3) or ""
         if head.isdigit():                 # 開頭的英文字母被讀成數字（O→0、G→6）：要「9 位數字＋C」才算，避免抓到電話
             if not (tail or len(num) == 9):
@@ -15143,7 +15143,10 @@ def _inv_parse_free(text, vendors):
                 continue
         if len(num) == 9 and not tail:     # H115070150／G115092266 → 結尾的 C 被讀成數字
             num, tail = num[:-1], "C"
-        if len(num) != 8:
+        # 2026-10-28：手寫數字 OCR 會少一位（H11509252C 讀成「H1509252<」）→ 7 位＋C 也收，比對時容許差一個字
+        if len(num) == 7 and not tail:
+            continue
+        if len(num) not in (7, 8):
             continue
         inv["contract_nos"].append(head + num + "C")
     inv["contract_nos"] = list(dict.fromkeys(inv["contract_nos"]))
@@ -15197,6 +15200,17 @@ def _inv_case_abbrevs(case_no):
     return {x for x in out if x}
 
 
+def _inv_one_edit(a, b):
+    """a、b 只差一個字（替換、少一個、多一個）。合約編號 OCR 容錯用。"""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    if len(a) > len(b):
+        a, b = b, a
+    return any(b[:i] + b[i + 1:] == a for i in range(len(b)))
+
+
 def _inv_match_case(inv):
     cases = _pdf_case_ref()
     cnos = [_norm_id(x) for x in inv.get("contract_nos") or [] if len(_norm_id(x)) >= 6]
@@ -15210,7 +15224,7 @@ def _inv_match_case(inv):
             for x in cnos:
                 if x == own:
                     score += 100; why.append(f"合約編號 {c['ids']['合約編號']} 完全相同"); break
-                if len(x) == len(own) and sum(a != b for a, b in zip(x, own)) == 1:
+                if _inv_one_edit(x, own):   # 錯一個字、少一個字、多一個字
                     score += 60; why.append(f"合約編號 {c['ids']['合約編號']} 差一個字（發票上 {x}）"); break
         abbrs = _inv_case_abbrevs(c["case_no"])
         if any(r in abbrs for r in refs) or _norm_text(c["case_no"]) in remarks:
