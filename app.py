@@ -12194,6 +12194,14 @@ def _pdf_writeback(record_id, case, doc_type, doc_date, ids=None, ids_trusted=Fa
     都只填空白；已有不同的值就不動、記下來給人看。"""
     msg = "\n".join([_pdf_writeback_msg(case, doc_type, doc_date)] + _pdf_fill_case_ids(case, doc_type, ids, ids_trusted))
     try:
+        # 重新確認時保留歸檔相關的紀錄（例如「同類型已存在」），不然主控台會看不到這份是因為資料夾已有檔案才暫停
+        old = (_pdf_get_record(record_id).get("fields", {}).get(PDF_F["writeback"]) or "")
+        keep = [x for x in old.splitlines() if re.match(r"^(歸檔：|⚠ 歸檔失敗|⚠ 同類型已存在|已選擇仍要歸檔)", x)]
+        if keep:
+            msg = "\n".join([msg] + keep)
+    except Exception:
+        pass
+    try:
         _pdf_patch(record_id, {PDF_F["writeback"]: msg})
     except Exception as e:
         print(f"[pdf_rename] 寫回結果記錄失敗：{e}", flush=True)
@@ -13269,6 +13277,16 @@ def pdf_rename_confirmed():
         d = _pdf_record_to_dict(r)
         t = types.get(d["doc_type"]) or {}
         names = [d["doc_type"]] + [x.strip() for x in re.split(r"[、,，]", t.get("synonyms") or "") if x.strip()]
+        # 檔名在類型後面有版本標註（例如 宜29_20260918_工程合約_EPC.pdf、…工程合約(潤特).pdf）：
+        # 只有同一個標註的才算同一份，工程合約(潤特) 跟 工程合約_EPC 是兩份不同的合約（2026-10-28）
+        stem = os.path.splitext(d.get("final_name") or "")[0]
+        m = re.match(r"^[^_]+_\d{8}_(.+)$", stem)
+        base = d["doc_type"] or ""
+        if m and base and m.group(1).startswith(base):
+            norm_q = lambda x: re.sub(r"[\s_\-()（）]", "", x)
+            qual = norm_q(m.group(1)[len(base):])
+            if qual:   # 只留同一個版本標註的寫法：_EPC、(EPC)、（EPC） 視為同一種，(潤特) 是另一種
+                names = [n for n in names if n.startswith(base) and norm_q(n[len(base):]) == qual] + [m.group(1)]
         d.update({
             "folder_keys": _pdf_folder_keys(d["case_no"]),
             "short": _pdf_short_name(d["case_no"]),
