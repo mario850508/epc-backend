@@ -3344,6 +3344,12 @@ def site_survey_cancelled_sync():
                 new_coords[c["case"].strip()] = c["coords"].strip()
         BIZ_COORDS_CACHE.clear()
         BIZ_COORDS_CACHE.update(new_coords)
+    contracts_in = body.get("case_contract_nos")   # 2026-10-28：A01資訊 B 欄合約編號（發票請款比對案場用）
+    if isinstance(contracts_in, list):
+        CASE_CONTRACT_CACHE.clear()
+        CASE_CONTRACT_CACHE.update({c["case"].strip(): c["no"].strip() for c in contracts_in
+                                    if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("no") or "").strip()})
+        PDF_CASE_REF["at"] = 0
     threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
     print(
         f"[site_survey_cancelled_sync] 收到 {len(CANCELLED_CASE_CACHE['case_nos'])} 筆取消案號、"
@@ -3358,6 +3364,7 @@ def site_survey_cancelled_sync():
         "owner_contact_count": len(OWNER_CONTACT_CACHE),
         "plant_coords_count": len(BIZ_COORDS_CACHE),
         "case_reps_count": len(CASE_REP_CACHE),
+        "case_contract_nos_count": len(CASE_CONTRACT_CACHE),
     })
 
 
