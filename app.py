@@ -15415,13 +15415,21 @@ def _inv_process_file(job, filename, data, uploader):
         job["results"].append({"file": filename, "error": "檔案裡沒有讀到發票"})
         job["done"] += 1
         return
+    # 2026-10-28 使用者：重新掃描會有重複的發票 → 同一個發票號碼覆蓋舊的那筆，不要變成兩筆。
+    # 覆蓋辨識結果、檔案、檢查結果；保留狀態／備註／人工修正（已付款的不會被打回待確認）。
     existing = {}
     try:
-        nos = [i["invoice_no"] for i in invoices if i.get("invoice_no")]
+        nos = [i["invoice_no"].replace(" ", "") for i in invoices if i.get("invoice_no")]
         if nos:
-            for r in airtable_get_all(INV_API_URL, "OR(" + ",".join("{" + INV_F["invoice_no"] + "}='" + _inv_esc(n) + "'" for n in nos) + ")",
-                                      [INV_F["invoice_no"]]):
-                existing[r["fields"].get(INV_F["invoice_no"], "")] = r["id"]
+            recs = airtable_get_all(INV_API_URL, "OR(" + ",".join("{" + INV_F["invoice_no"] + "}='" + _inv_esc(n) + "'" for n in nos) + ")",
+                                    [INV_F["invoice_no"], INV_F["manual"], INV_F["status"]])
+            recs.sort(key=lambda r: r.get("createdTime", ""))
+            for r in recs:
+                no0 = r["fields"].get(INV_F["invoice_no"], "")
+                if no0 in existing:   # 以前就重複的：留最早那筆，其他刪掉
+                    requests.delete(f"{INV_API_URL}/{r['id']}", headers=airtable_headers(), timeout=20)
+                else:
+                    existing[no0] = r
     except Exception as e:
         print(f"[invoice] 查重複發票失敗：{e}", flush=True)
     job["total"] += len(invoices) - 1
@@ -15429,12 +15437,19 @@ def _inv_process_file(job, filename, data, uploader):
         no = (inv.get("invoice_no") or "").replace(" ", "")
         inv["invoice_no"] = no
         try:
-            if no and no in existing:
-                job["results"].append({"file": filename, "invoice_no": no, "duplicate": True, "record_id": existing[no]})
-                continue
-            res = _inv_check(inv)
+            old = existing.get(no) if no else None
+            manual = {}
+            if old:
+                try:
+                    manual = json.loads(old["fields"].get(INV_F["manual"]) or "{}")
+                except ValueError:
+                    manual = {}
+                for k in ("total", "sales_amount", "tax"):
+                    if k in manual:
+                        inv[k] = manual[k]
+            res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=old["id"] if old else None)
             fields = {
-                INV_F["invoice_no"]: no or f"(未讀到號碼) {filename} p{inv.get('page')}", INV_F["status"]: "待確認",
+                INV_F["invoice_no"]: no or f"(未讀到號碼) {filename} p{inv.get('page')}",
                 INV_F["seller"]: inv.get("seller", ""), INV_F["items"]: "、".join(i["name"] for i in inv.get("items") or [])[:500],
                 INV_F["sales"]: inv.get("sales_amount") or None, INV_F["tax"]: inv.get("tax") or None, INV_F["total"]: inv.get("total") or None,
                 INV_F["ext_json"]: json.dumps(inv, ensure_ascii=False), INV_F["src_name"]: filename, INV_F["page"]: inv.get("page"),
@@ -15442,9 +15457,17 @@ def _inv_process_file(job, filename, data, uploader):
             }
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv.get("date") or ""):
                 fields[INV_F["date"]] = inv["date"]
-            resp = requests.post(INV_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=30)
-            resp.raise_for_status()
-            rid = resp.json()["id"]
+            if old:
+                rid = old["id"]
+                fields[INV_F["file"]] = []   # 清掉舊附件，下面再傳新的這頁
+                requests.patch(f"{INV_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=30).raise_for_status()
+            else:
+                fields[INV_F["status"]] = "待確認"
+                resp = requests.post(INV_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=30)
+                resp.raise_for_status()
+                rid = resp.json()["id"]
+                if no:
+                    existing[no] = {"id": rid, "fields": {}}   # 同一批又出現同一張（掃描兩次）也覆蓋這筆
             try:
                 page_pdf = _inv_page_pdf(data, int(inv.get("page") or 1))
                 base = re.sub(r"\.pdf$", "", filename, flags=re.I)
@@ -15452,7 +15475,7 @@ def _inv_process_file(job, filename, data, uploader):
                                                 f"{(res.get('case') or {}).get('case_no') or base}_{no or 'p' + str(inv.get('page'))}.pdf", "application/pdf")
             except Exception as e:
                 print(f"[invoice] 上傳發票附件失敗 {no}：{e}", flush=True)
-            job["results"].append({"file": filename, "invoice_no": no, "record_id": rid,
+            job["results"].append({"file": filename, "invoice_no": no, "record_id": rid, "replaced": bool(old),
                                    "case_no": (res.get("case") or {}).get("case_no", ""), "nodes": res.get("nodes"),
                                    "amount": (res.get("amount") or {}).get("label"), "docs": res.get("docs_label")})
         except Exception as e:
