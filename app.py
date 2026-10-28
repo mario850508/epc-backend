@@ -10913,6 +10913,13 @@ def _pdf_case_ref(force=False):
             cases.append({"record_id": "", "case_no": c["case"], "alias": c.get("alias", ""), "address": "",
                           "vendor": c.get("vendor", ""), "closed": "", "submit_name": "", "epc_party": "",
                           "ids": {"合約編號": CASE_CONTRACT_CACHE.get(c["case"], "")} if CASE_CONTRACT_CACHE.get(c["case"]) else {}})
+            known.add(c["case"])
+    # 2026-10-28：已簽約但還沒公證、也還沒建進 Airtable 的案件（例：潤特桃園89號 H11509252C），廠商已經來請簽約款 →
+    # 業務自治區有合約編號的都放進比對清單（只有案號＋合約編號；廠商用 A01資訊 J 欄要再推，先用發票賣方判斷）
+    for case_no, no in CASE_CONTRACT_CACHE.items():
+        if case_no not in known:
+            cases.append({"record_id": "", "case_no": case_no, "alias": "", "address": "", "vendor": "", "closed": "",
+                          "submit_name": "", "epc_party": "", "ids": {"合約編號": no}})
     PDF_CASE_REF["cases"] = cases
     PDF_CASE_REF["at"] = time.time()
     return cases
