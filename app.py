@@ -15643,6 +15643,41 @@ scheduler.add_job(_inv_auto_recheck, IntervalTrigger(minutes=30), id="invoice_au
                   max_instances=1, coalesce=True)
 
 
+@app.route("/api/invoice/zip", methods=["POST"])
+def invoice_zip():
+    """勾選的發票 → 每張一個 PDF（上傳時已從整份掃描檔切出那一頁）打包成 ZIP，給前台逐張上傳發票掃描檔用。
+    body: {ids: [...]}；檔名「案號_發票_發票號碼.pdf」（2026-10-28 使用者要求）。"""
+    import zipfile
+    from urllib.parse import quote as _q
+    ids = [i for i in ((request.get_json(silent=True) or {}).get("ids") or []) if re.fullmatch(r"rec[A-Za-z0-9]{14}", i or "")][:200]
+    if not ids:
+        return jsonify({"error": "沒有勾選發票"}), 400
+    buf, used, missing = io.BytesIO(), set(), []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for i in range(0, len(ids), 50):
+            formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ids[i:i + 50]) + ")"
+            for r in airtable_get_all(INV_API_URL, formula, [INV_F["invoice_no"], INV_F["case_no"], INV_F["file"]]):
+                f = r["fields"]
+                no, case_no = f.get(INV_F["invoice_no"], ""), f.get(INV_F["case_no"], "") or "未比對案場"
+                att = (f.get(INV_F["file"]) or [{}])[0]
+                if not att.get("url"):
+                    missing.append(no); continue
+                try:
+                    data = requests.get(att["url"], timeout=60).content
+                except Exception as e:
+                    print(f"[invoice_zip] 下載 {no} 失敗：{e}", flush=True)
+                    missing.append(no); continue
+                name = re.sub(r'[\\/:*?"<>|]', "_", f"{case_no}_發票_{no}") + ".pdf"
+                while name in used:
+                    name = name[:-4] + "_2.pdf"
+                used.add(name)
+                z.writestr(name, data)
+    fname = f"發票掃描檔_{datetime.now(TW_TZ):%Y%m%d_%H%M}.zip"
+    return Response(buf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{_q(fname)}",
+                             "X-Missing": _q("、".join(missing)), "Access-Control-Expose-Headers": "Content-Disposition, X-Missing"})
+
+
 @app.route("/api/invoice/cases")
 def invoice_cases():
     """手動選案號用的清單（案號／別名／廠商）。"""
