@@ -3268,7 +3268,7 @@ def site_survey_cancelled_sync():
     if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
         return jsonify({"error": "unauthorized"}), 401
     if ("cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body
-            and any(isinstance(body.get(k), list) for k in ("case_reps", "case_addrs", "plant_coords"))):
+            and any(isinstance(body.get(k), list) for k in ("case_reps", "case_addrs", "plant_coords", "case_contract_nos"))):
         # 部分推送（案件業務／地址／座標）：不碰取消／已公證／屋主資料（避免被當成空清單清掉）
         if isinstance(body.get("case_reps"), list):
             CASE_REP_CACHE.clear()
@@ -3280,6 +3280,12 @@ def site_survey_cancelled_sync():
                 CASE_ADDR_CACHE.clear()
             CASE_ADDR_CACHE.update({c["case"].strip(): c["addr"].strip() for c in body["case_addrs"]
                                     if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("addr") or "").strip()})
+        if isinstance(body.get("case_contract_nos"), list):   # [{case, no}]
+            if not merge:
+                CASE_CONTRACT_CACHE.clear()
+            CASE_CONTRACT_CACHE.update({c["case"].strip(): c["no"].strip() for c in body["case_contract_nos"]
+                                        if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("no") or "").strip()})
+            PDF_CASE_REF["at"] = 0   # 案件比對資料重抓，帶入新的合約編號
         if isinstance(body.get("plant_coords"), list):
             if not merge:
                 BIZ_COORDS_CACHE.clear()
@@ -3287,7 +3293,8 @@ def site_survey_cancelled_sync():
                                      if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("coords") or "").strip()})
         threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
         return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE),
-                        "case_addrs_count": len(CASE_ADDR_CACHE), "plant_coords_count": len(BIZ_COORDS_CACHE)})
+                        "case_addrs_count": len(CASE_ADDR_CACHE), "plant_coords_count": len(BIZ_COORDS_CACHE),
+                        "case_contract_nos_count": len(CASE_CONTRACT_CACHE)})
     if "cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body:
         return jsonify({"error": "沒有可處理的欄位（完整推送至少要帶 cancelled_case_numbers／certified_cases／owner_contacts 其中之一）"}), 400
     case_nos = body.get("cancelled_case_numbers") or []
@@ -3362,6 +3369,7 @@ BIZ_COORDS_CACHE = {}
 # 2026-10-11：業務自治區 A01資訊「業務」欄（U）——所有案件的負責業務（{案號: 業務名}），不限「已公證」。
 # 已公證案件清單只有狀態＝已公證的，案件一進到「已簽約」就查不到業務了。
 CASE_REP_CACHE = {}
+CASE_CONTRACT_CACHE = {}   # 2026-10-28：業務自治區 A01資訊 B 欄「合約編號」（{案號: 合約編號}）。Airtable 專案細節沒填時用（發票請款／公文更名比對案場）
 CASE_ADDR_CACHE = {}   # 2026-10-12：業務自治區 A01資訊「地址」欄（{案號: 地址}），Airtable 還沒有的案件用
 STATE_FIELD_LONG = "fld4BuR3sfKTkDvsi"   # 系統狀態「長值」（multilineText）
 _BIZ_SNAPSHOT_LOADED = {"done": False}
@@ -3415,6 +3423,7 @@ def _persist_biz_snapshots():
         "biz_plant_coords": dict(BIZ_COORDS_CACHE),
         "biz_case_reps": dict(CASE_REP_CACHE),
         "biz_case_addrs": dict(CASE_ADDR_CACHE),
+        "biz_case_contract_nos": dict(CASE_CONTRACT_CACHE),
         "biz_owner_contacts": dict(OWNER_CONTACT_CACHE),
         "biz_certified_cases": list(CERTIFIED_CASE_CACHE.get("cases") or []),
         "biz_cancelled_cases": sorted(CANCELLED_CASE_CACHE.get("case_nos") or []),
@@ -3452,6 +3461,10 @@ def _ensure_biz_snapshots_loaded():
             raw = _state_get_chunked("biz_case_addrs")
             if raw:
                 CASE_ADDR_CACHE.update(json.loads(raw))
+        if not CASE_CONTRACT_CACHE:
+            raw = _state_get_chunked("biz_case_contract_nos")
+            if raw:
+                CASE_CONTRACT_CACHE.update(json.loads(raw))
         if not OWNER_CONTACT_CACHE:
             raw = _state_get_chunked("biz_owner_contacts")
             if raw:
@@ -10885,10 +10898,14 @@ def _pdf_case_ref(force=False):
     # 已公證但還沒建進 Airtable 的案件（業務自治區推送），只有案號／別名可比
     known = {c["case_no"] for c in cases}
     _ensure_biz_snapshots_loaded()
+    for c in cases:   # 2026-10-28：Airtable 沒填合約編號 → 用業務自治區 A01資訊 B 欄（發票備註寫的就是這個）
+        if not c["ids"].get("合約編號") and CASE_CONTRACT_CACHE.get(c["case_no"]):
+            c["ids"]["合約編號"] = CASE_CONTRACT_CACHE[c["case_no"]]
     for c in CERTIFIED_CASE_CACHE.get("cases") or []:
         if c["case"] not in known:
             cases.append({"record_id": "", "case_no": c["case"], "alias": c.get("alias", ""), "address": "",
-                          "vendor": c.get("vendor", ""), "closed": "", "submit_name": "", "epc_party": "", "ids": {}})
+                          "vendor": c.get("vendor", ""), "closed": "", "submit_name": "", "epc_party": "",
+                          "ids": {"合約編號": CASE_CONTRACT_CACHE.get(c["case"], "")} if CASE_CONTRACT_CACHE.get(c["case"]) else {}})
     PDF_CASE_REF["cases"] = cases
     PDF_CASE_REF["at"] = time.time()
     return cases
@@ -14877,7 +14894,7 @@ INV_REQS = {
 _INV_SCHED_RE = re.compile(r"(簽約款|同意備案款|材料訂購款|工班進場款|掛[錶表]驗收款|設備登記款|正式售電款)\s*(\d{1,2}(?:\.\d+)?)\s*%")
 _INV_COUNTY_SHORT = {"桃園": ["桃"], "新竹": ["竹", "新竹"], "苗栗": ["苗"], "宜蘭": ["宜"], "臺中": ["中"], "台中": ["中"],
                      "彰化": ["彰"], "雲林": ["雲"], "南投": ["投"], "嘉義": ["嘉"], "臺南": ["南"], "台南": ["南"],
-                     "高雄": ["高"], "屏東": ["屏"], "臺北": ["北"], "台北": ["北"], "新北": ["新北"], "基隆": ["基"],
+                     "高雄": ["高"], "屏東": ["屏"], "臺北": ["北"], "台北": ["北"], "新北": ["新", "新北"], "基隆": ["基"],
                      "花蓮": ["花"], "臺東": ["東"], "台東": ["東"]}
 INV_JOBS = {}             # job_id → {status, done, total, results, error, at}
 _INV_SCHED_CACHE = {}     # 案號 → Claude 讀工程合約 PDF 得到的付款期程（同一次開機內不重讀）
@@ -14993,9 +15010,8 @@ def _inv_cn_total(text):
             elif ch == "萬":
                 total += (section + cur) * 10000
                 section = cur = 0
-            elif ch == "億":
-                total += (section + cur) * 100000000
-                section = cur = 0
+            elif ch == "億":   # 發票不會上億：前面是空格上的劃線（「一億仟佰…」），歸零
+                total = section = cur = 0
         total += section + cur
         if total >= 10:
             best = total
@@ -15004,7 +15020,7 @@ def _inv_cn_total(text):
 
 def _inv_amounts(text):
     """回 (銷售額, 稅額, 總計)；找不到回 (0, 0, 0)。"""
-    body = re.split(r"總計新[台臺]幣|中文大寫", text)[0] if re.search(r"總計新[台臺]幣|中文大寫", text) else text
+    body = (text or "").split("※")[0]
     toks = re.findall(r"[\d][\d.,]*[\d]|[\d]", body)
     vals = set()
     for t in toks:
@@ -15357,6 +15373,7 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
             res["warnings"].append("案場比對信心偏低，請確認")
     if not case:
         res["case"] = None
+        res["nodes"] = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_NODES]
         res["warnings"].append("比對不到案場，請手動選案號")
         return res
     res["case"] = {"case_no": case["case_no"], "alias": case.get("alias", ""), "vendor": case.get("vendor", ""),
