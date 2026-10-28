@@ -15733,11 +15733,28 @@ def _inv_recheck_record(rec, body=None):
         manual["case_no"] = (body.get("case_no") or "").strip()
     if "nodes" in body:
         manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
+    # 2026-10-28：Google OCR 判讀的發票，用存下來的 OCR 文字套最新規則重判（規則改進後，舊發票重新檢查就會吃到）。
+    # 發票號碼不動（避免跟別筆撞號）；人工修正過的金額下面會蓋回去。
+    reparsed = False
+    if inv.get("ocr_text") and not os.environ.get("ANTHROPIC_API_KEY"):
+        vendors = sorted({c["vendor"] for c in _pdf_case_ref() if c.get("vendor")}, key=len, reverse=True)
+        fresh = _inv_parse_free(inv["ocr_text"], vendors)
+        for k in ("date", "seller", "items", "sales_amount", "tax", "total", "remarks", "contract_nos", "case_refs", "nodes"):
+            if fresh.get(k) or k in ("nodes", "contract_nos", "case_refs"):
+                inv[k] = fresh[k]
+        reparsed = True
     for k in ("total", "sales_amount", "tax"):
         if body.get(k) not in (None, ""):
             inv[k] = float(body[k]); manual[k] = inv[k]
+        elif k in manual:
+            inv[k] = manual[k]
     res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
     fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
+    if reparsed:
+        fields.update({INV_F["seller"]: inv.get("seller", ""), INV_F["items"]: "、".join(i["name"] for i in inv.get("items") or [])[:500],
+                       INV_F["sales"]: inv.get("sales_amount") or None, INV_F["tax"]: inv.get("tax") or None, INV_F["total"]: inv.get("total") or None})
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", inv.get("date") or ""):
+            fields[INV_F["date"]] = inv["date"]
     for k, fk in (("total", "total"), ("sales_amount", "sales"), ("tax", "tax")):
         if k in manual:
             fields[INV_F[fk]] = manual[k]
