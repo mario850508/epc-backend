@@ -14947,7 +14947,7 @@ def _inv_extract(pdf_b64):
 # 常見錯字：合約編號開頭 O→0、結尾 C→<／c／0；金額後面的「.-」「,-」讀成 0、.0、.7 之類 → 下面都有修正。
 # 金額不靠欄位位置（OCR 會把表格打散），改找「銷售額＋稅額＝總計、稅額≈銷售額×5%」的三個數字。
 _INV_NODE_KW = [
-    ("簽約款", r"簽約"), ("同意備案款", r"同備|同意備案|同意備"), ("材料訂購款", r"材料"), ("工班進場款", r"進場"),
+    ("簽約款", r"簽約"), ("同意備案款", r"同備|同意備案|同意備"), ("材料訂購款", r"材料"), ("工班進場款", r"進場|[+＋]\s*進"),
     ("掛錶驗收款", r"掛[表錶]|驗收款"), ("設備登記款", r"設登|設備登記"), ("正式售電款", r"文件款|正式售電|售電款"),
 ]
 
@@ -15365,16 +15365,26 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
     if vendor and inv.get("seller") and vendor[:2] not in inv["seller"]:
         res["warnings"].append(f"賣方「{inv['seller']}」跟這案的施作廠商「{vendor}」不同")
 
+    manual_nodes = nodes is not None
     nodes = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_NODES]
-    res["nodes"] = nodes
-    if not nodes:
-        res["warnings"].append("看不出是哪一期款，請手動選節點")
 
     # 金額
     sc = _inv_contract_schedule(case["case_no"])
     res["contract"] = {k: sc.get(k) for k in ("found", "total", "how", "filename", "file_url", "origin", "note", "reading")}
     res["contract"]["sched"] = sc["sched"]
     total = float(inv.get("total") or 0)
+    # 2026-10-28：手寫品名 OCR 會漏期別（「+進場」讀成「+進土」）→ 沒有人工指定節點、金額又對不上時，
+    # 找合約裡金額加總剛好等於發票總計的組合（要包含已讀到的期別、期別要連續），只有一個就自動補上並提醒
+    guess = [] if manual_nodes else _inv_guess_nodes(sc["sched"], total, nodes)
+    if guess:
+        added = [n for n in guess if n not in nodes]
+        if added:
+            res["warnings"].append(f"依金額推得：補上 {'、'.join(added)}（發票上沒讀到，請對照原檔確認）")
+            res["nodes_inferred"] = added
+        nodes = guess
+    res["nodes"] = nodes
+    if not nodes:
+        res["warnings"].append("看不出是哪一期款，請手動選節點")
     missing = [n for n in nodes if not (sc["sched"].get(n) or {}).get("amount")]
     if nodes and not missing:
         expected = sum(sc["sched"][n]["amount"] for n in nodes)
@@ -15415,6 +15425,25 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
     except Exception as e:
         print(f"[invoice] 查重複請款失敗：{e}", flush=True)
     return res
+
+
+def _inv_guess_nodes(sched, total, nodes):
+    """合約期程裡，金額加總＝發票總計（±1）、包含已讀到的 nodes、期別連續（照付款順序）的組合；
+    剛好一個就回傳，零個或好幾個（例如進場款跟掛表款都是 20%）回 []。已讀到的期別金額本來就對的話也回 []。"""
+    have = [n for n in INV_NODES if (sched.get(n) or {}).get("amount")]
+    if not total or not have:
+        return []
+    if nodes and all(n in have for n in nodes) and abs(sum(sched[n]["amount"] for n in nodes) - total) <= 1:
+        return []
+    hits = []
+    for i in range(len(INV_NODES)):
+        for j in range(i, len(INV_NODES)):
+            run = list(INV_NODES[i:j + 1])
+            if not all(n in have for n in run) or not set(nodes) <= set(run):
+                continue
+            if abs(sum(sched[n]["amount"] for n in run) - total) <= 1:
+                hits.append(run)
+    return hits[0] if len(hits) == 1 else []
 
 
 def _inv_fields_from_check(res):
