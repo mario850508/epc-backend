@@ -16015,6 +16015,141 @@ scheduler.add_job(_inv_auto_recheck, IntervalTrigger(minutes=30), id="invoice_au
                   max_instances=1, coalesce=True)
 
 
+def _inv_case_files(case_no):
+    """這案已有的文件檔（給打包請款節點文件用）：{("pdf"|"draw"|"ops", 類型): [(檔名, 網址)]}。
+    公文更名只拿已確認／已歸檔的；案場圖面全部；維運驗收拿已產生的驗收單 PDF。"""
+    esc = _inv_esc(case_no)
+    out = {}
+    try:
+        for r in airtable_get_all(PDF_API_URL, "AND({" + PDF_F["case_no"] + "}='" + esc + "',OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED
+                                  + "',{" + PDF_F["status"] + "}='" + PDF_ST_ARCHIVED + "'))", [PDF_F["doc_type"], PDF_F["final_name"], PDF_F["file"]]):
+            f = r["fields"]
+            att = (f.get(PDF_F["file"]) or [{}])[0]
+            if f.get(PDF_F["doc_type"]) and att.get("url"):
+                out.setdefault(("pdf", f[PDF_F["doc_type"]]), []).append((f.get(PDF_F["final_name"]) or att.get("filename") or "文件.pdf", att["url"]))
+    except Exception as e:
+        print(f"[invoice_docs] 查公文更名失敗 {case_no}：{e}", flush=True)
+    try:
+        for r in airtable_get_all(DRAWING_API_URL, "{" + DRAWING_F["case_no"] + "}='" + esc + "'", [DRAWING_F["kind"], DRAWING_F["filename"], DRAWING_F["file"]]):
+            f = r["fields"]
+            att = (f.get(DRAWING_F["file"]) or [{}])[0]
+            if f.get(DRAWING_F["kind"]) and att.get("url"):
+                out.setdefault(("draw", f[DRAWING_F["kind"]]), []).append((f.get(DRAWING_F["filename"]) or att.get("filename") or "圖面.pdf", att["url"]))
+    except Exception as e:
+        print(f"[invoice_docs] 查案場圖面失敗 {case_no}：{e}", flush=True)
+    try:
+        for r in airtable_get_all(OPS_API_URL, "{" + OPS_FIELD_CASE_NO + "}='" + esc + "'", [OPS_FIELD_RESULT, OPS_FIELD_PDF]):
+            f = r["fields"]
+            for att in f.get(OPS_FIELD_PDF) or []:
+                if att.get("url"):
+                    out.setdefault(("ops", "驗收單"), []).append((att.get("filename") or f"{case_no}_驗收單.pdf", att["url"]))
+    except Exception as e:
+        print(f"[invoice_docs] 查維運驗收失敗 {case_no}：{e}", flush=True)
+    return out
+
+
+@app.route("/api/invoice/docs-zip", methods=["POST"])
+def invoice_docs_zip():
+    """2026-10-28 使用者：可付款的發票要把「請款節點需要的文件」一起上傳到能創前台 → 勾選的發票，
+    每案一個資料夾：發票 PDF＋各節點的文件（依 INV_REQS：公文更名／案場圖面／維運驗收單），
+    只有 Airtable 日期、沒有檔案的（掛表、進場屋主預約）列在「缺檔清單.txt」。
+    檔案邊下載邊寫進暫存檔（不放記憶體，主機只有 512MB），再整份傳回。body: {ids}"""
+    import tempfile
+    import zipfile
+    import shutil
+    from urllib.parse import quote as _q
+    ids = [i for i in ((request.get_json(silent=True) or {}).get("ids") or []) if re.fullmatch(r"rec[A-Za-z0-9]{14}", i or "")][:200]
+    if not ids:
+        return jsonify({"error": "沒有勾選發票"}), 400
+    invs = []
+    for i in range(0, len(ids), 50):
+        formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ids[i:i + 50]) + ")"
+        invs += airtable_get_all(INV_API_URL, formula, [INV_F[k] for k in ("invoice_no", "case_no", "nodes", "file", "vendor")])
+    invs.sort(key=lambda r: (r["fields"].get(INV_F["case_no"]) or "", r["fields"].get(INV_F["invoice_no"]) or ""))
+    clean = lambda n: re.sub(r'[\\/:*?"<>|]', "_", n or "").strip() or "未命名"
+    tmp = tempfile.NamedTemporaryFile(prefix="invdocs_", suffix=".zip", delete=False)
+    tmp.close()
+    used, missing, files_cache, count = set(), [], {}, 0
+
+    def put(z, path, url):
+        nonlocal count
+        if path in used:
+            return
+        used.add(path)
+        try:
+            with requests.get(url, stream=True, timeout=90) as resp:
+                resp.raise_for_status()
+                with z.open(path, "w") as dst:
+                    shutil.copyfileobj(resp.raw, dst, 256 * 1024)
+            count += 1
+        except Exception as e:
+            missing.append(f"{path}：下載失敗（{str(e)[:80]}）")
+
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as z:
+            for r in invs:
+                f = r["fields"]
+                case_no, no = f.get(INV_F["case_no"]) or "未比對案場", f.get(INV_F["invoice_no"]) or ""
+                folder = clean(case_no)
+                att = (f.get(INV_F["file"]) or [{}])[0]
+                if att.get("url"):
+                    put(z, f"{folder}/{clean(case_no + '_發票_' + no)}.pdf", att["url"])
+                nodes = [n for n in (f.get(INV_F["nodes"]) or "").split("、") if n in INV_REQS]
+                if not nodes:
+                    missing.append(f"{case_no}｜發票 {no}：沒有請款節點，沒打包文件")
+                    continue
+                if case_no not in files_cache:
+                    files_cache[case_no] = _inv_case_files(case_no) if f.get(INV_F["case_no"]) else {}
+                have = files_cache[case_no]
+                for node in nodes:
+                    for req in INV_REQS[node]:
+                        got = []
+                        for t in req.get("pdf") or []:
+                            got += [x for x in have.get(("pdf", t), []) if not (t == ENG_KIND and _is_upstream_contract(x[0]))]
+                        for t in req.get("draw") or []:
+                            got += [x for x in have.get(("draw", t), []) if not (t == ENG_KIND and _is_upstream_contract(x[0]))]
+                        if req.get("ops"):
+                            got += have.get(("ops", "驗收單"), [])
+                        if not got and node == "簽約款":   # 工程合約：公文更名待確認的也可以（發票比對金額用的就是它）
+                            doc = _inv_contract_doc(case_no)
+                            if doc and doc.get("file_url"):
+                                got = [(doc["filename"] or f"{case_no}_工程合約.pdf", doc["file_url"])]
+                        if not got:
+                            why = "Airtable 只有日期、沒有檔案" if (req.get("ms") and not (req.get("pdf") or req.get("draw") or req.get("ops"))) else "主控台找不到檔案"
+                            missing.append(f"{case_no}｜{node}｜{req['label']}：{why}")
+                            continue
+                        seen = set()
+                        for name, url in got:
+                            if name in seen:
+                                continue
+                            seen.add(name)
+                            nm = name if name.lower().endswith(".pdf") or "." in name[-5:] else name + ".pdf"
+                            put(z, f"{folder}/{clean(node)}/{clean(nm)}", url)
+            z.writestr("缺檔清單.txt", ("以下文件沒打包進來，要另外找：\n\n" + "\n".join(missing)) if missing else "全部節點文件都有打包。\n")
+    except Exception as e:
+        os.remove(tmp.name)
+        return jsonify({"error": f"打包失敗：{e}"}), 502
+
+    def gen():
+        try:
+            with open(tmp.name, "rb") as fh:
+                while True:
+                    chunk = fh.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+    fname = f"請款節點文件_{datetime.now(TW_TZ):%Y%m%d_%H%M}.zip"
+    return Response(gen(), mimetype="application/zip", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{_q(fname)}", "Content-Length": str(os.path.getsize(tmp.name)),
+        "X-Files": str(count), "X-Missing-Count": str(len(missing)),
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Files, X-Missing-Count"})
+
+
 @app.route("/api/invoice/zip", methods=["POST"])
 def invoice_zip():
     """勾選的發票 → 每張一個 PDF（上傳時已從整份掃描檔切出那一頁）打包成 ZIP，給前台逐張上傳發票掃描檔用。
