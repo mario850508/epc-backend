@@ -9108,6 +9108,8 @@ DRAWING_F = {"key": "fldFRnNFLJ0O23ozF", "case_no": "fldDPePQKWpuWUT2t", "kind":
 # 2026-10-22：台電契約／細部協商也從 G 槽同步上來，上傳時讀出總裝置容量（掛表資訊確認的容量確認用）
 # 2026-10-26：加「換文修約」（跟台電換文修改購售契約，例如容量 14.4 → 12.15），排第一＝比對時優先用修約後的容量
 CONTRACT_KINDS = ("換文修約", "台電契約", "細部協商")
+# 2026-10-28：契約文字摘錄存 12000 字（原本 3000）：發票請款要讀工程合約第 3～4 頁的「參. 付款期程」
+DRAWING_TEXT_MAX = 12000
 # 2026-10-23：03 資料夾的工程合約（跟 EPC 簽的；容量、躉購電價、工程單價）＝掛表資訊確認的比對基準
 ENG_KIND = "工程合約"
 DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS + (ENG_KIND,)
@@ -9301,7 +9303,7 @@ def _drawing_fields_from_text(kind, text, note=""):
 def _drawing_parse_fields(kind, text_in, text_failed, note, has_attachment):
     """上傳時一起寫進新記錄的讀取欄位：本機有文字就直接算；本機讀不到就記原因；都沒有才標「讀取中」交給伺服器背景讀。"""
     if text_in.strip():
-        return {**_drawing_fields_from_text(kind, text_in, note + "（本機讀取）"), DRAWING_F["text"]: text_in[:3000]}
+        return {**_drawing_fields_from_text(kind, text_in, note + "（本機讀取）"), DRAWING_F["text"]: text_in[:DRAWING_TEXT_MAX]}
     if text_failed:
         return {DRAWING_F["cap_src"]: ("本機讀不到文字：" + text_failed + note)[:200]}
     return {DRAWING_F["cap_src"]: ("讀取中…" if has_attachment else "原檔太大、沒存附件，讀不到") + note}
@@ -9350,7 +9352,7 @@ def procurement_drawings_parsed():
         note = "（原檔太大，只存前 6 頁）" if "只存前 6 頁" in (f.get(DRAWING_F["cap_src"]) or "") else ""
         text = body.get("text") if isinstance(body.get("text"), str) else ""
         if text.strip():
-            fields = {**_drawing_fields_from_text(kind, text, note + "（本機讀取）"), DRAWING_F["text"]: text[:3000]}
+            fields = {**_drawing_fields_from_text(kind, text, note + "（本機讀取）"), DRAWING_F["text"]: text[:DRAWING_TEXT_MAX]}
         else:
             fields = {DRAWING_F["cap_src"]: ("本機讀不到文字：" + str(body.get("error") or "沒有文字") + note)[:200]}
         requests.patch(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
@@ -9475,10 +9477,10 @@ def _drawing_parse_job(rid, kind, data, note=""):
                 text, err = _doc_pdf_text(data, "躉購電價")
                 ev = _eng_contract_values(text) if text.strip() else {"cap": None, "price": None, "unit_price": None, "src": err or "PDF 裡沒有文字"}
                 fields = {DRAWING_F["cap"]: ev["cap"], DRAWING_F["price"]: ev["price"], DRAWING_F["unit_price"]: ev["unit_price"],
-                          DRAWING_F["cap_src"]: (ev["src"] + note)[:200], DRAWING_F["text"]: text[:3000]}
+                          DRAWING_F["cap_src"]: (ev["src"] + note)[:200], DRAWING_F["text"]: text[:DRAWING_TEXT_MAX]}
             else:
                 cap, src, text = _contract_capacity_from_pdf(data, kind)
-                fields = {DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: ((src or "") + note)[:200], DRAWING_F["text"]: text[:3000]}
+                fields = {DRAWING_F["cap"]: cap, DRAWING_F["cap_src"]: ((src or "") + note)[:200], DRAWING_F["text"]: text[:DRAWING_TEXT_MAX]}
         except Exception as e:
             fields = {DRAWING_F["cap_src"]: ("讀取失敗：" + str(e))[:200]}
         try:
@@ -15137,14 +15139,15 @@ def _inv_contract_doc(case_no):
     upstream = ""
     try:
         recs = airtable_get_all(DRAWING_API_URL, "AND({" + DRAWING_F["kind"] + "}='" + ENG_KIND + "',{" + DRAWING_F["case_no"] + "}='" + esc + "')",
-                                [DRAWING_F[k] for k in ("text", "file", "filename", "doc_date")])
+                                [DRAWING_F[k] for k in ("text", "file", "filename", "doc_date", "cap_src")])
         recs.sort(key=lambda r: r["fields"].get(DRAWING_F["doc_date"], ""), reverse=True)
         upstream = next((r["fields"].get(DRAWING_F["filename"], "") for r in recs if _is_upstream_contract(r["fields"].get(DRAWING_F["filename"]))), "")
         recs = [r for r in recs if not _is_upstream_contract(r["fields"].get(DRAWING_F["filename"]))]
         if recs:
             f = recs[0]["fields"]
             return {"text": f.get(DRAWING_F["text"], ""), "file_url": ((f.get(DRAWING_F["file"]) or [{}])[0]).get("url", ""),
-                    "filename": f.get(DRAWING_F["filename"], ""), "origin": "案場圖面"}
+                    "filename": f.get(DRAWING_F["filename"], ""), "origin": "案場圖面",
+                    "reading": (f.get(DRAWING_F["cap_src"]) or "").startswith("讀取中")}
     except Exception as e:
         print(f"[invoice] 查案場圖面工程合約失敗 {case_no}：{e}", flush=True)
     try:
@@ -15193,6 +15196,9 @@ def _inv_contract_schedule(case_no):
         return {"found": False, "note": "找不到這案的工程合約（案場圖面／公文更名都沒有）", "sched": {}}
     if doc.get("upstream_only"):
         return {"found": False, "sched": {}, "note": f"只有上包合約「{doc['upstream_only']}」，跟 EPC 簽的工程合約還沒同步到主控台"}
+    if doc.get("reading") and not (doc.get("text") or "").strip():
+        return {"found": True, "sched": {}, "total": None, "how": "", "filename": doc["filename"], "file_url": doc["file_url"],
+                "origin": doc["origin"], "reading": True, "note": "工程合約剛上傳，還在讀取中（約 1 分鐘），稍後會自動重新檢查"}
     sched, total = _inv_parse_schedule(doc["text"])
     how = "合約文字"
     if len(sched) < 3 and doc.get("file_url") and os.environ.get("ANTHROPIC_API_KEY"):
@@ -15316,7 +15322,7 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
 
     # 金額
     sc = _inv_contract_schedule(case["case_no"])
-    res["contract"] = {k: sc.get(k) for k in ("found", "total", "how", "filename", "file_url", "origin", "note")}
+    res["contract"] = {k: sc.get(k) for k in ("found", "total", "how", "filename", "file_url", "origin", "note", "reading")}
     res["contract"]["sched"] = sc["sched"]
     total = float(inv.get("total") or 0)
     missing = [n for n in nodes if not (sc["sched"].get(n) or {}).get("amount")]
@@ -15531,28 +15537,7 @@ def invoice_recheck(record_id):
         return jsonify({"error": "record_id 不正確"}), 400
     body = request.get_json(silent=True) or {}
     try:
-        rec = _inv_get(record_id)
-        f = rec.get("fields", {})
-        inv = json.loads(f.get(INV_F["ext_json"]) or "{}")
-        try:
-            manual = json.loads(f.get(INV_F["manual"]) or "{}")
-        except ValueError:
-            manual = {}
-        if "case_no" in body:
-            manual["case_no"] = (body.get("case_no") or "").strip()
-        if "nodes" in body:
-            manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
-        for k in ("total", "sales_amount", "tax"):
-            if body.get(k) not in (None, ""):
-                inv[k] = float(body[k]); manual[k] = inv[k]
-        res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
-        fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
-        for k, fk in (("total", "total"), ("sales_amount", "sales"), ("tax", "tax")):
-            if k in manual:
-                fields[INV_F[fk]] = manual[k]
-        fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
-        resp = requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30)
-        resp.raise_for_status()
+        _inv_recheck_record(_inv_get(record_id), body)
         return jsonify({"ok": True, "item": _inv_record_out(_inv_get(record_id))})
     except Exception as e:
         print(f"[invoice] 重新檢查失敗 {record_id}：{e}", flush=True)
@@ -15587,6 +15572,52 @@ def invoice_delete(record_id):
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+
+
+def _inv_recheck_record(rec, body=None):
+    """重新檢查一筆發票記錄並寫回（API 與排程共用）。body 可帶人工修正 case_no／nodes／total…"""
+    body = body or {}
+    record_id = rec["id"]
+    f = rec.get("fields", {})
+    inv = json.loads(f.get(INV_F["ext_json"]) or "{}")
+    try:
+        manual = json.loads(f.get(INV_F["manual"]) or "{}")
+    except ValueError:
+        manual = {}
+    if "case_no" in body:
+        manual["case_no"] = (body.get("case_no") or "").strip()
+    if "nodes" in body:
+        manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
+    for k in ("total", "sales_amount", "tax"):
+        if body.get(k) not in (None, ""):
+            inv[k] = float(body[k]); manual[k] = inv[k]
+    res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
+    fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
+    for k, fk in (("total", "total"), ("sales_amount", "sales"), ("tax", "tax")):
+        if k in manual:
+            fields[INV_F[fk]] = manual[k]
+    fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
+    requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
+    return res
+
+
+def _inv_auto_recheck():
+    """每 30 分鐘：「待確認」且金額或函文還沒過的發票重新檢查（一次最多 20 張）。"""
+    try:
+        recs = airtable_get_all(INV_API_URL, "AND({" + INV_F["status"] + "}='待確認',OR({" + INV_F["amount_check"] + "}!='相符',{"
+                                + INV_F["doc_check"] + "}!='齊全'))", list(INV_F.values()))
+    except Exception as e:
+        print(f"[invoice] 自動重新檢查查詢失敗：{e}", flush=True)
+        return
+    for r in recs[:20]:
+        try:
+            _inv_recheck_record(r)
+        except Exception as e:
+            print(f"[invoice] 自動重新檢查失敗 {r['id']}：{e}", flush=True)
+
+
+scheduler.add_job(_inv_auto_recheck, IntervalTrigger(minutes=30), id="invoice_auto_recheck", replace_existing=True,
+                  max_instances=1, coalesce=True)
 
 
 @app.route("/api/invoice/cases")

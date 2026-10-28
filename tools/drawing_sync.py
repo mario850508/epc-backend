@@ -232,7 +232,7 @@ def reparse_unread(limit):
             text, why = read_text(data, it["kind"])
             body = {"id": it["id"]}
             if text.strip():
-                body["text"] = text[:6000]
+                body["text"] = text[:12000]
             else:
                 body["error"] = why or "沒有文字"
             r = api("POST", "/api/procurement/drawings/parsed", json=body, timeout=120)
@@ -381,7 +381,7 @@ def main():
                 if kind in CONTRACT_KINDS:    # 契約：文字在本機辨識，主控台只算容量／電價
                     if have_pdf_lib():
                         text, why = read_text(data_bytes, kind)
-                        extra = {"text": text[:6000]} if text.strip() else {"text_failed": why or "沒有文字"}
+                        extra = {"text": text[:12000]} if text.strip() else {"text_failed": why or "沒有文字"}
                     else:
                         extra = {"text_failed": "上傳的電腦沒有 PDF 套件（py -m pip install pypdf）"}
                 try:
