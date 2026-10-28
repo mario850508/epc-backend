@@ -15812,6 +15812,8 @@ def invoice_recheck(record_id):
     try:
         _inv_recheck_record(_inv_get(record_id), body)
         return jsonify({"ok": True, "item": _inv_record_out(_inv_get(record_id))})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     except Exception as e:
         print(f"[invoice] 重新檢查失敗 {record_id}：{e}", flush=True)
         return jsonify({"error": str(e)}), 502
@@ -15966,6 +15968,19 @@ def _inv_recheck_record(rec, body=None):
         manual["case_no"] = (body.get("case_no") or "").strip()
     if "nodes" in body:
         manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
+    # 2026-10-28 使用者：沒讀到日期／號碼讀錯要能自己改 → 人工改的日期、發票號碼存在 manual，重判不會蓋掉
+    if body.get("date"):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body["date"]):
+            raise ValueError("日期格式要是 YYYY-MM-DD")
+        manual["date"] = body["date"]
+    if body.get("invoice_no"):
+        no = re.sub(r"\s", "", str(body["invoice_no"])).upper()
+        if not re.fullmatch(r"[A-Z]{2}\d{8}", no):
+            raise ValueError("發票號碼格式要是 2 個英文字母＋8 位數字")
+        dup = [r for r in airtable_get_all(INV_API_URL, "{" + INV_F["invoice_no"] + "}='" + no + "'", [INV_F["invoice_no"]]) if r["id"] != record_id]
+        if dup:
+            raise ValueError(f"發票號碼 {no} 已經有另一筆，請先刪掉重複的那筆")
+        manual["invoice_no"] = no
     # 2026-10-28：Google OCR 判讀的發票，用存下來的 OCR 文字套最新規則重判（規則改進後，舊發票重新檢查就會吃到）。
     # 發票號碼不動（避免跟別筆撞號）；人工修正過的金額下面會蓋回去。
     reparsed = False
@@ -15981,6 +15996,10 @@ def _inv_recheck_record(rec, body=None):
             inv[k] = float(body[k]); manual[k] = inv[k]
         elif k in manual:
             inv[k] = manual[k]
+    if manual.get("date"):
+        inv["date"] = manual["date"]
+    if manual.get("invoice_no"):
+        inv["invoice_no"] = manual["invoice_no"]
     res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
     fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
     if reparsed:
@@ -15991,6 +16010,10 @@ def _inv_recheck_record(rec, body=None):
     for k, fk in (("total", "total"), ("sales_amount", "sales"), ("tax", "tax")):
         if k in manual:
             fields[INV_F[fk]] = manual[k]
+    if manual.get("date"):
+        fields[INV_F["date"]] = manual["date"]
+    if manual.get("invoice_no"):
+        fields[INV_F["invoice_no"]] = manual["invoice_no"]
     fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
     requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
     return res
