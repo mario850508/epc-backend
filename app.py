@@ -14771,7 +14771,7 @@ def delete_meter_check(record_id):
 # 發票請款（2026-10-28 新增）
 # ===================================================================
 # 廠商（EPC 施作廠商）開發票向我們請款。主控台上傳發票掃描檔（一個 PDF 可以多頁、一頁一張發票），
-# 後端用 Claude 讀出：發票號碼／日期／賣方／品名／金額／備註（備註通常寫合約編號＋案號或簡寫，例如
+# 後端用 Claude 讀出（Render 沒設 ANTHROPIC_API_KEY 時改用公文更名的 Google OCR＋規則判讀，見 1b）：發票號碼／日期／賣方／品名／金額／備註（備註通常寫合約編號＋案號或簡寫，例如
 # 「H11509251C 潤桃87」「O11505093C 工程新竹6號」），再由程式：
 #   1. 比對是哪個案場：合約編號（專案細節「合約編號」）＞案號＞案號簡寫（潤桃87＝潤特桃園87號）＞別名。
 #   2. 判斷請款節點（工程合約七期：簽約款／同意備案款／材料訂購款／工班進場款／掛錶驗收款／設備登記款／
@@ -14884,6 +14884,175 @@ def _inv_extract(pdf_b64):
     )
     instruction = "請讀完每一頁，每一張發票輸出一筆（page 從 1 開始，是這張發票在檔案裡的頁碼）。不是發票的頁面（空白、附件）不要輸出。"
     return _pdf_ask(system, pdf_b64, instruction, schema).get("invoices") or []
+
+
+# ---------------- 1b. 沒有 Claude 金鑰時：Google OCR（公文更名同一個 Apps Script）＋規則判讀 ----------------
+# 2026-10-28 實測 Google OCR 讀發票：印刷的電子發票幾乎全對；手寫三聯式的品名、合約編號、金額大致讀得到，
+# 常見錯字：合約編號開頭 O→0、結尾 C→<／c／0；金額後面的「.-」「,-」讀成 0、.0、.7 之類 → 下面都有修正。
+# 金額不靠欄位位置（OCR 會把表格打散），改找「銷售額＋稅額＝總計、稅額≈銷售額×5%」的三個數字。
+_INV_NODE_KW = [
+    ("簽約款", r"簽約"), ("同意備案款", r"同備|同意備案|同意備"), ("材料訂購款", r"材料"), ("工班進場款", r"進場"),
+    ("掛錶驗收款", r"掛[表錶]|驗收款"), ("設備登記款", r"設登|設備登記"), ("正式售電款", r"文件款|正式售電|售電款"),
+]
+
+
+def _inv_num_variants(tok):
+    """OCR 的金額字串 → 可能的整數值（手寫「67,400.-」常被讀成 67.41005、203,2005、13.480,）。"""
+    t = re.sub(r"[^\d.,]", "", tok).strip(".,")
+    if not t or not re.search(r"\d", t):
+        return set()
+    out = set()
+    digits = re.sub(r"[.,]", "", t)
+    out.add(digits)
+    if "." in t:
+        head, tail = t.rsplit(".", 1)
+        if len(tail) == 3:               # 13.480 → 千分位逗號被讀成點
+            out.add(re.sub(r"[.,]", "", t))
+        else:                            # 269,600.0／212,520.7 → 後面是「.-」
+            out.add(re.sub(r"[.,]", "", head))
+    if len(digits) >= 5:                 # 203,2005／10,1200 → 最後一位是「-」
+        out.add(digits[:-1])
+        if len(digits) >= 6:
+            out.add(digits[:-2])
+    return {int(x) for x in out if x and len(x) <= 9}
+
+
+_CN_DIGIT = {"零": 0, "〇": 0, "壹": 1, "一": 1, "貳": 2, "二": 2, "參": 3, "叁": 3, "三": 3, "肆": 4, "四": 4, "伍": 5, "五": 5,
+             "陸": 6, "六": 6, "柒": 7, "七": 7, "捌": 8, "八": 8, "玖": 9, "九": 9}
+_CN_UNIT = {"拾": 10, "十": 10, "佰": 100, "百": 100, "仟": 1000, "千": 1000}
+
+
+def _inv_cn_total(text):
+    """「總計新臺幣（中文大寫）…壹拾貳萬伍仟參佰柒拾元」→ 125370。手寫的阿拉伯數字 OCR 常錯，大寫國字比較準。
+    只看同一行（OCR 有時把大寫拆成兩行，取最後一行）；看不懂的字（ㄨ、×、去）跳過。"""
+    best = None
+    for m in re.finditer(r"([零〇壹貳參叁肆伍陸柒捌玖拾佰仟萬億一二三四五六七八九十百千 \tㄨxX×去√]+)元", text or ""):
+        total = section = cur = 0
+        for ch in m.group(1):
+            if ch in _CN_DIGIT:
+                cur = _CN_DIGIT[ch]
+            elif ch in _CN_UNIT:
+                section += cur * _CN_UNIT[ch]
+                cur = 0
+            elif ch == "萬":
+                total += (section + cur) * 10000
+                section = cur = 0
+            elif ch == "億":
+                total += (section + cur) * 100000000
+                section = cur = 0
+        total += section + cur
+        if total >= 10:
+            best = total
+    return best
+
+
+def _inv_amounts(text):
+    """回 (銷售額, 稅額, 總計)；找不到回 (0, 0, 0)。"""
+    body = re.split(r"總計新[台臺]幣|中文大寫", text)[0] if re.search(r"總計新[台臺]幣|中文大寫", text) else text
+    toks = re.findall(r"[\d][\d.,]*[\d]|[\d]", body)
+    vals = set()
+    for t in toks:
+        vals |= {v for v in _inv_num_variants(t) if v >= 10}
+    triples = []
+    for s in vals:
+        tax = round(s * 0.05)
+        for tx in (tax - 1, tax, tax + 1):
+            if tx in vals and (s + tx) in vals and s + tx < 50000000:
+                triples.append((s, tx, s + tx))
+    # 大寫國字的總計：跟某個數字對得上（總計本身、或 總計÷1.05 的銷售額、或 總計÷21 的稅額）才採用
+    cn = _inv_cn_total(text)
+    if cn:
+        hit = [tr for tr in triples if tr[2] == cn]
+        if hit:
+            return hit[0]
+        s0 = round(cn / 1.05)
+        if any(abs(v - x) <= 1 for v in vals for x in (cn, s0, cn - s0)):
+            return s0, cn - s0, cn
+    if triples:
+        return max(triples)
+    # 銷售額沒讀到：找 稅額×21≈總計 的一對
+    for tot in sorted(vals, reverse=True):
+        tx = round(tot / 21)
+        for t2 in (tx - 1, tx, tx + 1):
+            if t2 in vals and t2 >= 50:
+                return tot - t2, t2, tot
+    return 0, 0, 0
+
+
+def _inv_parse_free(text, vendors):
+    t = (text or "").replace("：", ":").replace("（", "(").replace("）", ")")
+    inv = {"invoice_no": "", "date": "", "seller": "", "seller_tax_id": "", "buyer": "", "items": [],
+           "sales_amount": 0, "tax": 0, "total": 0, "remarks": "", "contract_nos": [], "case_refs": [], "nodes": [],
+           "notes": "Google OCR＋規則判讀（沒有 Claude），金額／合約編號請對照原檔"}
+    m = re.search(r"(?<![A-Za-z])([A-Z]{2})[\s_-]*(\d{8})(?!\d)", t)
+    if m:
+        inv["invoice_no"] = m.group(1) + m.group(2)
+    m = re.search(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", t)
+    if m:
+        inv["date"] = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    else:
+        m = re.search(r"民國\s*(1\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", t)
+        if m:
+            inv["date"] = f"{int(m.group(1)) + 1911}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(r"賣方\s*:\s*(\S+?(?:公司|行|社))", t)
+    if m:
+        inv["seller"] = m.group(1)
+    else:
+        m = re.search(r"([一-鿿]{2,8}(?:股份)?有限公)司?", t.replace("綠點能創股份有限公司", ""))
+        if m:
+            inv["seller"] = m.group(1) + "司"
+    if not inv["seller"]:
+        inv["seller"] = next((v for v in vendors if v and v in t), "")
+    # 合約編號：英文字母（OCR 常把 O 讀成 0）＋9 位數字＋C（常讀成 < c 0）
+    head_fix = {"0": "O", "6": "G", "8": "B", "5": "S", "1": "I"}
+    for m in re.finditer(r"(?<![A-Za-z\d])([A-Z0-9])\s?(\d{8,9})\s?([C<cO(])?(?![\d])", t):
+        head, num, tail = m.group(1), m.group(2), m.group(3) or ""
+        if head.isdigit():                 # 開頭的英文字母被讀成數字（O→0、G→6）：要「9 位數字＋C」才算，避免抓到電話
+            if not (tail or len(num) == 9):
+                continue
+            head = head_fix.get(head, "")
+            if not head:
+                continue
+        if len(num) == 9 and not tail:     # H115070150／G115092266 → 結尾的 C 被讀成數字
+            num, tail = num[:-1], "C"
+        if len(num) != 8:
+            continue
+        inv["contract_nos"].append(head + num + "C")
+    inv["contract_nos"] = list(dict.fromkeys(inv["contract_nos"]))
+    refs = re.findall(r"(?:潤特|工程)[一-鿿]{2,3}\d{1,3}號?|(?<![一-鿿])[潤工][一-鿿]{1,2}\d{1,3}(?:號)?", t)
+    inv["case_refs"] = list(dict.fromkeys(refs))
+    inv["remarks"] = " ".join(inv["contract_nos"] + inv["case_refs"])
+    # 品名／節點：只看品名欄附近（發票下面的注意事項文字不看）
+    item_zone = re.split(r"※|總計新[台臺]幣", t)[0]
+    for line in item_zone.splitlines():
+        s = line.strip(" |「」J")
+        if any(re.search(p, s) for _, p in _INV_NODE_KW) and len(s) <= 30 and not re.search(r"註記|區分|扣抵", s):
+            inv["items"].append({"name": s, "amount": 0})
+    joined = " ".join(i["name"] for i in inv["items"])
+    inv["nodes"] = [n for n, p in _INV_NODE_KW if re.search(p, joined)]
+    inv["sales_amount"], inv["tax"], inv["total"] = _inv_amounts(t)
+    return inv
+
+
+def _inv_extract_free(data, ocr_url):
+    """一頁一頁 OCR（Drive OCR 會把多頁黏在一起，分不出哪張發票），每頁當一張發票。"""
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(io.BytesIO(data))
+    vendors = sorted({c["vendor"] for c in _pdf_case_ref() if c.get("vendor")}, key=len, reverse=True)
+    out = []
+    for i in range(len(reader.pages)):
+        w = PdfWriter()
+        w.add_page(reader.pages[i])
+        buf = io.BytesIO()
+        w.write(buf)
+        text = _pdf_ocr(buf.getvalue(), ocr_url)
+        inv = _inv_parse_free(text, vendors)
+        if not inv["invoice_no"] and not inv["total"]:
+            continue
+        inv["page"] = i + 1
+        inv["ocr_text"] = text[:3000]
+        out.append(inv)
+    return out
 
 
 # ---------------- 2. 比對案場 ----------------
@@ -15008,7 +15177,7 @@ def _inv_contract_schedule(case_no):
         return {"found": False, "note": "找不到這案的工程合約（案場圖面／公文更名都沒有）", "sched": {}}
     sched, total = _inv_parse_schedule(doc["text"])
     how = "合約文字"
-    if len(sched) < 3 and doc.get("file_url"):
+    if len(sched) < 3 and doc.get("file_url") and os.environ.get("ANTHROPIC_API_KEY"):
         try:
             sched, total = _inv_schedule_by_ai(case_no, doc["file_url"])
             how = "AI 讀合約 PDF"
@@ -15210,7 +15379,10 @@ def _inv_process_file(job, filename, data, uploader):
         job["done"] += 1
         return
     try:
-        invoices = _inv_extract(base64.b64encode(data).decode())
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            invoices = _inv_extract(base64.b64encode(data).decode())
+        else:
+            invoices = _inv_extract_free(data, (_pdf_settings().get("ocr_url") or "").strip())
     except Exception as e:
         job["results"].append({"file": filename, "error": f"辨識失敗：{e}"})
         job["done"] += 1
@@ -15283,8 +15455,8 @@ def invoice_upload():
     files = request.files.getlist("files") or request.files.getlist("files[]")
     if not files:
         return jsonify({"error": "沒有收到檔案"}), 400
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return jsonify({"error": "後端沒有設定 ANTHROPIC_API_KEY"}), 500
+    if not os.environ.get("ANTHROPIC_API_KEY") and not (_pdf_settings().get("ocr_url") or "").strip():
+        return jsonify({"error": "後端沒有 ANTHROPIC_API_KEY，PDF 公文更名設定裡也沒有 Google OCR 網址"}), 500
     payload = [(fs.filename or "invoice.pdf", fs.read()) for fs in files[:10]]
     for k in [k for k, v in INV_JOBS.items() if time.time() - v.get("at", 0) > 3600 and v["status"] != "running"]:
         INV_JOBS.pop(k, None)
