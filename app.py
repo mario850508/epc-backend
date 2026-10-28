@@ -11871,7 +11871,7 @@ def _pdf_free_analyze(text, source, settings, filename=""):
         "confidence": max(0, min(case_conf, type_conf, date_conf)), "evidence": evidence, "issues": issues,
         "conf_parts": [case_conf, type_conf, date_conf], "notes": notes,
         "ranked": ranked, "ids": ext["ids"],
-        "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:4000]},
+        "result": {"engine": "free", "source": source, "extract": ext_store, "text_excerpt": (text or "")[:12000]},
     }
 
 
@@ -12426,7 +12426,7 @@ def _pdf_relearn_fill_text(recs, settings):
                 pdf = requests.get(att["url"], timeout=120)
                 pdf.raise_for_status()
                 text, _ = _pdf_get_text(pdf.content, settings, _pdf_ext(att.get("filename") or g.get(PDF_F["src_name"]) or ""))
-                res["text_excerpt"] = (text or "")[:4000]
+                res["text_excerpt"] = (text or "")[:12000]
         except Exception as e:
             print(f"[pdf_rename] 重新學習補讀文字失敗（{g.get(PDF_F['src_name'])}）：{e}", flush=True)
         done += 1
