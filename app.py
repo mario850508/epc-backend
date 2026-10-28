@@ -5270,21 +5270,37 @@ def _vp_own_booking(token, bid):
     return vendor, rec, None
 
 
-def _vp_notify_pm(rec, card_fn):
-    """通知陽光窗口（預設收件人，Slack 即時＋LINE 進每日彙整）與這筆預約任務的安排人員。"""
+def _vp_notify_pm(rec, card_fn, recs=None):
+    """通知陽光窗口（預設收件人，Slack 即時＋LINE 進每日彙整）與這筆（或這幾筆）預約任務的安排人員。
+    2026-10-28：預設收件人的 Slack 跟安排人員是同一個帳號時，只發一次（以前同一則會收到兩次）。"""
     f = rec["fields"]
     card = card_fn(f)
+    creators = []
+    for r in (recs or [rec]):
+        try:
+            trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + r["id"] + "'", [FIELD_TASK_CREATOR])
+            creator = (trs[0]["fields"].get(FIELD_TASK_CREATOR) or "").strip() if trs else ""
+            for n in _split_names(creator):
+                if n not in creators:
+                    creators.append(n)
+        except Exception as e:
+            print(f"[vendor-portal] 查安排人員失敗：{e}", flush=True)
+    dup_slack = False
     try:
-        _line_push_card(card)
+        dsid = _slack_default_user()
+        if dsid:
+            dup_slack = any((_get_binding(n) or {}).get("slack") == dsid for n in creators)
+    except Exception as e:
+        print(f"[vendor-portal] 比對 Slack 收件人失敗：{e}", flush=True)
+    try:
+        _line_push_card(card, slack=not dup_slack)
     except Exception as e:
         print(f"[vendor-portal] 通知 PM 失敗：{e}", flush=True)
-    try:
-        trs = airtable_get_all(TASK_API_URL, "{" + FIELD_TASK_BOOKING_ID + "}='" + rec["id"] + "'", [FIELD_TASK_CREATOR])
-        creator = (trs[0]["fields"].get(FIELD_TASK_CREATOR) or "").strip() if trs else ""
-        if creator:
-            _notify_scheduler(creator, card)
-    except Exception as e:
-        print(f"[vendor-portal] 通知安排人員失敗：{e}", flush=True)
+    for n in creators:
+        try:
+            _notify_scheduler(n, card)
+        except Exception as e:
+            print(f"[vendor-portal] 通知安排人員失敗：{e}", flush=True)
 
 
 @app.route("/api/vendor-portal/<token>/bookings/<bid>/ack", methods=["POST"])
@@ -5304,6 +5320,47 @@ def vendor_portal_booking_ack(token, bid):
                                       rows=[("廠商", vendor), ("項目", "、".join(f.get(FIELD_SLOT_TYPE) or [])), ("時間", _booking_time_text(f)),
                                             ("確認人", by or "（沒填名字）")]))
     return jsonify({"ok": True, "ack_at": now, "ack_by": by})
+
+
+@app.route("/api/vendor-portal/<token>/bookings/ack-all", methods=["POST"])
+def vendor_portal_booking_ack_all(token):
+    """廠商一次確認多筆行程（一起通知的卡片：按一下全部確認）。body: {ids:[…], by}。
+    只動自己廠商、還沒確認的有效預約；通知窗口只發一則彙整卡片。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    body = request.get_json(silent=True) or {}
+    ids = []
+    for i in (body.get("ids") or []):
+        if isinstance(i, str) and i not in ids:
+            ids.append(i)
+    ids = ids[:40]
+    by = re.sub(r"\s+", " ", str(body.get("by") or "")).strip()[:30]
+    now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    done = []
+    for bid in ids:
+        rec = _get_booking(bid)
+        f = (rec or {}).get("fields", {})
+        if not rec or f.get(FIELD_SLOT_KIND) != SLOT_KIND_BOOKING or (f.get(FIELD_SLOT_VENDOR) or "") != vendor:
+            continue
+        if f.get(FIELD_SLOT_ACK_AT):
+            continue   # 已經確認過的不重複寫
+        r = requests.patch(f"{SLOT_API_URL}/{bid}", headers=airtable_headers(),
+                           json={"fields": {FIELD_SLOT_ACK_AT: now, FIELD_SLOT_ACK_BY: by, FIELD_SLOT_ISSUE: ""}}, timeout=20)
+        if r.status_code < 400:
+            done.append(rec)
+    if done:
+        done.sort(key=lambda r: (r["fields"].get(FIELD_SLOT_DATE, ""), r["fields"].get(FIELD_SLOT_START, "")))
+        lines = [f"{_booking_time_text(r['fields'])}｜{r['fields'].get(FIELD_SLOT_CASE_NO, '')} {r['fields'].get(FIELD_SLOT_ALIAS, '')}".strip()
+                 + "（" + "、".join(r["fields"].get(FIELD_SLOT_TYPE) or []) + "）" for r in done]
+        card = _card("✅ 廠商已確認行程", "#16A34A", f"{vendor}｜共 {len(done)} 筆",
+                     rows=[("廠商", vendor), ("確認人", by or "（沒填名字）")],
+                     sections=[("確認的行程", lines)])
+        try:
+            _vp_notify_pm(done[0], lambda f: card, recs=done)
+        except Exception as e:
+            print(f"[vendor-portal] 全部確認通知失敗：{e}", flush=True)
+    return jsonify({"ok": True, "count": len(done), "ack_at": now, "ack_by": by})
 
 
 @app.route("/api/vendor-portal/<token>/bookings/<bid>/issue", methods=["POST"])
