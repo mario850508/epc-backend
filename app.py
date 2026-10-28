@@ -14023,19 +14023,23 @@ def joint_confirm(gid):
     if not items:
         return jsonify({"error": "沒有可確認的案件"}), 400
     items.sort(key=lambda x: x["start"])
-    for i in range(len(items) - 1):
-        if items[i]["end"] > items[i + 1]["start"]:
-            return jsonify({"error": f"{items[i]['case']} 和 {items[i + 1]['case']} 的時間重疊了"}), 400
-    for it in items:   # 廠商當天已有的預約
-        try:
-            c = _find_slot_conflict(group["vendor"], date, it["start"], it["end"], types=tasks[it["task_id"]].get("type") or [])
-        except Exception as e:
-            return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
-        if c:
-            return jsonify({"error": f"{it['case']} {it['start']}–{it['end']} 跟廠商已有的預約（{c['case']} {c['start_time']}–{c['end_time']}）重疊"}), 409
+    allow_overlap = bool(body.get("allow_overlap"))   # 窗口已看過重疊提示、確認沒問題（例如同一批人力同時處理）
+    if not allow_overlap:
+        for i in range(len(items) - 1):
+            if items[i]["end"] > items[i + 1]["start"]:
+                return jsonify({"error": f"{items[i]['case']} 和 {items[i + 1]['case']} 的時間重疊了", "overlap": True}), 400
+        for it in items:   # 廠商當天已有的預約
+            try:
+                c = _find_slot_conflict(group["vendor"], date, it["start"], it["end"], types=tasks[it["task_id"]].get("type") or [])
+            except Exception as e:
+                return jsonify({"error": "查詢既有預約失敗", "detail": str(e)}), 502
+            if c:
+                return jsonify({"error": f"{it['case']} {it['start']}–{it['end']} 跟廠商已有的預約（{c['case']} {c['start_time']}–{c['end_time']}）重疊", "overlap": True}), 409
     for it in items:
         t = tasks[it["task_id"]]
         slot = {"date": date, "start_time": it["start"], "end_time": it["end"]}
+        if allow_overlap:
+            slot["overlap_ok"] = True   # 屋主按確認時不再擋同時段衝突
         try:
             _patch_task(t["record_id"], {FIELD_TASK_CHOSEN_SLOT: json.dumps(slot, ensure_ascii=False),
                                          FIELD_TASK_STAGE: TASK_STAGE_WAIT_REP, FIELD_TASK_ALT_SLOTS: ""})
