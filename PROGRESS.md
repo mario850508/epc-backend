@@ -240,3 +240,9 @@ eparse_full.log。
 - 需求:屋主已經同意(口頭/LINE)的行程,窗口可以直接帶回去幫屋主確認,不用等屋主自己按;確認後再用手動傳卡片的方式通知廠商。
 - 後端:`POST /api/joint-schedules/<gid>/tasks/<task_id>/confirm-for-owner`(app.py `joint_confirm_for_owner`)——跟屋主自己按確認(owner_booking_confirm)同一套:`_book_vendor_slot`(登記人「屋主 <姓名>」、備註「窗口代屋主確認」)→ 任務標已完成 → `_joint_after_confirm`(全部確認就把聯合排程標已完成)。廠商當天有衝突回 409+overlap:true,前端問過後帶 `allow_overlap` 重送。`_joint_view` 的每案多回 `booking_id`。
 - 前端 joint.js v12:每案「已排時間、等屋主確認」多一個「✅ 代屋主確認(屋主已同意)」;成立後出現「📤 通知廠商(傳卡片)」(關掉聯合排程視窗、開既有 openVendorNotice,手動用 LINE 傳卡片),代確認完會直接問要不要現在通知廠商。
+
+## 2026-10-28 公文更名一次上傳多份大掃描檔(工程合約)到第 3 份就全部「Failed to fetch」
+- 原因(Render 事件記錄查到):16:21「Ran out of memory (used over 512MB)」+ 16:20～16:24 連續三次部署(別的對話推新版),主機在上傳途中重啟。前端一遇到連不上就直接判失敗,剩下的全掛。本機量測:12 頁 21MB 的掃描檔縮小到 5MB 以內,記憶體多吃約 170～210MB、約 12 秒——512MB 主機很容易爆。
+- 後端:(1) `_pdf_shrink` 加 `PDF_SHRINK_LOCK`(一次只縮一份)＋一張圖一張圖換、每頁 gc,峰值約 211→166MB;(2) 上傳端點支援 `defer_run=1`(整批傳完再啟動辨識,不要邊傳邊辨識),`POST /api/pdf-rename/run?if_enabled=1` 在自動辨識沒開時不啟動;(3) 重複檔案(hash 相同)若記錄沒有附件(上次傳到一半被重啟中斷)→補傳附件、放回佇列,不再回 duplicate。
+- 前端(index.html uploadPdfFiles):連不上/502-504 → 等主機回來(每 5 秒探測 `/`,最多約 2 分鐘)再重傳,每份最多 4 次;整批傳完才叫一次辨識。
+- 注意:多個對話同時推 epc-backend 會連環重啟,上傳途中遇到就會中斷;這是主機 512MB 的限制,根本解法是升級 Render 方案或減少連續推版。

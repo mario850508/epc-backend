@@ -11361,44 +11361,58 @@ def _pdf_image_to_pdf(data):
 
 
 
+PDF_SHRINK_LOCK = threading.Lock()   # 2026-10-28：縮小大掃描檔很吃記憶體（12 頁 21MB 約多 170～210MB），一次只做一份
+
+
 def _pdf_shrink(data, limit=None):
     """2026-10-19：超過 Airtable 5MB 上限的 PDF（多半是整份掃描的審訖圖，常見 6～8MB）→ 把裡面的圖片縮小、降 JPEG 品質，
     依序嘗試 (長邊 3000px, 品質 80)、(2600, 70)、(2200, 60)、(1800, 50)，一降到上限以下就停。
     回傳 (bytes, 是否有縮到上限內)。文字層與頁面內容不動（OCR 辨識用得到）。"""
+    import gc
     from pypdf import PdfReader, PdfWriter
-    from PIL import Image
     limit = limit or PDF_MAX_BYTES
     best = data
-    for side, quality in ((3000, 80), (2600, 70), (2200, 60), (1800, 50)):
-        reader = PdfReader(io.BytesIO(data))
-        writer = PdfWriter(clone_from=reader)
-        for page in writer.pages:
-            try:
-                images = list(page.images)
-            except Exception:
-                continue
-            for img in images:
-                try:
-                    pil = img.image
-                    if pil is None:
-                        continue
-                    if pil.mode not in ("RGB", "L"):
-                        pil = pil.convert("RGB")
-                    pil.thumbnail((side, side))
-                    img.replace(pil, quality=quality)
-                except Exception as e:
-                    print(f"[pdf_shrink] 略過一張圖片：{e}", flush=True)
+    with PDF_SHRINK_LOCK:
         try:
-            writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
-        except Exception:
-            pass
-        out = io.BytesIO()
-        writer.write(out)
-        if len(out.getvalue()) < len(best):
-            best = out.getvalue()
-        if len(best) <= limit:
-            return best, True
-    return best, len(best) <= limit
+            for side, quality in ((3000, 80), (2600, 70), (2200, 60), (1800, 50)):
+                reader = PdfReader(io.BytesIO(data))
+                writer = PdfWriter(clone_from=reader)
+                del reader
+                for page in writer.pages:
+                    try:
+                        n_img = len(page.images)
+                    except Exception:
+                        continue
+                    for i in range(n_img):   # 一張一張換、換完就丟掉，不要一次把整頁（整份）的解碼圖片留在記憶體
+                        try:
+                            img = page.images[i]
+                            pil = img.image
+                            if pil is None:
+                                continue
+                            if pil.mode not in ("RGB", "L"):
+                                pil = pil.convert("RGB")
+                            pil.thumbnail((side, side))
+                            img.replace(pil, quality=quality)
+                            del pil, img
+                        except Exception as e:
+                            print(f"[pdf_shrink] 略過一張圖片：{e}", flush=True)
+                    gc.collect()
+                try:
+                    writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
+                except Exception:
+                    pass
+                out = io.BytesIO()
+                writer.write(out)
+                res = out.getvalue()
+                del writer, out
+                gc.collect()
+                if len(res) < len(best):
+                    best = res
+                if len(best) <= limit:
+                    return best, True
+            return best, len(best) <= limit
+        finally:
+            gc.collect()
 
 
 def _pdf_text_layer(pdf_bytes):
@@ -12753,7 +12767,14 @@ def _pdf_create_from_bytes(name, data, uploader="", source="主控台上傳", sr
         return {"name": name, "ok": False, "error": "超過 5MB（Airtable 單檔上傳上限），而且自動縮小後還是太大，請先用 PDF 壓縮工具縮小再上傳"}
     try:
         dup = airtable_get_all(PDF_API_URL, "{" + PDF_F["hash"] + "}='" + digest + "'",
-                               [PDF_F["status"], PDF_F["src_name"], PDF_F["uploader"]])
+                               [PDF_F["status"], PDF_F["src_name"], PDF_F["uploader"], PDF_F["file"]])
+        if dup and not dup[0].get("fields", {}).get(PDF_F["file"]):
+            # 2026-10-28：上次傳到一半主機重啟，只建了記錄、附件沒傳完。重傳時補上附件（不然這筆永遠辨識失敗）
+            upload_attachment_to_ops_record(dup[0]["id"], PDF_F["file"], base64.b64encode(data).decode(), name,
+                                            content_type=content_type)
+            _pdf_patch(dup[0]["id"], {PDF_F["status"]: PDF_ST_QUEUED, PDF_F["attempts"]: 0, PDF_F["error"]: ""})
+            _pdf_items_dirty()
+            return {"name": name, "ok": True, "id": dup[0]["id"], "repaired": True}
         if dup:
             # 好幾位 PM 都收到同一份（例如同一個廠商群組）：不重複辨識，但把這位 PM 也記上去，各自的清單都看得到
             have = dup[0].get("fields", {}).get(PDF_F["uploader"]) or ""
@@ -12799,7 +12820,8 @@ def pdf_rename_upload():
     uploader = (request.form.get("uploader") or "").strip()[:50]
     source = (request.form.get("source") or "主控台上傳").strip()[:50]
     results = [_pdf_create_from_bytes(fs.filename, fs.read(), uploader, source) for fs in files]
-    if any(r["ok"] and not r.get("duplicate") for r in results) and _pdf_settings().get("enabled"):
+    defer = (request.form.get("defer_run") or "") == "1"   # 前端整批傳完才叫「立即辨識」
+    if not defer and any(r["ok"] and not r.get("duplicate") for r in results) and _pdf_settings().get("enabled"):
         _pdf_run_async()
     return jsonify({"results": results})
 
@@ -12912,6 +12934,8 @@ def pdf_rename_watcher_heartbeat():
 def pdf_rename_run_now():
     if PDF_RUN["running"]:
         return jsonify({"ok": True, "message": "已經在辨識中"})
+    if request.args.get("if_enabled") == "1" and not _pdf_settings().get("enabled"):
+        return jsonify({"ok": True, "message": "自動辨識沒開，不啟動"})
     _pdf_run_async()
     return jsonify({"ok": True})
 
