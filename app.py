@@ -15401,7 +15401,7 @@ def _inv_page_pdf(data, page_no):
         return data
 
 
-def _inv_process_file(job, filename, data, uploader):
+def _inv_process_file(job, filename, data, uploader, page_no=None):
     if len(data) > 25 * 1024 * 1024:
         job["results"].append({"file": filename, "error": "檔案超過 25MB"})
         job["done"] += 1
@@ -15416,9 +15416,12 @@ def _inv_process_file(job, filename, data, uploader):
         job["done"] += 1
         return
     if not invoices:
-        job["results"].append({"file": filename, "error": "檔案裡沒有讀到發票"})
+        job["results"].append({"file": filename, "page": page_no, "error": "這頁沒有讀到發票" if page_no else "檔案裡沒有讀到發票"})
         job["done"] += 1
         return
+    if page_no:   # 瀏覽器已切成單頁送來：記錄原檔的頁碼（切附件時單頁檔一定回整份）
+        for inv in invoices:
+            inv["page"] = page_no
     # 2026-10-28 使用者：重新掃描會有重複的發票 → 同一個發票號碼覆蓋舊的那筆，不要變成兩筆。
     # 覆蓋辨識結果、檔案、檢查結果；保留狀態／備註／人工修正（已付款的不會被打回待確認）。
     existing = {}
@@ -15515,6 +15518,29 @@ def invoice_upload():
     INV_JOBS[job_id] = {"status": "running", "done": 0, "total": len(payload), "results": [], "error": "", "at": time.time()}
     threading.Thread(target=_inv_run_job, args=(job_id, payload, (request.form.get("uploader") or "").strip()[:50]), daemon=True).start()
     return jsonify({"job_id": job_id})
+
+
+@app.route("/api/invoice/page", methods=["POST"])
+def invoice_page():
+    """2026-10-28：使用者一次上傳 3 份完整掃描檔 → 主機（512MB）記憶體爆掉重開、工作全消失。
+    改成瀏覽器先把 PDF 切成單頁、一次送一頁，這裡直接辨識＋存檔後回結果（同步，約 20～40 秒），
+    伺服器不用留任何工作狀態；重開了前端會重送那一頁。multipart：file、src_name、page、uploader。"""
+    fs = request.files.get("file")
+    if not fs:
+        return jsonify({"error": "沒有收到檔案"}), 400
+    data = fs.read()
+    if len(data) > 15 * 1024 * 1024:
+        return jsonify({"error": "單頁超過 15MB，請降低掃描解析度"}), 413
+    if not os.environ.get("ANTHROPIC_API_KEY") and not (_pdf_settings().get("ocr_url") or "").strip():
+        return jsonify({"error": "後端沒有 ANTHROPIC_API_KEY，PDF 公文更名設定裡也沒有 Google OCR 網址"}), 500
+    try:
+        page_no = int(request.form.get("page") or 1)
+    except ValueError:
+        page_no = 1
+    job = {"status": "running", "done": 0, "total": 1, "results": [], "error": "", "at": time.time()}
+    _inv_process_file(job, (request.form.get("src_name") or fs.filename or "invoice.pdf")[:200], data,
+                      (request.form.get("uploader") or "").strip()[:50], page_no=page_no)
+    return jsonify({"results": job["results"]})
 
 
 @app.route("/api/invoice/jobs/<job_id>")
