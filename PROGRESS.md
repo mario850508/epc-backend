@@ -235,3 +235,8 @@ eparse_full.log。
 ## 2026-10-28 聯合排程時間重疊改成「先問再安排」
 - 問題:聯合排程同一天的案件常常是同一批人力一起處理,時間重疊本來就沒問題,但前端只顯示紅字警告、後端 /api/joint-schedules/<id>/confirm 直接 400 擋掉。
 - 做法:前端 joint.js(v11)按「確認行程」時若有重疊,先跳確認視窗列出重疊的案件與時間,窗口確認才送出 `allow_overlap:true`;後端 joint_confirm 收到 allow_overlap 就略過「案件互相重疊」與「廠商當天既有預約衝突」兩項檢查,並在每案 chosen_slot 寫 `overlap_ok:true`(屋主按確認時 _book_vendor_slot 才不會被同組已預約的案件擋住)。沒帶旗標時仍回 400/409 並附 `overlap:true`,前端遇到廠商衝突也會再問一次。
+
+## 2026-10-28 聯合排程「代屋主確認」＋確認後通知廠商
+- 需求:屋主已經同意(口頭/LINE)的行程,窗口可以直接帶回去幫屋主確認,不用等屋主自己按;確認後再用手動傳卡片的方式通知廠商。
+- 後端:`POST /api/joint-schedules/<gid>/tasks/<task_id>/confirm-for-owner`(app.py `joint_confirm_for_owner`)——跟屋主自己按確認(owner_booking_confirm)同一套:`_book_vendor_slot`(登記人「屋主 <姓名>」、備註「窗口代屋主確認」)→ 任務標已完成 → `_joint_after_confirm`(全部確認就把聯合排程標已完成)。廠商當天有衝突回 409+overlap:true,前端問過後帶 `allow_overlap` 重送。`_joint_view` 的每案多回 `booking_id`。
+- 前端 joint.js v12:每案「已排時間、等屋主確認」多一個「✅ 代屋主確認(屋主已同意)」;成立後出現「📤 通知廠商(傳卡片)」(關掉聯合排程視窗、開既有 openVendorNotice,手動用 LINE 傳卡片),代確認完會直接問要不要現在通知廠商。

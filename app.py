@@ -13727,6 +13727,7 @@ def _joint_view(group, tasks):
         "invite_text": _joint_invite_text(group, t),
         "confirm_share_url": _task_share_url(t["record_id"], "gconfirm", "card") if t.get("chosen_slot") else "",
         "done": t["status"] == TASK_STATUS_DONE,
+        "booking_id": t.get("booking_id") or "",
     } for t in tasks]
     n, replied, confirmed = _joint_counts(tasks)
     out["counts"] = {"total": n, "replied": replied, "confirmed": confirmed}
@@ -14063,6 +14064,51 @@ def joint_confirm(gid):
             buttons=([("📤 傳確認卡給屋主", url)] if url else []) + [("👀 預覽屋主畫面", _task_owner_link(t))]))
     group = _get_group(gid)
     return jsonify({"ok": True, "joint": _joint_view(group, list(tasks.values()))})
+
+
+@app.route("/api/joint-schedules/<gid>/tasks/<task_id>/confirm-for-owner", methods=["POST"])
+def joint_confirm_for_owner(gid, task_id):
+    """2026-10-28 PM 代屋主確認：屋主已經口頭／LINE 同意這個時間，窗口直接幫屋主按「確認時間沒問題」。
+    做的事跟屋主自己按確認（owner_booking_confirm）一樣：建立預約、任務標完成、更新聯合排程進度。
+    回傳 booking_id，前端接著可以用既有的「通知廠商」把卡片傳給廠商。body: {allow_overlap?, owner_name?, owner_phone?}"""
+    group = _get_group(gid)
+    if not group:
+        return jsonify({"error": "找不到這個聯合排程"}), 404
+    if group["status"] in (GS_CANCEL, GS_DONE):
+        return jsonify({"error": "這個聯合排程已經結束了"}), 409
+    task = next((t for t in _group_tasks(gid) if t["record_id"] == task_id), None)
+    if not task:
+        return jsonify({"error": "找不到這個案件的任務"}), 404
+    if task["status"] == TASK_STATUS_CANCELLED:
+        return jsonify({"error": "這個案件的任務已經取消了"}), 409
+    if task["status"] == TASK_STATUS_DONE:
+        return jsonify({"error": "這個案件已經確認過了", "booking_id": task.get("booking_id") or ""}), 409
+    chosen = task["chosen_slot"]
+    if task["stage"] != TASK_STAGE_WAIT_REP or not chosen:
+        return jsonify({"error": "這個案件還沒有排好時間，請先「確認行程」"}), 409
+    body = request.get_json(silent=True) or {}
+    name = (body.get("owner_name") or task.get("owner_name") or "").strip()
+    phone = (body.get("owner_phone") or task.get("owner_phone") or "").strip()
+    record, err = _book_vendor_slot(
+        task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
+        task["type"], f"屋主 {name}".strip(), "窗口代屋主確認", owner_name=name, owner_phone=phone,
+        companions=task.get("companions"),
+        allow_overlap=bool(body.get("allow_overlap") or chosen.get("overlap_ok")),
+    )
+    if err:
+        err_body, status = err
+        return jsonify(dict(err_body, overlap=(status == 409))), status
+    try:
+        _patch_task(task["record_id"], {FIELD_TASK_STATUS: TASK_STATUS_DONE, FIELD_TASK_BOOKING_ID: record["id"], FIELD_TASK_STAGE: None})
+    except Exception as e:
+        print(f"[joint_confirm_for_owner] 更新任務狀態失敗（預約本身已成功）：{e}", flush=True)
+    task["status"], task["booking_id"] = TASK_STATUS_DONE, record["id"]
+    threading.Thread(target=_joint_after_confirm, args=(task,), daemon=True).start()
+    tasks = _group_tasks(gid)
+    for t in tasks:
+        if t["record_id"] == task["record_id"]:
+            t["status"], t["booking_id"] = TASK_STATUS_DONE, record["id"]   # 剛寫入，查詢可能還沒反映
+    return jsonify({"ok": True, "booking_id": record["id"], "joint": _joint_view(_get_group(gid) or group, tasks)})
 
 
 @app.route("/api/joint-schedules/<gid>/cancel", methods=["POST"])
