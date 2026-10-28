@@ -252,3 +252,6 @@ eparse_full.log。
 - 重複原因:`_vp_notify_pm` 同時送「預設收件人(Slack 預設帳號)」跟「安排人員(任務建立人)」,兩邊剛好是同一個人 → 同一個 Slack 帳號收兩次。修正:預設收件人的 Slack 帳號 == 任一安排人員的 Slack 帳號時,預設那一路 `_line_push_card(card, slack=False)`(LINE 彙整照舊),只發安排人員那一則。
 - 新增 `POST /api/vendor-portal/<token>/bookings/ack-all` {ids, by}:只動自己廠商、還沒確認的有效預約,一次寫入確認時間/確認人,通知只發一則彙整卡(列出每筆時間/案件/項目)。`_vp_notify_pm(rec, card_fn, recs=None)` 可帶多筆預約找安排人員。
 - vendor.html:「等您確認的行程」上方多一顆「✅ 全部確認收到(N 筆)」(已回報問題的不算進去;只有 1 筆時不顯示)。
+
+## 2026-10-28 聯合排程:一起通知廠商(一張卡片)
+- 聯合排程詳情視窗:已成立預約(代屋主確認或屋主按確認)的案件 ≥2 筆時,最上面多一顆「📤 一起通知廠商(N 筆合成一張卡片)」(joint.js v13 `jtNotifyVendorAll`)。做法:把這些預約(含同排同時預約的各案預約記錄)勾進完成安排那邊既有的 `BATCH_SEL`,開 `openBatchVendorNotice(vendor)`,走原本 `/api/vendor-slots/batch-vendor-notice` → LIFF 分享連結,不新增後端。每案原本的「通知廠商」仍在。
