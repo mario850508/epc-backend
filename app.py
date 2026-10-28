@@ -14586,6 +14586,8 @@ def _mc_eng_contracts(case_nos):
             for r in airtable_get_all(DRAWING_API_URL, "AND({" + DRAWING_F["kind"] + "}='" + ENG_KIND + "',OR(" + ",".join("{" + DRAWING_F["case_no"] + "}='" + esc(n) + "'" for n in chunk) + "))",
                                       [DRAWING_F[k] for k in ("case_no", "doc_date", "filename", "file", "cap", "price", "unit_price", "cap_src")]):
                 f = r["fields"]
+                if _is_upstream_contract(f.get(DRAWING_F["filename"])):   # 上包合約（潤特），不是跟 EPC 簽的
+                    continue
                 found.setdefault(f.get(DRAWING_F["case_no"], ""), []).append({
                     "cap": f.get(DRAWING_F["cap"]), "price": f.get(DRAWING_F["price"]), "unit_price": f.get(DRAWING_F["unit_price"]),
                     "date": f.get(DRAWING_F["doc_date"], ""), "src": f.get(DRAWING_F["cap_src"]) or "", "origin": "G槽",
@@ -14596,6 +14598,8 @@ def _mc_eng_contracts(case_nos):
             for r in airtable_get_all(PDF_API_URL, "AND({" + PDF_F["doc_type"] + "}='" + ENG_KIND + "',OR(" + ",".join("{" + PDF_F["case_no"] + "}='" + esc(n) + "'" for n in chunk) + "))",
                                       [PDF_F[k] for k in ("case_no", "doc_date", "final_name", "file", "result_json")]):
                 f = r["fields"]
+                if _is_upstream_contract(f.get(PDF_F["final_name"])):
+                    continue
                 try:
                     text = json.loads(f.get(PDF_F["result_json"]) or "{}").get("text_excerpt", "")
                 except ValueError:
@@ -14803,7 +14807,7 @@ INV_F = {
 INV_STATUSES = ("待確認", "可付款", "退回", "已付款")
 INV_NODES = ("簽約款", "同意備案款", "材料訂購款", "工班進場款", "掛錶驗收款", "設備登記款", "正式售電款")
 # 每期要有的文件。ms＝進度管理里程碑類型（有完成日期就算有）、pdf＝PDF 公文更名的函文類型、
-# draw＝案場圖面的類型、id＝專案細節的編號欄位（有填就算有）、past＝里程碑日期要是今天以前（掛表）、
+# draw＝案場圖面的類型、id＝專案細節的編號欄位（有填就算有）、done＝里程碑還要是「已完成」（掛表，使用者 2026-10-28 指定）、
 # ops＝維運驗收要「合格」
 INV_REQS = {
     "簽約款": [{"label": "工程合約", "ms": ["工程合約簽約"], "pdf": ["工程合約"], "draw": ["工程合約"], "id": "合約編號"}],
@@ -14812,7 +14816,7 @@ INV_REQS = {
                 {"label": "系統送審圖", "ms": ["系統送審圖"], "pdf": ["系統送審圖"], "draw": ["系統送審圖"]}],
     "工班進場款": [{"label": "進場屋主預約時間", "ms": ["進場屋主預約"]},
                 {"label": "串併圖", "ms": ["串並圖"], "pdf": ["串併圖"]}],
-    "掛錶驗收款": [{"label": "掛表通知", "ms": ["掛表", "併聯試運轉"], "pdf": ["併聯試運轉函"], "past": True},
+    "掛錶驗收款": [{"label": "掛表（Airtable 掛表日期＋已完成）", "ms": ["掛表"], "done": True},
                 {"label": "驗收單（驗收合格）", "ops": True}],
     "設備登記款": [{"label": "設備登記函／設備移轉函", "ms": ["設備登記", "移轉設備"], "pdf": ["設備登記", "設備登記移轉"], "id": "設備登記編號"}],
     "正式售電款": [{"label": "正式售電函", "ms": ["正式售電函"], "pdf": ["正式售電函"]}],
@@ -15120,13 +15124,23 @@ def _inv_parse_schedule(text):
     return sched, total
 
 
+def _is_upstream_contract(filename):
+    """2026-10-28 使用者：檔名有「(潤特)」的工程合約是我們的上包合約（潤特↔綠點），不是跟 EPC 簽的，比對時不能用。
+    跟 EPC 的是「宜40_工程合約.pdf」或「宜40_工程合約(EPC).pdf」。"""
+    return bool(re.search(r"[(（_]\s*潤特", filename or ""))
+
+
 def _inv_contract_doc(case_no):
-    """這案的工程合約：案場圖面（G 槽同步）優先，沒有就 PDF 公文更名。回 {text, file_url, filename, origin}。"""
+    """這案跟 EPC 簽的工程合約：案場圖面（G 槽同步）優先，沒有就 PDF 公文更名；上包合約（檔名有「(潤特)」）不用。
+    回 {text, file_url, filename, origin}；只有上包合約時回 {"upstream_only": 檔名}。"""
     esc = _inv_esc(case_no)
+    upstream = ""
     try:
         recs = airtable_get_all(DRAWING_API_URL, "AND({" + DRAWING_F["kind"] + "}='" + ENG_KIND + "',{" + DRAWING_F["case_no"] + "}='" + esc + "')",
                                 [DRAWING_F[k] for k in ("text", "file", "filename", "doc_date")])
         recs.sort(key=lambda r: r["fields"].get(DRAWING_F["doc_date"], ""), reverse=True)
+        upstream = next((r["fields"].get(DRAWING_F["filename"], "") for r in recs if _is_upstream_contract(r["fields"].get(DRAWING_F["filename"]))), "")
+        recs = [r for r in recs if not _is_upstream_contract(r["fields"].get(DRAWING_F["filename"]))]
         if recs:
             f = recs[0]["fields"]
             return {"text": f.get(DRAWING_F["text"], ""), "file_url": ((f.get(DRAWING_F["file"]) or [{}])[0]).get("url", ""),
@@ -15136,6 +15150,8 @@ def _inv_contract_doc(case_no):
     try:
         recs = airtable_get_all(PDF_API_URL, "AND({" + PDF_F["doc_type"] + "}='" + ENG_KIND + "',{" + PDF_F["case_no"] + "}='" + esc + "')",
                                 [PDF_F[k] for k in ("result_json", "file", "final_name")])
+        upstream = upstream or next((r["fields"].get(PDF_F["final_name"], "") for r in recs if _is_upstream_contract(r["fields"].get(PDF_F["final_name"]))), "")
+        recs = [r for r in recs if not _is_upstream_contract(r["fields"].get(PDF_F["final_name"]))]
         if recs:
             f = recs[0]["fields"]
             try:
@@ -15146,7 +15162,7 @@ def _inv_contract_doc(case_no):
                     "filename": f.get(PDF_F["final_name"], ""), "origin": "公文更名"}
     except Exception as e:
         print(f"[invoice] 查公文更名工程合約失敗 {case_no}：{e}", flush=True)
-    return None
+    return {"upstream_only": upstream} if upstream else None
 
 
 def _inv_schedule_by_ai(case_no, file_url):
@@ -15175,6 +15191,8 @@ def _inv_contract_schedule(case_no):
     doc = _inv_contract_doc(case_no)
     if not doc:
         return {"found": False, "note": "找不到這案的工程合約（案場圖面／公文更名都沒有）", "sched": {}}
+    if doc.get("upstream_only"):
+        return {"found": False, "sched": {}, "note": f"只有上包合約「{doc['upstream_only']}」，跟 EPC 簽的工程合約還沒同步到主控台"}
     sched, total = _inv_parse_schedule(doc["text"])
     how = "合約文字"
     if len(sched) < 3 and doc.get("file_url") and os.environ.get("ANTHROPIC_API_KEY"):
@@ -15202,10 +15220,10 @@ def _inv_case_docs(case):
             ms_ids = r.json().get("fields", {}).get(FIELD_MS_LINK_ON_CASE) or []
             for i in range(0, len(ms_ids), 50):
                 formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ms_ids[i:i + 50]) + ")"
-                for m in airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE]):
+                for m in airtable_get_all(MILESTONE_API_URL, formula, [FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS]):
                     mf = m["fields"]
                     if mf.get(FIELD_MS_TYPE) and mf.get(FIELD_MS_ACTUAL_DATE):
-                        out["ms"].setdefault(mf[FIELD_MS_TYPE], []).append(mf[FIELD_MS_ACTUAL_DATE])
+                        out["ms"].setdefault(mf[FIELD_MS_TYPE], []).append((mf[FIELD_MS_ACTUAL_DATE], mf.get(FIELD_MS_STATUS) or ""))
         except Exception as e:
             print(f"[invoice] 查里程碑失敗 {case_no}：{e}", flush=True)
     try:
@@ -15236,15 +15254,15 @@ def _inv_case_docs(case):
 def _inv_check_req(req, docs, today):
     found, pending = [], []
     for t in req.get("ms") or []:
-        for d in sorted(docs["ms"].get(t) or [], reverse=True):
-            if req.get("past") and d > today:
-                pending.append(f"進度管理「{t}」日期 {d} 還沒到")
+        for d, st in sorted(docs["ms"].get(t) or [], reverse=True):
+            if req.get("done") and st != MS_STATUS_DONE:
+                pending.append(f"進度管理「{t}」{d}，節點狀態「{st or '空白'}」不是已完成")
             else:
                 found.append(f"進度管理「{t}」{d}")
     for t in req.get("pdf") or []:
-        found += [f"公文更名：{n or t}" for n in docs["pdf"].get(t) or []]
+        found += [f"公文更名：{n or t}" for n in docs["pdf"].get(t) or [] if not (t == ENG_KIND and _is_upstream_contract(n))]
     for t in req.get("draw") or []:
-        found += [f"案場圖面：{n or t}" for n in docs["draw"].get(t) or []]
+        found += [f"案場圖面：{n or t}" for n in docs["draw"].get(t) or [] if not (t == ENG_KIND and _is_upstream_contract(n))]
     if req.get("id") and docs["ids"].get(req["id"]):
         found.append(f"專案細節{req['id']} {docs['ids'][req['id']]}")
     if req.get("ops"):
