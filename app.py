@@ -15184,9 +15184,16 @@ def _inv_parse_free(text, vendors):
     if m:
         inv["seller"] = m.group(1)
     else:
-        m = re.search(r"([一-鿿]{2,8}(?:股份)?有限公)司?", t.replace("綠點能創股份有限公司", ""))
+        # 2026-10-28：手寫三聯式的賣方在印章裡，OCR 常讀爛（「曙光能創有限公司」讀成「年後有限公司」）→
+        # 先找已知廠商簡稱開頭的公司名，找不到才抓任何「…有限公司」
+        body = t.replace("綠點能創股份有限公司", "")
+        m = next((m for v in vendors if v for m in [re.search(re.escape(v) + r"[一-鿿]{0,6}?(?:股份)?有限公", body)] if m), None)
         if m:
-            inv["seller"] = m.group(1) + "司"
+            inv["seller"] = m.group(0) + "司"
+        else:
+            m = re.search(r"([一-鿿]{2,8}(?:股份)?有限公)司?", body)
+            if m:
+                inv["seller"] = m.group(1) + "司"
     if not inv["seller"]:
         inv["seller"] = next((v for v in vendors if v and v in t), "")
     # 合約編號：英文字母（OCR 常把 O 讀成 0）＋9 位數字＋C（常讀成 < c 0）
@@ -15981,6 +15988,8 @@ def _inv_recheck_record(rec, body=None):
         if dup:
             raise ValueError(f"發票號碼 {no} 已經有另一筆，請先刪掉重複的那筆")
         manual["invoice_no"] = no
+    if (body.get("seller") or "").strip():
+        manual["seller"] = body["seller"].strip()[:100]
     # 2026-10-28：Google OCR 判讀的發票，用存下來的 OCR 文字套最新規則重判（規則改進後，舊發票重新檢查就會吃到）。
     # 發票號碼不動（避免跟別筆撞號）；人工修正過的金額下面會蓋回去。
     reparsed = False
@@ -16000,6 +16009,8 @@ def _inv_recheck_record(rec, body=None):
         inv["date"] = manual["date"]
     if manual.get("invoice_no"):
         inv["invoice_no"] = manual["invoice_no"]
+    if manual.get("seller"):
+        inv["seller"] = manual["seller"]
     res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
     fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
     if reparsed:
@@ -16014,6 +16025,8 @@ def _inv_recheck_record(rec, body=None):
         fields[INV_F["date"]] = manual["date"]
     if manual.get("invoice_no"):
         fields[INV_F["invoice_no"]] = manual["invoice_no"]
+    if manual.get("seller"):
+        fields[INV_F["seller"]] = manual["seller"]
     fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
     requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
     return res
