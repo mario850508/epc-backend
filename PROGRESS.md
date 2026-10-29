@@ -255,3 +255,7 @@ eparse_full.log。
 
 ## 2026-10-28 聯合排程:一起通知廠商(一張卡片)
 - 聯合排程詳情視窗:已成立預約(代屋主確認或屋主按確認)的案件 ≥2 筆時,最上面多一顆「📤 一起通知廠商(N 筆合成一張卡片)」(joint.js v13 `jtNotifyVendorAll`)。做法:把這些預約(含同排同時預約的各案預約記錄)勾進完成安排那邊既有的 `BATCH_SEL`,開 `openBatchVendorNotice(vendor)`,走原本 `/api/vendor-slots/batch-vendor-notice` → LIFF 分享連結,不新增後端。每案原本的「通知廠商」仍在。
+
+## 2026-10-29 發票請款「打包請款節點文件」ZIP 裡的 PDF 全部打不開
+- 原因:/api/invoice/docs-zip 的 put() 用 shutil.copyfileobj(resp.raw, ...),Airtable 檔案伺服器回 gzip,raw 不解壓 → ZIP 裡每個 PDF 開頭是 1f 8b 08(gzip)而不是 %PDF,PDF-XChange 報「Unsupported file format」。在主控台實際下載一包、解開 ZIP 檢查位元組確認。
+- 修正:改用 esp.iter_content()(會自動解 gzip)。/api/invoice/zip(發票掃描檔)用 .content,本來就正常。

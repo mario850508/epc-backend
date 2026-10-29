@@ -16119,7 +16119,10 @@ def invoice_docs_zip():
             with requests.get(url, stream=True, timeout=90) as resp:
                 resp.raise_for_status()
                 with z.open(path, "w") as dst:
-                    shutil.copyfileobj(resp.raw, dst, 256 * 1024)
+                    # 2026-10-29：不能用 resp.raw——Airtable 檔案伺服器回 gzip，raw 不會解壓，打包出來的 PDF 開頭是 1f8b（gzip）、打不開
+                    for chunk in resp.iter_content(256 * 1024):
+                        if chunk:
+                            dst.write(chunk)
             count += 1
         except Exception as e:
             missing.append(f"{path}：下載失敗（{str(e)[:80]}）")
