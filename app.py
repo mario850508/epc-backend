@@ -15492,7 +15492,7 @@ def _inv_check_req(req, docs, today):
 
 # ---------------- 5. 組合檢查結果 ----------------
 
-def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
+def _inv_check(inv, case_no=None, nodes=None, exclude_id=None, pending=None):
     """inv＝Claude 讀到的一張發票；case_no／nodes 有給就用人工指定的。回傳檢查結果 dict。"""
     today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
     res = {"checked_at": _inv_now(), "warnings": []}
@@ -15578,11 +15578,39 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
     # 函文
     docs = _inv_case_docs(case)
     res["docs"] = []
+    # 2026-10-29 使用者：文件是我們內部還沒給（例：驗收單明天才有），今天要先把資料遞出去 → 可以標「補件承諾」
+    # （哪個節點的哪份文件、補件期限）。期限內先當「補件中」；每次重新檢查會看文件是不是真的補齊了（補齊就清掉承諾、
+    # 記錄完成），期限到了還沒補齊前端會跳「補件逾期」警示。承諾存在 manual.pending_docs：[{node,label,due,note,at}]
+    pend = {f"{e.get('node')}|{e.get('label')}": e for e in (pending or []) if e.get("node") and e.get("label")}
+    done_docs, promised = [], []
     for n in nodes:
-        res["docs"].append({"node": n, "reqs": [_inv_check_req(r, docs, today) for r in INV_REQS[n]]})
-    lacking = [f"{d['node']}：{r['label']}" for d in res["docs"] for r in d["reqs"] if not r["ok"]]
-    res["docs_ok"] = bool(nodes) and not lacking
-    res["docs_label"] = ("齊全" if res["docs_ok"] else "缺：" + "、".join(r.split("：", 1)[1] for r in lacking)) if nodes else ""
+        reqs = []
+        for r in INV_REQS[n]:
+            cr = _inv_check_req(r, docs, today)
+            e = pend.get(f"{n}|{cr['label']}")
+            if e:
+                if cr["ok"]:
+                    cr["supplemented"] = True
+                    done_docs.append({"node": n, "label": cr["label"], "due": e.get("due", ""), "done_at": today})
+                else:
+                    cr["promise"] = {"due": e.get("due", ""), "note": e.get("note", ""), "at": e.get("at", "")}
+                    promised.append({"node": n, "label": cr["label"], **cr["promise"]})
+            reqs.append(cr)
+        res["docs"].append({"node": n, "reqs": reqs})
+    lacking = [f"{d['node']}：{r['label']}" for d in res["docs"] for r in d["reqs"] if not r["ok"] and not r.get("promise")]
+    res["docs_ok"] = bool(nodes) and not lacking and not promised
+    res["docs_lacking"] = [x.split("：", 1)[1] for x in lacking]
+    res["docs_pending"] = promised
+    res["supplement_done"] = done_docs
+    if not nodes:
+        res["docs_label"] = ""
+    elif res["docs_ok"]:
+        res["docs_label"] = "齊全"
+    elif lacking:
+        res["docs_label"] = "缺：" + "、".join(res["docs_lacking"])
+    else:
+        md = lambda d: f"{int(d[5:7])}/{int(d[8:10])}" if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d or "") else "?"
+        res["docs_label"] = "補件中：" + "、".join(f"{x['label']}（至{md(x.get('due'))}）" for x in promised)
 
     # 同一期是不是已經請過款
     try:
@@ -15702,7 +15730,8 @@ def _inv_process_file(job, filename, data, uploader, page_no=None):
                         inv[k] = manual[k]
                 if manual.get("items"):
                     inv["items"] = [{"name": manual["items"], "amount": 0}]
-            res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=old["id"] if old else None)
+            res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=old["id"] if old else None,
+                             pending=manual.get("pending_docs"))
             fields = {
                 INV_F["invoice_no"]: no or f"(未讀到號碼) {filename} p{inv.get('page')}",
                 INV_F["seller"]: inv.get("seller", ""), INV_F["items"]: "、".join(i["name"] for i in inv.get("items") or [])[:500],
@@ -15997,6 +16026,14 @@ def _inv_recheck_record(rec, body=None):
     if "nodes" in body:
         picked = [n for n in body.get("nodes") or [] if n in INV_ALL_NODES]
         manual["nodes"] = [INV_OTHER] if INV_OTHER in picked else picked   # 其他不跟七期並存
+    if "pending_docs" in body:   # 補件承諾（整份清單由前端送來）
+        clean = []
+        for e in body.get("pending_docs") or []:
+            due = str(e.get("due") or "")
+            if e.get("node") and e.get("label") and re.fullmatch(r"\d{4}-\d{2}-\d{2}", due):
+                clean.append({"node": e["node"], "label": e["label"], "due": due, "note": str(e.get("note") or "")[:100],
+                              "at": e.get("at") or _inv_now()})
+        manual["pending_docs"] = clean
     if "items" in body:   # 品名可人工改／新增（2026-10-29）
         manual["items"] = (body.get("items") or "").strip()[:200]
     # 2026-10-28 使用者：沒讀到日期／號碼讀錯要能自己改 → 人工改的日期、發票號碼存在 manual，重判不會蓋掉
@@ -16037,7 +16074,14 @@ def _inv_recheck_record(rec, body=None):
         inv["seller"] = manual["seller"]
     if manual.get("items"):
         inv["items"] = [{"name": manual["items"], "amount": 0}]
-    res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
+    res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id,
+                     pending=manual.get("pending_docs"))
+    if res.get("supplement_done"):   # 補件真的補齊了 → 清掉承諾、留一筆完成紀錄
+        keys = {f"{d['node']}|{d['label']}" for d in res["supplement_done"]}
+        manual["pending_docs"] = [e for e in manual.get("pending_docs") or [] if f"{e.get('node')}|{e.get('label')}" not in keys]
+        manual["done_docs"] = (manual.get("done_docs") or []) + res["supplement_done"]
+    if manual.get("done_docs"):
+        res["done_docs"] = manual["done_docs"]
     fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
     if reparsed:
         fields.update({INV_F["seller"]: inv.get("seller", ""), INV_F["items"]: "、".join(i["name"] for i in inv.get("items") or [])[:500],
@@ -16128,7 +16172,7 @@ def invoice_docs_zip():
     invs = []
     for i in range(0, len(ids), 50):
         formula = "OR(" + ",".join(f"RECORD_ID()='{x}'" for x in ids[i:i + 50]) + ")"
-        invs += airtable_get_all(INV_API_URL, formula, [INV_F[k] for k in ("invoice_no", "case_no", "nodes", "file", "vendor")])
+        invs += airtable_get_all(INV_API_URL, formula, [INV_F[k] for k in ("invoice_no", "case_no", "nodes", "file", "vendor", "manual")])
     invs.sort(key=lambda r: (r["fields"].get(INV_F["case_no"]) or "", r["fields"].get(INV_F["invoice_no"]) or ""))
     clean = lambda n: re.sub(r'[\\/:*?"<>|]', "_", n or "").strip() or "未命名"
     tmp = tempfile.NamedTemporaryFile(prefix="invdocs_", suffix=".zip", delete=False)
@@ -16184,6 +16228,14 @@ def invoice_docs_zip():
                             if doc and doc.get("file_url"):
                                 got = [(doc["filename"] or f"{case_no}_工程合約.pdf", doc["file_url"])]
                         if not got:
+                            try:
+                                pe = next((e for e in (json.loads(f.get(INV_F["manual"]) or "{}").get("pending_docs") or [])
+                                           if e.get("node") == node and e.get("label") == req["label"]), None)
+                            except ValueError:
+                                pe = None
+                            if pe:
+                                missing.append(f"{case_no}｜{node}｜{req['label']}：補件中，承諾 {pe.get('due', '')} 前補齊" + (f"（{pe['note']}）" if pe.get("note") else ""))
+                                continue
                             why = "Airtable 只有日期、沒有檔案" if (req.get("ms") and not (req.get("pdf") or req.get("draw") or req.get("ops"))) else "主控台找不到檔案"
                             missing.append(f"{case_no}｜{node}｜{req['label']}：{why}")
                             continue
