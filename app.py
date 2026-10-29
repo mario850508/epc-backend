@@ -14992,6 +14992,10 @@ INV_F = {
 }
 INV_STATUSES = ("待確認", "可付款", "退回", "已付款")
 INV_NODES = ("簽約款", "同意備案款", "材料訂購款", "工班進場款", "掛錶驗收款", "設備登記款", "正式售電款")
+# 2026-10-29 使用者：有些發票是工程合約以外的款項（例：加購配電盤），不是七期款 → 節點選「其他」：
+# 不比對合約金額、不檢查節點文件、打包只放發票。「其他」只能人工選（AI 判讀只會判七期），而且不能跟七期並存。
+INV_OTHER = "其他"
+INV_ALL_NODES = INV_NODES + (INV_OTHER,)
 # 每期要有的文件。ms＝進度管理里程碑類型（有完成日期就算有）、pdf＝PDF 公文更名的函文類型、
 # draw＝案場圖面的類型、id＝專案細節的編號欄位（有填就算有）、done＝里程碑還要是「已完成」（掛表，使用者 2026-10-28 指定）、
 # ops＝維運驗收要「合格」
@@ -15511,7 +15515,7 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
             res["warnings"].append("案場比對信心偏低，請確認")
     if not case:
         res["case"] = None
-        res["nodes"] = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_NODES]
+        res["nodes"] = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_ALL_NODES]
         res["warnings"].append("比對不到案場，請手動選案號")
         return res
     res["case"] = {"case_no": case["case_no"], "alias": case.get("alias", ""), "vendor": case.get("vendor", ""),
@@ -15521,7 +15525,19 @@ def _inv_check(inv, case_no=None, nodes=None, exclude_id=None):
         res["warnings"].append(f"賣方「{inv['seller']}」跟這案的施作廠商「{vendor}」不同")
 
     manual_nodes = nodes is not None
-    nodes = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_NODES]
+    nodes = [n for n in (nodes if nodes is not None else inv.get("nodes") or []) if n in INV_ALL_NODES]
+    if INV_OTHER in nodes:   # 其他款項：不比對合約金額、不檢查文件
+        total = float(inv.get("total") or 0)
+        res["nodes"] = [INV_OTHER]
+        res["contract"] = None
+        res["amount"] = {"expected": None, "invoice_total": total, "diff": None, "ok": True, "label": "其他款項"}
+        sales, tax = float(inv.get("sales_amount") or 0), float(inv.get("tax") or 0)
+        if sales and total and abs(sales + tax - total) > 1:
+            res["warnings"].append(f"發票上 銷售額 {sales:,.0f} ＋ 稅額 {tax:,.0f} ≠ 總計 {total:,.0f}，可能辨識錯誤")
+        res["docs"] = []
+        res["docs_ok"] = True
+        res["docs_label"] = "不需檢查"
+        return res
 
     # 金額
     sc = _inv_contract_schedule(case["case_no"])
@@ -15681,9 +15697,11 @@ def _inv_process_file(job, filename, data, uploader, page_no=None):
                     manual = json.loads(old["fields"].get(INV_F["manual"]) or "{}")
                 except ValueError:
                     manual = {}
-                for k in ("total", "sales_amount", "tax"):
-                    if k in manual:
+                for k in ("total", "sales_amount", "tax", "date", "seller"):
+                    if manual.get(k):
                         inv[k] = manual[k]
+                if manual.get("items"):
+                    inv["items"] = [{"name": manual["items"], "amount": 0}]
             res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=old["id"] if old else None)
             fields = {
                 INV_F["invoice_no"]: no or f"(未讀到號碼) {filename} p{inv.get('page')}",
@@ -15977,7 +15995,10 @@ def _inv_recheck_record(rec, body=None):
     if "case_no" in body:
         manual["case_no"] = (body.get("case_no") or "").strip()
     if "nodes" in body:
-        manual["nodes"] = [n for n in body.get("nodes") or [] if n in INV_NODES]
+        picked = [n for n in body.get("nodes") or [] if n in INV_ALL_NODES]
+        manual["nodes"] = [INV_OTHER] if INV_OTHER in picked else picked   # 其他不跟七期並存
+    if "items" in body:   # 品名可人工改／新增（2026-10-29）
+        manual["items"] = (body.get("items") or "").strip()[:200]
     # 2026-10-28 使用者：沒讀到日期／號碼讀錯要能自己改 → 人工改的日期、發票號碼存在 manual，重判不會蓋掉
     if body.get("date"):
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body["date"]):
@@ -16014,6 +16035,8 @@ def _inv_recheck_record(rec, body=None):
         inv["invoice_no"] = manual["invoice_no"]
     if manual.get("seller"):
         inv["seller"] = manual["seller"]
+    if manual.get("items"):
+        inv["items"] = [{"name": manual["items"], "amount": 0}]
     res = _inv_check(inv, case_no=manual.get("case_no") or None, nodes=manual.get("nodes"), exclude_id=record_id)
     fields = {**_inv_fields_from_check(res), INV_F["manual"]: json.dumps(manual, ensure_ascii=False) if manual else ""}
     if reparsed:
@@ -16030,6 +16053,8 @@ def _inv_recheck_record(rec, body=None):
         fields[INV_F["invoice_no"]] = manual["invoice_no"]
     if manual.get("seller"):
         fields[INV_F["seller"]] = manual["seller"]
+    if manual.get("items"):
+        fields[INV_F["items"]] = manual["items"]
     fields[INV_F["ext_json"]] = json.dumps(inv, ensure_ascii=False)
     requests.patch(f"{INV_API_URL}/{record_id}", headers=airtable_headers(), json={"fields": fields}, timeout=30).raise_for_status()
     return res
@@ -16038,7 +16063,7 @@ def _inv_recheck_record(rec, body=None):
 def _inv_auto_recheck():
     """每 30 分鐘：「待確認」且金額或函文還沒過的發票重新檢查（一次最多 20 張）。"""
     try:
-        recs = airtable_get_all(INV_API_URL, "AND({" + INV_F["status"] + "}='待確認',OR({" + INV_F["amount_check"] + "}!='相符',{"
+        recs = airtable_get_all(INV_API_URL, "AND({" + INV_F["status"] + "}='待確認',{" + INV_F["nodes"] + "}!='其他',OR({" + INV_F["amount_check"] + "}!='相符',{"
                                 + INV_F["doc_check"] + "}!='齊全'))", list(INV_F.values()))
     except Exception as e:
         print(f"[invoice] 自動重新檢查查詢失敗：{e}", flush=True)
@@ -16136,9 +16161,11 @@ def invoice_docs_zip():
                 att = (f.get(INV_F["file"]) or [{}])[0]
                 if att.get("url"):
                     put(z, f"{folder}/{clean(case_no + '_發票_' + no)}.pdf", att["url"])
-                nodes = [n for n in (f.get(INV_F["nodes"]) or "").split("、") if n in INV_REQS]
+                raw_nodes = [n for n in (f.get(INV_F["nodes"]) or "").split("、") if n]
+                nodes = [n for n in raw_nodes if n in INV_REQS]
                 if not nodes:
-                    missing.append(f"{case_no}｜發票 {no}：沒有請款節點，沒打包文件")
+                    if INV_OTHER not in raw_nodes:   # 其他款項只放發票，不用節點文件
+                        missing.append(f"{case_no}｜發票 {no}：沒有請款節點，沒打包文件")
                     continue
                 if case_no not in files_cache:
                     files_cache[case_no] = _inv_case_files(case_no) if f.get(INV_F["case_no"]) else {}
