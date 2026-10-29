@@ -9189,7 +9189,10 @@ CONTRACT_KINDS = ("換文修約", "台電契約", "細部協商")
 DRAWING_TEXT_MAX = 12000
 # 2026-10-23：03 資料夾的工程合約（跟 EPC 簽的；容量、躉購電價、工程單價）＝掛表資訊確認的比對基準
 ENG_KIND = "工程合約"
-DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS + (ENG_KIND,)
+# 2026-10-29：發票請款「打包請款節點文件」要的 G 槽檔案（很多是直接放進資料夾、沒經過公文更名，主控台原本拿不到）。
+# drawing_sync 只替「發票請款裡有發票的案件」同步這幾種（/api/invoice/doc-cases），不全部傳（省 Airtable 空間）
+NODE_DOC_KINDS = ("同意備案", "設備登記", "正式售電函", "併聯試運轉函", "支架拆圖", "串併圖")
+DRAWING_KINDS = ("審訖圖", "系統送審圖") + CONTRACT_KINDS + (ENG_KIND,) + NODE_DOC_KINDS
 _CAP_NUM = r"([0-9][0-9,]*(?:\.[0-9]+)?)"
 
 
@@ -9574,7 +9577,7 @@ def _case_drawings_from_sync(case_no):
     for r in recs:
         f = r["fields"]
         att = (f.get(DRAWING_F["file"]) or [{}])[0]
-        if not att.get("url") or f.get(DRAWING_F["kind"]) in CONTRACT_KINDS + (ENG_KIND,):
+        if not att.get("url") or f.get(DRAWING_F["kind"]) not in ("審訖圖", "系統送審圖"):   # 只要圖面（契約、請款節點文件不算）
             continue
         out.append({"id": r["id"], "doc_type": f.get(DRAWING_F["kind"], ""), "doc_date": f.get(DRAWING_F["doc_date"], ""), "status": "G槽",
                     "name": f.get(DRAWING_F["filename"], "") or att.get("filename", ""), "ext": "pdf", "file_url": att["url"]})
@@ -14994,15 +14997,15 @@ INV_NODES = ("簽約款", "同意備案款", "材料訂購款", "工班進場款
 # ops＝維運驗收要「合格」
 INV_REQS = {
     "簽約款": [{"label": "工程合約", "ms": ["工程合約簽約"], "pdf": ["工程合約"], "draw": ["工程合約"], "id": "合約編號"}],
-    "同意備案款": [{"label": "同意備案函", "ms": ["同意備案"], "pdf": ["同意備案"], "id": "同意備案編號"}],
-    "材料訂購款": [{"label": "支架拆圖", "ms": ["支架拆圖"], "pdf": ["支架拆圖"]},
+    "同意備案款": [{"label": "同意備案函", "ms": ["同意備案"], "pdf": ["同意備案"], "draw": ["同意備案"], "id": "同意備案編號"}],
+    "材料訂購款": [{"label": "支架拆圖", "ms": ["支架拆圖"], "pdf": ["支架拆圖"], "draw": ["支架拆圖"]},
                 {"label": "系統送審圖", "ms": ["系統送審圖"], "pdf": ["系統送審圖"], "draw": ["系統送審圖"]}],
     "工班進場款": [{"label": "進場屋主預約時間", "ms": ["進場屋主預約"]},
-                {"label": "串併圖", "ms": ["串並圖"], "pdf": ["串併圖"]}],
-    "掛錶驗收款": [{"label": "掛表（Airtable 掛表日期＋已完成）", "ms": ["掛表"], "done": True},
+                {"label": "串併圖", "ms": ["串並圖"], "pdf": ["串併圖"], "draw": ["串併圖"]}],
+    "掛錶驗收款": [{"label": "掛表（Airtable 掛表日期＋已完成）", "ms": ["掛表"], "done": True, "draw": ["併聯試運轉函"]},
                 {"label": "驗收單（驗收合格）", "ops": True}],
-    "設備登記款": [{"label": "設備登記函／設備移轉函", "ms": ["設備登記", "移轉設備"], "pdf": ["設備登記", "設備登記移轉"], "id": "設備登記編號"}],
-    "正式售電款": [{"label": "正式售電函", "ms": ["正式售電函"], "pdf": ["正式售電函"]}],
+    "設備登記款": [{"label": "設備登記函／設備移轉函", "ms": ["設備登記", "移轉設備"], "pdf": ["設備登記", "設備登記移轉"], "draw": ["設備登記"], "id": "設備登記編號"}],
+    "正式售電款": [{"label": "正式售電函", "ms": ["正式售電函"], "pdf": ["正式售電函"], "draw": ["正式售電函"]}],
 }
 # 合約「參. 付款期程」裡各期的寫法（OCR 會「錶／表」混用）
 _INV_SCHED_RE = re.compile(r"(簽約款|同意備案款|材料訂購款|工班進場款|掛[錶表]驗收款|設備登記款|正式售電款)\s*(\d{1,2}(?:\.\d+)?)\s*%")
@@ -16219,6 +16222,16 @@ def invoice_zip():
     return Response(buf.getvalue(), mimetype="application/zip",
                     headers={"Content-Disposition": f"attachment; filename*=UTF-8''{_q(fname)}",
                              "X-Missing": _q("、".join(missing)), "Access-Control-Expose-Headers": "Content-Disposition, X-Missing"})
+
+
+@app.route("/api/invoice/doc-cases")
+def invoice_doc_cases():
+    """drawing_sync 用：發票請款裡還在處理（不是退回）的發票的案號 → 這些案件要同步請款節點文件（NODE_DOC_KINDS）。"""
+    try:
+        recs = airtable_get_all(INV_API_URL, "AND({" + INV_F["case_no"] + "}!='',{" + INV_F["status"] + "}!='退回')", [INV_F["case_no"]])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"cases": sorted({r["fields"].get(INV_F["case_no"], "") for r in recs} - {""}), "kinds": list(NODE_DOC_KINDS)})
 
 
 @app.route("/api/invoice/cases")

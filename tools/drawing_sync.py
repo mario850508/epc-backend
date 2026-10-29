@@ -48,6 +48,14 @@ KINDS = [("審訖圖", "6", ("審訖圖",), ()), ("系統送審圖", "4", ("系�
          # 跟 EPC 的是「宜40_工程合約.pdf」或「宜40_工程合約(EPC).pdf」
          ("工程合約", None, ("工程合約", "工程契約"), ("(潤特)", "（潤特）", "_潤特", "(潤特 "))]
 CONTRACT_KINDS = ("台電契約", "細部協商", "換文修約", "工程合約")
+# 2026-10-29：發票請款「打包請款節點文件」要的檔案，只替主控台發票請款裡有發票的案件同步（/api/invoice/doc-cases），
+# 不全部傳（全部案場太多、Airtable 空間有限）。很多同意備案函等是直接放進 06 資料夾、沒經過公文更名。
+NODE_DOC_KINDS = [("同意備案", "6", ("同意備案",), ("補件", "變更", "展延", "廢止", "撤銷")),
+                  ("設備登記", "6", ("設備登記",), ("移轉", "補件")),
+                  ("正式售電函", "6", ("正式售電",), ()),
+                  ("併聯試運轉函", "6", ("併聯試運轉",), ()),
+                  ("支架拆圖", "4", ("支架拆圖",), ()),
+                  ("串併圖", "4", ("串併圖", "串並圖"), ())]
 
 
 try:
@@ -309,6 +317,12 @@ def main():
         log(f"讀取主控台已上傳清單失敗：{e}")
         return 1
     log(f"主控台已有 {len(idx)} 份圖面")
+    inv_cases = set()
+    try:
+        inv_cases = set(api("GET", "/api/invoice/doc-cases").json().get("cases") or [])
+        log(f"發票請款有發票的案件 {len(inv_cases)} 個 → 這些案件也同步請款節點文件（同意備案、設備登記…）")
+    except Exception as e:
+        log(f"讀取發票請款案件失敗（略過請款節點文件）：{e}")
     only = set()
     if args.open_orders:
         for st in ("已成立", "可能撤案"):
@@ -338,7 +352,8 @@ def main():
                 continue
             if args.open_orders and case_no not in only:
                 continue
-            for kind, cat, kw, ex in kinds:
+            case_kinds = kinds + (NODE_DOC_KINDS if (case_no in inv_cases or args.case) else [])
+            for kind, cat, kw, ex in case_kinds:
                 try:
                     best = pick_latest(case_dir, cat, kw, ex)
                 except OSError as e:
