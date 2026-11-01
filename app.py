@@ -8990,37 +8990,96 @@ def md_confirm_many():
     return jsonify({"ok": True, "done": done})
 
 
-def _md_build_message(rep, items):
-    """把一位業務名下還缺的資料整理成一則訊息（依案場分組）。"""
+def _md_lines_by_case(items, show_rep=False):
     by_case = collections.OrderedDict()
     for it in items:
         by_case.setdefault(it["alias"] or it["case_no"], []).append(it)
-    lines = [f"【缺件提醒】{rep} 您好，以下案場廠商還缺資料，麻煩協助向屋主／相關單位取得後提供給我：", ""]
+    lines = []
     for name, its in by_case.items():
-        lines.append(f"▍{name}")
+        lines.append(f"▍{name}" + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else ""))
         for it in its:
             extra = f"（{it['note']}）" if it["note"] else ""
-            who = "（業務助理申請）" if it["provider"] == "業務助理" else ""
-            lines.append(f"　・{it['doc_type']}{extra}{who}")
+            lines.append(f"　・{it['doc_type']}{extra}")
         lines.append("")
-    lines.append(f"共 {len(by_case)} 個案場、{len(items)} 項。資料拿到後請直接回覆我，謝謝！")
-    return "\n".join(lines)
+    return by_case, lines
 
 
-def _md_rep_items(rep, ids=None):
+def _md_build_message(rep, items):
+    """把一位業務名下還缺的資料整理成一則訊息（依案場分組）。
+    2026-11-01：業務助理申請的項目另外隔開，只是同步讓業務知道，由業務助理處理，不用業務提供。"""
+    own = [i for i in items if i["provider"] != "業務助理"]
+    assist = [i for i in items if i["provider"] == "業務助理"]
+    out = []
+    if own:
+        by_case, lines = _md_lines_by_case(own)
+        out += [f"【缺件提醒】{rep} 您好，以下案場廠商還缺資料，麻煩協助向屋主／相關單位取得後提供給我：", ""] + lines
+        out.append(f"共 {len(by_case)} 個案場、{len(own)} 項。資料拿到後請直接回覆我，謝謝！")
+    if assist:
+        by_case, lines = _md_lines_by_case(assist)
+        if out:
+            out += ["", "－－－－－－－－－－", ""]
+        else:
+            out += [f"【缺件通知】{rep} 您好，", ""]
+        out += ["以下資料為「業務助理」申請，同步讓您知道，由業務助理處理，您不需要另外提供：", ""] + lines
+        out.append(f"共 {len(by_case)} 個案場、{len(assist)} 項（業務助理處理中）。")
+    return "\n".join(out)
+
+
+def _md_build_assistant_message(to, items):
+    by_case, lines = _md_lines_by_case(items, show_rep=True)
+    out = [f"【缺件申請】{to} 您好，以下案場廠商還缺資料，麻煩協助申請取得後提供給我：", ""] + lines
+    out.append(f"共 {len(by_case)} 個案場、{len(items)} 項。資料拿到後請直接回覆我，謝謝！")
+    return "\n".join(out)
+
+
+def _md_rep_items(rep, ids=None, only="all"):
+    """only: all=該業務全部缺件(Mario 自己的除外)；own=不含業務助理申請的；assistant=只有業務助理申請的。"""
     items = [i for i in _md_load(only_missing=True)
              if i["rep"] == rep and i["provider"] != MD_PROVIDER_MARIO]
+    if only == "own":
+        items = [i for i in items if i["provider"] != "業務助理"]
+    elif only == "assistant":
+        items = [i for i in items if i["provider"] == "業務助理"]
     if ids:
         wanted = set(ids)
         items = [i for i in items if i["id"] in wanted]
     return items
 
 
+def _md_assistant_items(vendor="", ids=None):
+    items = [i for i in _md_load(only_missing=True) if i["provider"] == "業務助理" and (not vendor or i["vendor"] == vendor)]
+    if ids:
+        wanted = set(ids)
+        items = [i for i in items if i["id"] in wanted]
+    return items
+
+
+def _md_stamp_notified(items):
+    today = _md_today()
+    for i in range(0, len(items), 10):
+        chunk = items[i:i + 10]
+        requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+            {"id": it["id"], "fields": {MD_F["notified"]: today, MD_F["notify_count"]: (it["notify_count"] or 0) + 1}}
+            for it in chunk]})
+
+
 @app.route("/api/missing-docs/notice", methods=["GET"])
 def md_notice_preview():
-    """預覽要傳給某位業務的訊息（不會送出）。?rep=名字"""
-    rep = (request.args.get("rep") or "").strip()
+    """預覽要傳的訊息（不會送出）。?rep=業務名字；或 ?role=assistant&to=收件人&vendor=廠商（傳給業務助理）。"""
     try:
+        if request.args.get("role") == "assistant":
+            to = (request.args.get("to") or "").strip()
+            items = _md_assistant_items((request.args.get("vendor") or "").strip())
+            bound = False
+            if to:
+                try:
+                    b = _get_binding(to)
+                    bound = bool(b["uid"] or b["slack"])
+                except Exception:
+                    bound = False
+            return jsonify({"role": "assistant", "to": to, "rep": to, "count": len(items), "ids": [i["id"] for i in items],
+                            "bound": bound, "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
+        rep = (request.args.get("rep") or "").strip()
         items = _md_rep_items(rep)
         bound = False
         if rep:
@@ -9037,8 +9096,25 @@ def md_notice_preview():
 
 @app.route("/api/missing-docs/notify", methods=["POST"])
 def md_notify():
-    """真的把缺件訊息推播給業務（前端預覽確認後才會呼叫）。body: {rep, ids?}。成功就記錄最後通知日／次數。"""
+    """真的把缺件訊息推播（前端預覽確認後才會呼叫）。body: {rep, ids?}；或 {role:'assistant', to, ids?, vendor?}。
+    成功就記錄最後通知日／次數。業務通知時，只有「不是業務助理申請」的項目記通知；業務助理申請的項目是同步知會，
+    記錄留給通知業務助理時用。"""
     body = request.get_json(force=True) or {}
+    if body.get("role") == "assistant":
+        to = (body.get("to") or "").strip()
+        if not to:
+            return jsonify({"error": "請先選要傳給誰（業務助理）"}), 400
+        try:
+            items = _md_assistant_items((body.get("vendor") or "").strip(), body.get("ids"))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 502
+        if not items:
+            return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
+        text = _md_build_assistant_message(to, items)
+        sent = _push_to_name(to, text)
+        if sent:
+            _md_stamp_notified(items)
+        return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
     rep = (body.get("rep") or "").strip()
     if not rep:
         return jsonify({"error": "缺少業務名字"}), 400
@@ -9051,12 +9127,7 @@ def md_notify():
     text = _md_build_message(rep, items)
     sent = _push_to_name(rep, text)
     if sent:
-        today = _md_today()
-        for i in range(0, len(items), 10):
-            chunk = items[i:i + 10]
-            requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
-                {"id": it["id"], "fields": {MD_F["notified"]: today, MD_F["notify_count"]: (it["notify_count"] or 0) + 1}}
-                for it in chunk]})
+        _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
     return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
 
 
