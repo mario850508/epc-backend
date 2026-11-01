@@ -259,3 +259,8 @@ eparse_full.log。
 ## 2026-10-29 發票請款「打包請款節點文件」ZIP 裡的 PDF 全部打不開
 - 原因:/api/invoice/docs-zip 的 put() 用 shutil.copyfileobj(resp.raw, ...),Airtable 檔案伺服器回 gzip,raw 不解壓 → ZIP 裡每個 PDF 開頭是 1f 8b 08(gzip)而不是 %PDF,PDF-XChange 報「Unsupported file format」。在主控台實際下載一包、解開 ZIP 檢查位元組確認。
 - 修正:改用 esp.iter_content()(會自動解 gzip)。/api/invoice/zip(發票掃描檔)用 .content,本來就正常。
+
+## 2026-11-01 LINE 每日彙整輪播:去重、同類合併、編號
+- 現象(11/1 額度重置後第一次收到彙整):「廠商已確認行程」同一則出現兩張(只差底部「你名下的任務」),輪播很長、不知道為什麼這麼多張。原因:預設收件人跟安排人員是同一人,同一通知從兩條路進佇列,`_digest_enqueue` 的去重鍵包含 footer,所以判成不同則。
+- 修正(app.py):(1) `_digest_enqueue` 去重鍵不看 footer;(2) `_digest_messages` 組輪播前再去重(`_digest_dedupe_cards`)、同一天多張「✅ 廠商已確認行程」合成一張列出全部行程(`_digest_merge_ack_cards`);(3) 每張卡片標題加編號(i/N),摘要每行也有對應編號,note 說明。本機用 8 則含重複的樣本測:輪播 8→3 張+摘要。
+- LINE 額度:彙整=一個 flex carousel 訊息物件,每人每天只算 1 則(不論幾張卡片,上限 12 張=摘要+11)。

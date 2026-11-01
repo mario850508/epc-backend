@@ -6775,7 +6775,10 @@ def _digest_enqueue(target, card=None, text=None):
     except Exception as e:
         print(f"[line_digest] 讀取佇列失敗，這則改成馬上送：{e}", flush=True)
         return False
-    key = hashlib.sha1(json.dumps([target, card, text], sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
+    # 2026-11-01：預設收件人跟安排人員是同一個人時，同一則通知會從兩條路進來，只差卡片底部的「你名下的任務」統計
+    # （footer）→ 算重複的時候不看 footer
+    core = {k: v for k, v in card.items() if k != "footer"} if isinstance(card, dict) else card
+    key = hashlib.sha1(json.dumps([target, core, text], sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()[:16]
     with _LINE_DIGEST_LOCK:
         if any(x.get("k") == key for x in LINE_DIGEST["items"]):
             return True      # 同一則通知重複進來，只留一則
@@ -6793,19 +6796,66 @@ def _text_to_card(text):
     return _card("📝 通知", "#6B7280", head[:60], note="\n".join(lines[1:])[:900] if len(lines) > 1 else "")
 
 
+def _digest_dedupe_cards(cards):
+    """完全一樣的卡片（不看 footer）只留一張。"""
+    seen, out = set(), []
+    for c in cards:
+        k = json.dumps({a: b for a, b in c.items() if a != "footer"}, sort_keys=True, ensure_ascii=False, default=str)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
+def _digest_merge_ack_cards(cards):
+    """2026-11-01：一天裡好幾張「✅ 廠商已確認行程」（每筆、每次一鍵確認各一張）合成一張，列出所有確認的行程。"""
+    idx = [i for i, c in enumerate(cards) if str(c.get("tag") or "").startswith("✅ 廠商已確認行程")]
+    if len(idx) < 2:
+        return cards
+    lines, vendors, bys = [], [], []
+    for i in idx:
+        c = cards[i]
+        rows = {k: v for k, v in (c.get("rows") or [])}
+        for key, bucket in (("廠商", vendors), ("確認人", bys)):
+            v = str(rows.get(key) or "").strip()
+            if v and v not in bucket:
+                bucket.append(v)
+        secs = c.get("sections") or []
+        if secs:   # 廠商一鍵確認多筆的彙整卡：每行已經是「時間｜案件（項目）」
+            for _, ls in secs:
+                lines += [str(x[0] if isinstance(x, (tuple, list)) else x) for x in ls]
+        else:
+            lines.append(f"{rows.get('時間', '')}｜{c.get('title', '')}（{rows.get('項目', '')}）")
+    lines = list(dict.fromkeys(x for x in lines if x.strip()))
+    names = [b for b in bys if "沒填" not in b]
+    merged = _card("✅ 廠商已確認行程", "#16A34A", f"共 {len(lines)} 筆",
+                   rows=[("廠商", "、".join(vendors)), ("確認人", "、".join(names) or "（沒填名字）")],
+                   sections=[("確認的行程", lines)])
+    out = []
+    for i, c in enumerate(cards):
+        if i == idx[0]:
+            out.append(merged)
+        elif i not in idx:
+            out.append(c)
+    return out
+
+
 def _digest_messages(items):
-    """一個人的所有通知 → 一個 LINE 訊息物件（單一通知就直接是那張卡片；多則是輪播：摘要＋原卡片）。"""
-    cards = [it.get("card") or _text_to_card(it.get("text")) for it in items]
+    """一個人的所有通知 → 一個 LINE 訊息物件（單一通知就直接是那張卡片；多則是輪播：摘要＋原卡片）。
+    2026-11-01：先去重、同類「廠商已確認行程」合成一張；每張卡片標題標編號（1/N），摘要的每一行對應同一個編號。"""
+    cards = _digest_merge_ack_cards(_digest_dedupe_cards([it.get("card") or _text_to_card(it.get("text")) for it in items]))
     n = len(cards)
     titles = [(re.sub(r"[｜|].*$", "", c["tag"]).strip() + " " + c["title"]).strip() for c in cards]
     if n == 1:
         c = cards[0]
         alt = (c["tag"] + "：" + c["title"])[:390]
         return {"type": "flex", "altText": alt, "contents": _card_to_flex(c)}, cards
-    note = f"另外 {n - LINE_DIGEST_MAX_BUBBLES} 則請到主控台查看" if n > LINE_DIGEST_MAX_BUBBLES else "左右滑動看每一則的詳細內容"
+    note = f"另外 {n - LINE_DIGEST_MAX_BUBBLES} 則請到主控台查看" if n > LINE_DIGEST_MAX_BUBBLES else "左右滑動看每一則的詳細內容；每張卡片標題有編號，對應上面摘要的編號"
     summary = _card("📬 今日 LINE 通知彙整", "#0F766E", f"共 {n} 則", subtitle="一天只傳一次，所有通知都整理在這裡",
-                    sections=[("摘要", [f"• {t}" for t in titles[:30]])], note=note)
-    bubbles = [_card_to_flex(summary)] + [_card_to_flex(c) for c in cards[:LINE_DIGEST_MAX_BUBBLES]]
+                    sections=[("摘要", [f"{i}. {t}" for i, t in enumerate(titles[:30], 1)])], note=note)
+    numbered = [dict(c, tag=f"{c['tag']}　（{i}/{n}）") for i, c in enumerate(cards[:LINE_DIGEST_MAX_BUBBLES], 1)]
+    bubbles = [_card_to_flex(summary)] + [_card_to_flex(c) for c in numbered]
     alt = (f"📬 今日通知彙整（{n} 則）：" + "；".join(titles))[:390]
     return {"type": "flex", "altText": alt, "contents": {"type": "carousel", "contents": bubbles}}, cards
 
