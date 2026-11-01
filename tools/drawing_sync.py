@@ -257,6 +257,34 @@ def reparse_unread(limit):
     log(f"重讀完成：成功 {ok}、失敗 {fail}" + (f"，還有 {len(todo) - limit} 份下次再讀" if len(todo) > limit else ""))
 
 
+def shrink_pdf(data, limit=4_800_000):
+    """PDF 裡的圖片太大 → 在本機逐級縮小再傳。系統送審圖、設計圖常常只有 5 頁卻 20MB+（單張圖上億像素），
+    「只存前 6 頁」等於整份，而主控台只有 512MB，自己縮會 502（2026-11-01 宜28 系統送審圖 24MB 踩到）。"""
+    import io
+    import warnings
+    from pypdf import PdfReader, PdfWriter
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    warnings.simplefilter("ignore")
+    best = data
+    for side, q in ((3000, 70), (2400, 70), (1800, 70), (1500, 65), (1200, 60), (1000, 55)):
+        w = PdfWriter(clone_from=PdfReader(io.BytesIO(data)))
+        for page in w.pages:
+            for img in page.images:
+                try:
+                    im = img.image.convert("RGB")
+                    im.thumbnail((side, side))
+                    img.replace(im, quality=q)
+                except Exception:
+                    pass
+        buf = io.BytesIO()
+        w.write(buf)
+        best = buf.getvalue()
+        if len(best) <= limit:
+            return best
+    return best
+
+
 def image_bytes(path, limit=4_800_000):
     """串併圖是 JPG／PNG：5MB 內原檔直接傳；太大的用 Pillow 縮成 JPEG（Airtable 附件單檔上限 5MB）。"""
     with open(path, "rb") as f:
@@ -419,6 +447,14 @@ def main():
                     if data_bytes is None and size > MAX_BYTES:
                         too_big.append((case_no, kind, fn, round(size / 1048576, 1)))
                         continue
+                if (data_bytes is not None and len(data_bytes) > TRIM_BYTES and not is_img
+                        and kind not in CONTRACT_KINDS and not args.dry_run):   # 契約要 OCR，不縮；圖面／節點文件縮到 5MB 內
+                    try:
+                        before = len(data_bytes)
+                        data_bytes = shrink_pdf(data_bytes)
+                        log(f"    （{fn} 圖片太大，本機縮小 {round(before / 1048576, 1)}MB → {round(len(data_bytes) / 1048576, 1)}MB）")
+                    except Exception as e:
+                        log(f"  ✗ {case_no} {kind}：{fn} 縮小 PDF 失敗：{e}")
                 if args.dry_run:
                     log(f"  ＋ {case_no} {kind}：{fn}（{round(size / 1024)}KB）")
                     up += 1
