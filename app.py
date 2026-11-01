@@ -8918,6 +8918,32 @@ def md_add():
     return jsonify({"ok": True, "created": created, "skipped": skipped, "rep": rep})
 
 
+MD_CLOSED_STATUS = {"結案", "撤案", "封存", "預計撤案", "已結案待歸檔"}
+
+
+@app.route("/api/missing-docs/cases", methods=["GET"])
+def md_cases():
+    """某廠商目前進行中的案件（給缺件追蹤「先選廠商、再選案場」用），每筆附上負責業務。?vendor=三創"""
+    vendor = (request.args.get("vendor") or "").strip()
+    try:
+        cases = _pdf_case_ref()
+    except Exception as e:
+        return jsonify({"error": str(e), "cases": []}), 502
+    out = []
+    for c in cases:
+        if vendor and c["vendor"] != vendor:
+            continue
+        if c["closed"] in MD_CLOSED_STATUS or not c["case_no"]:
+            continue
+        out.append({"case_no": c["case_no"], "alias": c["alias"], "vendor": c["vendor"],
+                    "rep": _canon_rep(_rep_for_case(c["case_no"]))})
+    def natural(c):
+        m = _re.match(r"^(.*?)(\d+)號?$", c["case_no"])
+        return (m.group(1), int(m.group(2))) if m else (c["case_no"], 0)
+    out.sort(key=natural)
+    return jsonify({"cases": out})
+
+
 @app.route("/api/missing-docs/<rec_id>", methods=["PATCH"])
 def md_update(rec_id):
     """body 可帶 status / note / rep / provider / doc_type / confirm(true=今天確認過)。"""
