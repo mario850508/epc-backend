@@ -270,3 +270,11 @@ eparse_full.log。
 - 做法:`LINE_DIGEST["cfg"]["only_me"]`(預設 True,存在「系統狀態」彙整設定裡)。`_line_hold_others(target, immediate)`:自動推播(非 immediate、非 `_push_now`)給「U 開頭、不是預設收件人」的人 → `_line_push_card/_line_push_text` 直接回 (False, 測試期…),不排進彙整、不送 LINE;Slack 照送(`_notify_scheduler_one`/`_push_to_name` 本來就分開送 Slack)。不受影響:預設收件人本人、群組(C/R)、馬上送的(採購司機資訊、PM 按按鈕通知業務)。
 - 開放給其他人:`POST /api/line/digest {"only_me": false}`(Authorization 登入後,或主控台帶登入的 fetch)。GET /api/line/digest 的 cfg 看得到目前狀態。
 - 後續(使用者確認通知 OK 後才做):依廠商分北/中/南三位 PM 路由通知(對照見記憶 project_vendor_pm_regions:北=使用者、中=李宇哲、南=顏敏萱)。
+
+
+## 缺件追蹤 (2026-11-01)
+- Airtable 新表「缺件追蹤」`tblz6bah3ijXSrZzZ`（欄位全是文字/日期，沒有 Single Select，不用手動加選項）。後端 app.py 在 `/api/ops-cases` 前面：`/api/missing-docs` GET/POST、`/<id>` PATCH/DELETE、`/confirm`（批次標本週已確認）、`/notice?rep=`（預覽訊息）、`/notify`（真的推播，走 `_push_to_name` LINE+Slack，成功才記最後通知日/次數）。
+- 業務沒填時用 `_canon_rep(_rep_for_case(case_no))` 自動帶；「誰提供」依類型預設：竣工圖/使用執照=業務助理、保固書/出場=Mario（不進通知業務的訊息）、其他=業務。
+- 每週確認：最後確認日（沒有就建立日）距今>=7 天算「該確認」。前端 epc-dashboard/missing-docs.js。
+
+- 2026-11-02：「一起通知廠商」卡片改成可左右滑的兩張（LINE carousel）：① 依工項分類（原樣）、② 依日期時間排序（每筆標出工項）。只有一種工項或只有 1 筆時維持單張；內容超過 LINE 50KB 上限（約 20 筆以上）自動退回單張依工項。LINE 卡片無法在同一張卡片內『點選切換』（沒有狀態），所以用滑動切換。使用者要求先測試、不發到群組。
