@@ -9396,8 +9396,14 @@ def procurement_drawings_sync():
         data = base64.b64decode(body.get("data") or "")
     except Exception:
         return jsonify({"error": "檔案內容不是 base64"}), 400
-    if not data.startswith(b"%PDF"):
+    is_img = data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(b"%PDF") and not (is_img and kind in NODE_DOC_KINDS):   # 圖檔只收請款節點文件（串併圖）
         return jsonify({"error": "不是 PDF"}), 400
+    if is_img and len(data) > PDF_MAX_BYTES:   # 圖檔太大 → 縮成 JPEG 放得進 Airtable 附件（5MB）
+        try:
+            data = _img_shrink(data)
+        except Exception as e:
+            return jsonify({"error": f"圖檔太大且縮小失敗：{e}"}), 413
     if len(data) > PDF_UPLOAD_MAX_BYTES:
         return jsonify({"error": "超過 30MB"}), 413
     filename = (body.get("filename") or f"{case_no}_{kind}.pdf")[:200]
@@ -9431,7 +9437,8 @@ def procurement_drawings_sync():
         rid = resp.json()["id"]
         if store is not None:
             try:
-                upload_attachment_to_ops_record(rid, DRAWING_F["file"], base64.b64encode(store).decode(), filename, content_type="application/pdf")
+                upload_attachment_to_ops_record(rid, DRAWING_F["file"], base64.b64encode(store).decode(), filename,
+                                                content_type=("image/png" if data[:4] == b"\x89PNG" else "image/jpeg") if is_img else "application/pdf")
             except Exception:
                 requests.delete(f"{DRAWING_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
                 raise
@@ -9443,6 +9450,25 @@ def procurement_drawings_sync():
         return jsonify({"ok": True, "id": rid, "replaced": len(old), "parsing": bool(parse and not local_read), "local_read": local_read, "note": note})
     except Exception as e:
         return jsonify({"error": str(e)[:300]}), 502
+
+
+def _img_shrink(data, limit=None):
+    """圖檔縮成 JPEG，直到放得進 Airtable 附件（單檔 5MB）。"""
+    from PIL import Image
+    limit = limit or (PDF_MAX_BYTES - 200 * 1024)
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    scale, q, out = 1.0, 85, data
+    for _ in range(8):
+        w, h = im.size
+        im2 = im if scale == 1.0 else im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = io.BytesIO()
+        im2.save(buf, "JPEG", quality=q, optimize=True)
+        out = buf.getvalue()
+        if len(out) <= limit:
+            return out
+        scale *= 0.8
+        q = max(60, q - 5)
+    return out
 
 
 def _drawing_fields_from_text(kind, text, note=""):
@@ -15073,15 +15099,16 @@ INV_OTHER = "其他"
 INV_ALL_NODES = INV_NODES + (INV_OTHER,)
 # 每期要有的文件。ms＝進度管理里程碑類型（有完成日期就算有）、pdf＝PDF 公文更名的函文類型、
 # draw＝案場圖面的類型、id＝專案細節的編號欄位（有填就算有）、done＝里程碑還要是「已完成」（掛表，使用者 2026-10-28 指定）、
+# date_only＝本來就只有 Airtable 日期、沒有檔案（進場屋主預約、掛表）：打包缺檔清單不列，除非 Airtable 沒有日期（2026-11-01）、
 # ops＝維運驗收要「合格」
 INV_REQS = {
     "簽約款": [{"label": "工程合約", "ms": ["工程合約簽約"], "pdf": ["工程合約"], "draw": ["工程合約"], "id": "合約編號"}],
     "同意備案款": [{"label": "同意備案函", "ms": ["同意備案"], "pdf": ["同意備案"], "draw": ["同意備案"], "id": "同意備案編號"}],
     "材料訂購款": [{"label": "支架拆圖", "ms": ["支架拆圖"], "pdf": ["支架拆圖"], "draw": ["支架拆圖"]},
                 {"label": "系統送審圖", "ms": ["系統送審圖"], "pdf": ["系統送審圖"], "draw": ["系統送審圖"]}],
-    "工班進場款": [{"label": "進場屋主預約時間", "ms": ["進場屋主預約"]},
+    "工班進場款": [{"label": "進場屋主預約時間", "ms": ["進場屋主預約"], "date_only": True},
                 {"label": "串併圖", "ms": ["串並圖"], "pdf": ["串併圖"], "draw": ["串併圖"]}],
-    "掛錶驗收款": [{"label": "掛表（Airtable 掛表日期＋已完成）", "ms": ["掛表"], "done": True, "draw": ["併聯試運轉函"]},
+    "掛錶驗收款": [{"label": "掛表（Airtable 掛表日期＋已完成）", "ms": ["掛表"], "done": True, "date_only": True},
                 {"label": "驗收單（驗收合格）", "ops": True}],
     "設備登記款": [{"label": "設備登記函／設備移轉函", "ms": ["設備登記", "移轉設備"], "pdf": ["設備登記", "設備登記移轉"], "draw": ["設備登記"], "id": "設備登記編號"}],
     "正式售電款": [{"label": "正式售電函", "ms": ["正式售電函"], "pdf": ["正式售電函"], "draw": ["正式售電函"]}],
@@ -16307,8 +16334,16 @@ def _inv_build_docs_zip(job, z, ids):
     invs = _inv_zip_fetch(ids, ("invoice_no", "case_no", "nodes", "file", "vendor", "manual"))
     job["total"] = len(invs)
     clean = lambda n: re.sub(r'[\\/:*?"<>|]', "_", n or "").strip() or "未命名"
-    used, files_cache = set(), {}
+    used, files_cache, docs_cache = set(), {}, {}
     missing = job["missing"]
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+
+    def chk_of(case_no, req):
+        """這項文件在 Airtable／維運驗收的狀況（跟函文檢查同一套）；每案只查一次資料。"""
+        if case_no not in docs_cache:
+            case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
+            docs_cache[case_no] = _inv_case_docs(case) if case else {"ms": {}, "pdf": {}, "draw": {}, "ids": {}, "ops": []}
+        return _inv_check_req(req, docs_cache[case_no], today)
 
     def one(r):
         f = r["fields"]
@@ -16329,6 +16364,11 @@ def _inv_build_docs_zip(job, z, ids):
         have = files_cache[case_no]
         for node in nodes:
             for req in INV_REQS[node]:
+                if req.get("date_only"):   # 只看 Airtable 日期：有日期（掛表還要已完成）就不用列，沒有才列
+                    chk = chk_of(case_no, req)
+                    if not chk["ok"]:
+                        missing.append(f"{case_no}｜{node}｜{req['label']}：Airtable " + ("；".join(chk["pending"]) or "還沒有日期"))
+                    continue
                 got = []
                 for t in req.get("pdf") or []:
                     got += [x for x in have.get(("pdf", t), []) if not (t == ENG_KIND and _is_upstream_contract(x[0]))]
@@ -16349,7 +16389,12 @@ def _inv_build_docs_zip(job, z, ids):
                     if pe:
                         missing.append(f"{case_no}｜{node}｜{req['label']}：補件中，承諾 {pe.get('due', '')} 前補齊" + (f"（{pe['note']}）" if pe.get("note") else ""))
                         continue
-                    why = "Airtable 只有日期、沒有檔案" if (req.get("ms") and not (req.get("pdf") or req.get("draw") or req.get("ops"))) else "主控台找不到檔案"
+                    if req.get("ops"):   # 驗收單：看維運驗收是不是已經合格，講清楚缺的是什麼
+                        chk = chk_of(case_no, req)
+                        why = ("維運驗收已合格，但還沒產生驗收單 PDF（維運團隊產生後再打包）" if chk["ok"]
+                               else "驗收單還不是合格：" + ("；".join(chk["pending"]) or "維運驗收沒有這案的驗收單"))
+                    else:
+                        why = "主控台找不到檔案"
                     missing.append(f"{case_no}｜{node}｜{req['label']}：{why}")
                     continue
                 seen = set()

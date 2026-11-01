@@ -53,9 +53,11 @@ CONTRACT_KINDS = ("台電契約", "細部協商", "換文修約", "工程合約"
 NODE_DOC_KINDS = [("同意備案", "6", ("同意備案",), ("補件", "變更", "展延", "廢止", "撤銷")),
                   ("設備登記", "6", ("設備登記",), ("移轉", "補件")),
                   ("正式售電函", "6", ("正式售電",), ()),
-                  ("併聯試運轉函", "6", ("併聯試運轉",), ()),
+                  ("系統送審圖", "4", ("系統送審圖",), ()),   # --contracts-only 不含系統送審圖，發票請款的材料訂購款要用
                   ("支架拆圖", "4", ("支架拆圖",), ()),
                   ("串併圖", "4", ("串併圖", "串並圖"), ())]
+# 串併圖在 G 槽多半是 JPG（例：桃87_20260616_串併圖.jpg），只認 PDF 的話一份都抓不到（2026-11-01）
+IMG_OK_KINDS = {"串併圖": (".pdf", ".jpg", ".jpeg", ".png")}
 
 
 try:
@@ -255,7 +257,30 @@ def reparse_unread(limit):
     log(f"重讀完成：成功 {ok}、失敗 {fail}" + (f"，還有 {len(todo) - limit} 份下次再讀" if len(todo) > limit else ""))
 
 
-def pick_latest(case_dirs, cat, keywords, excludes=()):
+def image_bytes(path, limit=4_800_000):
+    """串併圖是 JPG／PNG：5MB 內原檔直接傳；太大的用 Pillow 縮成 JPEG（Airtable 附件單檔上限 5MB）。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) <= limit:
+        return raw
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(raw)).convert("RGB")
+    scale, q, out = 1.0, 85, raw
+    for _ in range(8):
+        w, h = im.size
+        im2 = im if scale == 1.0 else im.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = io.BytesIO()
+        im2.save(buf, "JPEG", quality=q, optimize=True)
+        out = buf.getvalue()
+        if len(out) <= limit:
+            return out
+        scale *= 0.8
+        q = max(60, q - 5)
+    return out
+
+
+def pick_latest(case_dirs, cat, keywords, excludes=(), exts=(".pdf",)):
     """案場資料夾（同一案可能有好幾個：地區資料夾、買賣合約相關、撤案案件…，2026-10-25 起合併看）底下，
     檔名含 keywords 其中之一（且不含 excludes）的 PDF，選檔名日期（沒有就用修改時間）最新的一份。"""
     if isinstance(case_dirs, str):
@@ -273,7 +298,7 @@ def pick_latest(case_dirs, cat, keywords, excludes=()):
     for folder in folders:
         for fn in os.listdir(folder):
             if (any(k in fn for k in keywords) and not any(x in fn for x in excludes)
-                    and fn.lower().endswith(".pdf") and not fn.startswith("~")):
+                    and fn.lower().endswith(tuple(exts)) and not fn.startswith("~")):
                 p = os.path.join(folder, fn)
                 dm = DATE_RE.search(fn)
                 doc_date = "-".join(dm.groups()) if dm else ""
@@ -352,10 +377,11 @@ def main():
                 continue
             if args.open_orders and case_no not in only:
                 continue
-            case_kinds = kinds + (NODE_DOC_KINDS if (case_no in inv_cases or args.case) else [])
+            have_kinds = {k[0] for k in kinds}
+            case_kinds = kinds + ([k for k in NODE_DOC_KINDS if k[0] not in have_kinds] if (case_no in inv_cases or args.case) else [])
             for kind, cat, kw, ex in case_kinds:
                 try:
-                    best = pick_latest(case_dir, cat, kw, ex)
+                    best = pick_latest(case_dir, cat, kw, ex, exts=IMG_OK_KINDS.get(kind, (".pdf",)))
                 except OSError as e:
                     log(f"  ✗ {case_no} {kind} 讀資料夾失敗：{e}")
                     failed.append((case_no, kind, "", f"讀資料夾失敗：{e}"))
@@ -375,8 +401,17 @@ def main():
                 if old and old.get("filename") == fn and (old.get("mtime") == mt or old.get("size_kb") == round(size / 1024)):
                     skip += 1
                     continue
+                is_img = not fn.lower().endswith(".pdf")
                 data_bytes = None
-                if size > TRIM_BYTES and not args.dry_run:
+                if is_img and not args.dry_run:
+                    try:
+                        data_bytes = image_bytes(path)
+                    except Exception as e:
+                        log(f"  ✗ {case_no} {kind}：{fn} 讀圖失敗：{e}")
+                        failed.append((case_no, kind, fn, f"讀圖失敗：{e}"))
+                        fail += 1
+                        continue
+                elif size > TRIM_BYTES and not args.dry_run:
                     try:
                         data_bytes = first_pages(path)
                     except Exception as e:
@@ -404,7 +439,7 @@ def main():
                         try:
                             r = api("POST", "/api/procurement/drawings/sync", timeout=300, json={
                                 "case_no": case_no, "kind": kind, "filename": fn, "doc_date": doc_date, "src_path": path, "mtime": mt,
-                                "orig_size": size, "trimmed": len(data_bytes) < size, "data": data, **extra})
+                                "orig_size": size, "trimmed": len(data_bytes) < size and not is_img, "data": data, **extra})
                             if r.status_code >= 400:
                                 raise Exception(f"HTTP {r.status_code} {r.text[:200]}")
                             break
