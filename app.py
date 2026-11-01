@@ -6680,7 +6680,7 @@ def _line_note_result(status_code, text=""):
 # 採購司機資訊（時間敏感，自己合併成一則）。要關掉彙整：POST /api/line/digest {"enabled": false}。
 # ===================================================================
 LINE_DIGEST_STATE_KEY = "line_digest_state"
-LINE_DIGEST = {"loaded": False, "cfg": {"enabled": True, "time": "12:30"}, "items": [], "sent_on": {}, "done_date": "",
+LINE_DIGEST = {"loaded": False, "cfg": {"enabled": True, "time": "12:30", "only_me": True}, "items": [], "sent_on": {}, "done_date": "",
                "attempts": 0, "last_flush": None, "last_result": None}
 _LINE_DIGEST_LOCK = threading.RLock()
 _LINE_DIGEST_SAVE = {"timer": None}
@@ -6718,6 +6718,8 @@ def _digest_load():
             LINE_DIGEST["cfg"]["enabled"] = cfg["enabled"]
         if re.fullmatch(r"\d{1,2}:\d{2}", str(cfg.get("time") or "")):
             LINE_DIGEST["cfg"]["time"] = cfg["time"]
+        if isinstance(cfg.get("only_me"), bool):
+            LINE_DIGEST["cfg"]["only_me"] = cfg["only_me"]
         LINE_DIGEST["items"] = list(data.get("items") or [])
         LINE_DIGEST["sent_on"] = dict(data.get("sent_on") or {})
         LINE_DIGEST["done_date"] = data.get("done_date") or ""
@@ -6758,6 +6760,23 @@ def _digest_enabled():
 def _digest_time_minutes():
     h, m = str(LINE_DIGEST["cfg"].get("time") or "12:30").split(":")
     return max(LINE_DIGEST_MIN_TIME, int(h) * 60 + int(m))
+
+
+def _line_hold_others(target, immediate=False):
+    """2026-11-01：LINE 免費額度每月 200 則，通知功能確認沒問題前，自動推播（每日彙整那一類）只送給預設收件人（使用者本人），
+    其他人（別的 PM／業務／安排人員）的 LINE 先不送——他們有綁 Slack 的照常收 Slack。
+    不影響：群組、馬上送的（採購司機資訊、PM 按按鈕通知業務）。關掉：POST /api/line/digest {"only_me": false}。"""
+    if immediate or getattr(_PUSH_CTX, "now", False):
+        return False
+    if not target or target[:1] != "U":
+        return False
+    try:
+        _digest_load()
+    except Exception:
+        pass
+    if not LINE_DIGEST["cfg"].get("only_me", True):
+        return False
+    return target != _line_config()[1]
 
 
 def _digest_should_queue(target, immediate):
@@ -6979,6 +6998,8 @@ def _slack_notify_default(payload):
 def _line_push_text(text, to=None, immediate=False, slack=True):
     token, default_target = _line_config()
     target = to or default_target
+    if to and _line_hold_others(to, immediate):
+        return False, "測試期：LINE 只推給預設收件人（其他人先走 Slack）"
     if to is None and slack:
         _slack_notify_default(text)    # 沒指定收件人＝「給你」的通知：同步到你的 Slack（Slack 沒有額度問題）
     if not token or not target:
@@ -7091,6 +7112,8 @@ def _card_plain_text(card):
 def _line_push_card(card, to=None, immediate=False, slack=True):
     token, default_target = _line_config()
     target = to or default_target
+    if to and _line_hold_others(to, immediate):
+        return False, "測試期：LINE 只推給預設收件人（其他人先走 Slack）"
     if to is None and slack:
         _slack_notify_default(card)
     if not token or not target:
@@ -8471,6 +8494,8 @@ def line_digest_api():
         with _LINE_DIGEST_LOCK:
             if isinstance(body.get("enabled"), bool):
                 LINE_DIGEST["cfg"]["enabled"] = body["enabled"]
+            if isinstance(body.get("only_me"), bool):
+                LINE_DIGEST["cfg"]["only_me"] = body["only_me"]
             if "time" in body:
                 t = str(body["time"]).strip()
                 m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)

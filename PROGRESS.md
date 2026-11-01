@@ -264,3 +264,9 @@ eparse_full.log。
 - 現象(11/1 額度重置後第一次收到彙整):「廠商已確認行程」同一則出現兩張(只差底部「你名下的任務」),輪播很長、不知道為什麼這麼多張。原因:預設收件人跟安排人員是同一人,同一通知從兩條路進佇列,`_digest_enqueue` 的去重鍵包含 footer,所以判成不同則。
 - 修正(app.py):(1) `_digest_enqueue` 去重鍵不看 footer;(2) `_digest_messages` 組輪播前再去重(`_digest_dedupe_cards`)、同一天多張「✅ 廠商已確認行程」合成一張列出全部行程(`_digest_merge_ack_cards`);(3) 每張卡片標題加編號(i/N),摘要每行也有對應編號,note 說明。本機用 8 則含重複的樣本測:輪播 8→3 張+摘要。
 - LINE 額度:彙整=一個 flex carousel 訊息物件,每人每天只算 1 則(不論幾張卡片,上限 12 張=摘要+11)。
+
+## 2026-11-01 測試期:LINE 只推給預設收件人(使用者),其他人只走 Slack
+- 原因:LINE 免費額度每月 200 則;每日彙整/通知功能使用者要先自己確認 1~2 天沒問題,才開放給其他窗口。
+- 做法:`LINE_DIGEST["cfg"]["only_me"]`(預設 True,存在「系統狀態」彙整設定裡)。`_line_hold_others(target, immediate)`:自動推播(非 immediate、非 `_push_now`)給「U 開頭、不是預設收件人」的人 → `_line_push_card/_line_push_text` 直接回 (False, 測試期…),不排進彙整、不送 LINE;Slack 照送(`_notify_scheduler_one`/`_push_to_name` 本來就分開送 Slack)。不受影響:預設收件人本人、群組(C/R)、馬上送的(採購司機資訊、PM 按按鈕通知業務)。
+- 開放給其他人:`POST /api/line/digest {"only_me": false}`(Authorization 登入後,或主控台帶登入的 fetch)。GET /api/line/digest 的 cfg 看得到目前狀態。
+- 後續(使用者確認通知 OK 後才做):依廠商分北/中/南三位 PM 路由通知(對照見記憶 project_vendor_pm_regions)。
