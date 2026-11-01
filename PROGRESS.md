@@ -269,4 +269,4 @@ eparse_full.log。
 - 原因:LINE 免費額度每月 200 則;每日彙整/通知功能使用者要先自己確認 1~2 天沒問題,才開放給其他窗口。
 - 做法:`LINE_DIGEST["cfg"]["only_me"]`(預設 True,存在「系統狀態」彙整設定裡)。`_line_hold_others(target, immediate)`:自動推播(非 immediate、非 `_push_now`)給「U 開頭、不是預設收件人」的人 → `_line_push_card/_line_push_text` 直接回 (False, 測試期…),不排進彙整、不送 LINE;Slack 照送(`_notify_scheduler_one`/`_push_to_name` 本來就分開送 Slack)。不受影響:預設收件人本人、群組(C/R)、馬上送的(採購司機資訊、PM 按按鈕通知業務)。
 - 開放給其他人:`POST /api/line/digest {"only_me": false}`(Authorization 登入後,或主控台帶登入的 fetch)。GET /api/line/digest 的 cfg 看得到目前狀態。
-- 後續(使用者確認通知 OK 後才做):依廠商分北/中/南三位 PM 路由通知(對照見記憶 project_vendor_pm_regions)。
+- 後續(使用者確認通知 OK 後才做):依廠商分北/中/南三位 PM 路由通知(對照見記憶 project_vendor_pm_regions:北=使用者、中=李宇哲、南=顏敏萱)。
