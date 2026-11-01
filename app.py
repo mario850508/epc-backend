@@ -8824,6 +8824,216 @@ def _ops_record_to_dict(rec, full=False):
     return result
 
 
+# ===================================================================
+# 缺件追蹤（2026-11-01）：廠商要求補的案場文件（竣工圖／使用執照／電費單／監控／
+# 出場保固書…）記錄在 Airtable「缺件追蹤」表，每週確認一次拿到沒，並可一鍵把
+# 「某位業務名下還缺的資料」整理成一則訊息推播給他（走既有的業務 LINE／Slack 綁定）。
+# ===================================================================
+MD_TABLE_ID = "tblz6bah3ijXSrZzZ"
+MD_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/{MD_TABLE_ID}"
+MD_F = {
+    "alias": "fldJsSAzzOeiTo0wY", "case_no": "fldXgEG4Nd0XwTU5g", "vendor": "fldTVvQeoCP1FguBP",
+    "doc_type": "fldZM5worq7NFAPEl", "note": "fldmK7IS3AIpsnxpe", "rep": "fldPN0QGQN4EHRKmd",
+    "provider": "fld61thfg3BhdkD5A", "status": "fld0BWszqHASi1p8u", "created": "fldrthxYsx6PO4Efh",
+    "confirmed": "fldSeCVW1w4Flkv4R", "got": "fldLUmDsNHrw1Hrj8", "notified": "fldGIqa2OxbwU2MHx",
+    "notify_count": "fldGWKyrcc9H0afA1",
+}
+MD_STATUS_MISSING, MD_STATUS_GOT = "缺件", "已取得"
+MD_PROVIDER_MARIO = "Mario"   # 這類資料由 Mario 自己提供（例如出場保固書），不會寫進通知業務的訊息
+
+
+def _md_today():
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _md_to_dict(r):
+    f = r["fields"]
+
+    def g(k):
+        return f.get(MD_F[k])
+
+    return {
+        "id": r["id"], "alias": g("alias") or "", "case_no": g("case_no") or "", "vendor": g("vendor") or "",
+        "doc_type": g("doc_type") or "", "note": g("note") or "", "rep": g("rep") or "",
+        "provider": g("provider") or "", "status": g("status") or MD_STATUS_MISSING,
+        "created": g("created") or "", "confirmed": g("confirmed") or "", "got": g("got") or "",
+        "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
+    }
+
+
+def _md_load(only_missing=False):
+    formula = f"{{{MD_F['status']}}}='{MD_STATUS_MISSING}'" if only_missing else "TRUE()"
+    recs = airtable_get_all(MD_API_URL, formula, list(MD_F.values()))
+    return [_md_to_dict(r) for r in recs]
+
+
+def _md_default_provider(doc_type):
+    if "竣工圖" in doc_type or "使用執照" in doc_type:
+        return "業務助理"
+    if "保固書" in doc_type or "出場" in doc_type:
+        return MD_PROVIDER_MARIO
+    return "業務"
+
+
+@app.route("/api/missing-docs", methods=["GET"])
+def md_list():
+    try:
+        items = _md_load()
+    except Exception as e:
+        return jsonify({"error": str(e), "items": []}), 502
+    return jsonify({"items": items, "today": _md_today()})
+
+
+@app.route("/api/missing-docs", methods=["POST"])
+def md_add():
+    """新增缺件。body: {case_no, alias, vendor, doc_types:[...], note, rep, provider}。
+    同案號＋同類型已經有「缺件」的不重複建立（回傳 skipped）。業務沒填就用 _rep_for_case 補。"""
+    body = request.get_json(force=True) or {}
+    case_no = (body.get("case_no") or "").strip()
+    alias = (body.get("alias") or "").strip()
+    types = [t.strip() for t in (body.get("doc_types") or []) if t and t.strip()]
+    if not (case_no or alias) or not types:
+        return jsonify({"error": "請選擇案場並至少勾一種缺件類型"}), 400
+    rep = _canon_rep((body.get("rep") or "").strip()) or (_canon_rep(_rep_for_case(case_no)) if case_no else "")
+    provider = (body.get("provider") or "").strip()
+    note = (body.get("note") or "").strip()
+    try:
+        existing = {(i["case_no"] or i["alias"], i["doc_type"]) for i in _md_load(only_missing=True)}
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    created, skipped = [], []
+    for t in types:
+        if ((case_no or alias), t) in existing:
+            skipped.append(t)
+            continue
+        fields = {MD_F["alias"]: alias or case_no, MD_F["case_no"]: case_no,
+                  MD_F["vendor"]: (body.get("vendor") or "").strip(),
+                  MD_F["doc_type"]: t, MD_F["note"]: note, MD_F["rep"]: rep,
+                  MD_F["provider"]: provider or _md_default_provider(t),
+                  MD_F["status"]: MD_STATUS_MISSING, MD_F["created"]: _md_today()}
+        resp = requests.post(MD_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text, "created": created}), 502
+        created.append(t)
+    return jsonify({"ok": True, "created": created, "skipped": skipped, "rep": rep})
+
+
+@app.route("/api/missing-docs/<rec_id>", methods=["PATCH"])
+def md_update(rec_id):
+    """body 可帶 status / note / rep / provider / doc_type / confirm(true=今天確認過)。"""
+    body = request.get_json(force=True) or {}
+    fields = {}
+    for key in ("note", "rep", "provider", "doc_type"):
+        if key in body:
+            fields[MD_F[key]] = (body.get(key) or "").strip()
+    if body.get("status") in (MD_STATUS_MISSING, MD_STATUS_GOT):
+        fields[MD_F["status"]] = body["status"]
+        fields[MD_F["got"]] = _md_today() if body["status"] == MD_STATUS_GOT else None
+        fields[MD_F["confirmed"]] = _md_today()
+    if body.get("confirm"):
+        fields[MD_F["confirmed"]] = _md_today()
+    if not fields:
+        return jsonify({"error": "沒有要更新的欄位"}), 400
+    resp = requests.patch(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/missing-docs/<rec_id>", methods=["DELETE"])
+def md_delete(rec_id):
+    resp = requests.delete(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), timeout=20)
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/missing-docs/confirm", methods=["POST"])
+def md_confirm_many():
+    """每週確認：把一批缺件標成「今天已確認」。body: {ids:[...]}。"""
+    ids = (request.get_json(force=True) or {}).get("ids") or []
+    today = _md_today()
+    done = 0
+    for i in range(0, len(ids), 10):
+        chunk = ids[i:i + 10]
+        resp = requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={
+            "records": [{"id": rid, "fields": {MD_F["confirmed"]: today}} for rid in chunk]})
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text, "done": done}), 502
+        done += len(chunk)
+    return jsonify({"ok": True, "done": done})
+
+
+def _md_build_message(rep, items):
+    """把一位業務名下還缺的資料整理成一則訊息（依案場分組）。"""
+    by_case = collections.OrderedDict()
+    for it in items:
+        by_case.setdefault(it["alias"] or it["case_no"], []).append(it)
+    lines = [f"【缺件提醒】{rep} 您好，以下案場廠商還缺資料，麻煩協助向屋主／相關單位取得後提供給我：", ""]
+    for name, its in by_case.items():
+        lines.append(f"▍{name}")
+        for it in its:
+            extra = f"（{it['note']}）" if it["note"] else ""
+            who = "（業務助理申請）" if it["provider"] == "業務助理" else ""
+            lines.append(f"　・{it['doc_type']}{extra}{who}")
+        lines.append("")
+    lines.append(f"共 {len(by_case)} 個案場、{len(items)} 項。資料拿到後請直接回覆我，謝謝！")
+    return "\n".join(lines)
+
+
+def _md_rep_items(rep, ids=None):
+    items = [i for i in _md_load(only_missing=True)
+             if i["rep"] == rep and i["provider"] != MD_PROVIDER_MARIO]
+    if ids:
+        wanted = set(ids)
+        items = [i for i in items if i["id"] in wanted]
+    return items
+
+
+@app.route("/api/missing-docs/notice", methods=["GET"])
+def md_notice_preview():
+    """預覽要傳給某位業務的訊息（不會送出）。?rep=名字"""
+    rep = (request.args.get("rep") or "").strip()
+    try:
+        items = _md_rep_items(rep)
+        bound = False
+        if rep:
+            try:
+                b = _get_binding(rep)
+                bound = bool(b["uid"] or b["slack"])
+            except Exception:
+                bound = False
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
+                    "text": _md_build_message(rep, items) if items else ""})
+
+
+@app.route("/api/missing-docs/notify", methods=["POST"])
+def md_notify():
+    """真的把缺件訊息推播給業務（前端預覽確認後才會呼叫）。body: {rep, ids?}。成功就記錄最後通知日／次數。"""
+    body = request.get_json(force=True) or {}
+    rep = (body.get("rep") or "").strip()
+    if not rep:
+        return jsonify({"error": "缺少業務名字"}), 400
+    try:
+        items = _md_rep_items(rep, body.get("ids"))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if not items:
+        return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
+    text = _md_build_message(rep, items)
+    sent = _push_to_name(rep, text)
+    if sent:
+        today = _md_today()
+        for i in range(0, len(items), 10):
+            chunk = items[i:i + 10]
+            requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+                {"id": it["id"], "fields": {MD_F["notified"]: today, MD_F["notify_count"]: (it["notify_count"] or 0) + 1}}
+                for it in chunk]})
+    return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
+
+
 @app.route("/api/ops-cases")
 def ops_cases():
     """維運團隊模組的案件清單。回傳所有「維運驗收」記錄的精簡資訊，前端可以
