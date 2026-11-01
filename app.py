@@ -8868,10 +8868,12 @@ def _md_load(only_missing=False):
 
 
 def _md_default_provider(doc_type):
-    if "竣工圖" in doc_type or "使用執照" in doc_type:
-        return "業務助理"
-    if "保固書" in doc_type or "出場" in doc_type:
+    """依缺件類型預設「誰提供」(使用者 2026-11-01 定的慣例,個案不同再手動改):
+    Mario 自己=使用分區證明/公證書/出場保固書;業務助理=竣工圖/使用執照(含附件)/房屋證明;其餘(電費單、身分證…)=業務。"""
+    if "使用分區" in doc_type or "公證書" in doc_type or "保固書" in doc_type or "出場" in doc_type:
         return MD_PROVIDER_MARIO
+    if "竣工圖" in doc_type or "使用執照" in doc_type or "房屋證明" in doc_type:
+        return "業務助理"
     return "業務"
 
 
