@@ -9131,6 +9131,9 @@ def _md_lines_by_case(items, show_rep=False):
             for it in its:
                 extra = f"（{it['note']}）" if it["note"] else ""
                 lines.append(f"　・{it['doc_type']}{extra}")
+            furl = _md_folder_url(its[0]["case_no"])   # 2026-11-02：文字版也附上傳資料夾連結（貼進個人 LINE 給業務用）
+            if furl:
+                lines.append(f"　📂 上傳：{furl}")
             lines.append("")
     return by_case, lines
 
