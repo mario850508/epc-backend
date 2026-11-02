@@ -9218,9 +9218,10 @@ def md_notify():
     成功就記錄最後通知日／次數。業務通知時，只有「不是業務助理申請」的項目記通知；業務助理申請的項目是同步知會，
     記錄留給通知業務助理時用。"""
     body = request.get_json(force=True) or {}
+    manual = bool(body.get("manual"))   # 2026-11-02：使用者自己複製文字貼給對方，系統只記「已通知」、不推播
     if body.get("role") == "assistant":
         to = (body.get("to") or "").strip()
-        if not to:
+        if not to and not manual:
             return jsonify({"error": "請先選要傳給誰（業務助理）"}), 400
         try:
             items = _md_assistant_items((body.get("vendor") or "").strip(), body.get("ids"))
@@ -9228,8 +9229,8 @@ def md_notify():
             return jsonify({"error": str(e)}), 502
         if not items:
             return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
-        text = _md_build_assistant_message(to, items)
-        sent = _push_to_name(to, text)
+        text = _md_build_assistant_message(to or "業務助理", items)
+        sent = True if manual else _push_to_name(to, text)
         if sent:
             _md_stamp_notified(items)
         return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
@@ -9243,7 +9244,7 @@ def md_notify():
     if not items:
         return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
     text = _md_build_message(rep, items)
-    sent = _push_to_name(rep, text)
+    sent = True if manual else _push_to_name(rep, text)
     if sent:
         _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
     return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
