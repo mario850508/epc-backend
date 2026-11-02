@@ -3265,10 +3265,11 @@ def site_survey_cancelled_sync():
            certified_cases: [{case, alias, vendor, sales_person}, ...],
            owner_contacts: [{case, name, phone}, ...]}"""
     body = request.get_json(force=True)
-    if not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY:
+    # 2026-11-02：本機觀測中心推資料夾連結用 X-Service-Key（SERVICE_KEY／BIZ_SHEET_SYNC_KEY 皆可），Apps Script 仍用 body.key
+    if not _auth_service_key_ok() and (not BIZ_SHEET_SYNC_KEY or body.get("key") != BIZ_SHEET_SYNC_KEY):
         return jsonify({"error": "unauthorized"}), 401
     if ("cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body
-            and any(isinstance(body.get(k), list) for k in ("case_reps", "case_addrs", "plant_coords", "case_contract_nos"))):
+            and any(isinstance(body.get(k), list) for k in ("case_reps", "case_addrs", "plant_coords", "case_contract_nos", "case_folders"))):
         # 部分推送（案件業務／地址／座標）：不碰取消／已公證／屋主資料（避免被當成空清單清掉）
         if isinstance(body.get("case_reps"), list):
             CASE_REP_CACHE.clear()
@@ -3286,6 +3287,11 @@ def site_survey_cancelled_sync():
             CASE_CONTRACT_CACHE.update({c["case"].strip(): c["no"].strip() for c in body["case_contract_nos"]
                                         if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("no") or "").strip()})
             PDF_CASE_REF["at"] = 0   # 案件比對資料重抓，帶入新的合約編號
+        if isinstance(body.get("case_folders"), list):   # [{case, id}]
+            if not merge:
+                CASE_FOLDER_CACHE.clear()
+            CASE_FOLDER_CACHE.update({c["case"].strip(): c["id"].strip() for c in body["case_folders"]
+                                      if isinstance(c, dict) and (c.get("case") or "").strip() and (c.get("id") or "").strip()})
         if isinstance(body.get("plant_coords"), list):
             if not merge:
                 BIZ_COORDS_CACHE.clear()
@@ -3294,7 +3300,7 @@ def site_survey_cancelled_sync():
         threading.Thread(target=_persist_biz_snapshots, daemon=True).start()
         return jsonify({"ok": True, "partial": True, "case_reps_count": len(CASE_REP_CACHE),
                         "case_addrs_count": len(CASE_ADDR_CACHE), "plant_coords_count": len(BIZ_COORDS_CACHE),
-                        "case_contract_nos_count": len(CASE_CONTRACT_CACHE)})
+                        "case_contract_nos_count": len(CASE_CONTRACT_CACHE), "case_folders_count": len(CASE_FOLDER_CACHE)})
     if "cancelled_case_numbers" not in body and "certified_cases" not in body and "owner_contacts" not in body:
         return jsonify({"error": "沒有可處理的欄位（完整推送至少要帶 cancelled_case_numbers／certified_cases／owner_contacts 其中之一）"}), 400
     case_nos = body.get("cancelled_case_numbers") or []
@@ -3377,6 +3383,7 @@ BIZ_COORDS_CACHE = {}
 # 已公證案件清單只有狀態＝已公證的，案件一進到「已簽約」就查不到業務了。
 CASE_REP_CACHE = {}
 CASE_CONTRACT_CACHE = {}   # 2026-10-28：業務自治區 A01資訊 B 欄「合約編號」（{案號: 合約編號}）。Airtable 專案細節沒填時用（發票請款／公文更名比對案場）
+CASE_FOLDER_CACHE = {}   # 2026-11-02：業務自治區「資料夾連結」分頁（{案號: Drive 資料夾 id}），缺件通知卡片的「上傳」按鈕用；本機觀測中心定時推送
 CASE_ADDR_CACHE = {}   # 2026-10-12：業務自治區 A01資訊「地址」欄（{案號: 地址}），Airtable 還沒有的案件用
 STATE_FIELD_LONG = "fld4BuR3sfKTkDvsi"   # 系統狀態「長值」（multilineText）
 _BIZ_SNAPSHOT_LOADED = {"done": False}
@@ -3431,6 +3438,7 @@ def _persist_biz_snapshots():
         "biz_case_reps": dict(CASE_REP_CACHE),
         "biz_case_addrs": dict(CASE_ADDR_CACHE),
         "biz_case_contract_nos": dict(CASE_CONTRACT_CACHE),
+        "biz_case_folders": dict(CASE_FOLDER_CACHE),
         "biz_owner_contacts": dict(OWNER_CONTACT_CACHE),
         "biz_certified_cases": list(CERTIFIED_CASE_CACHE.get("cases") or []),
         "biz_cancelled_cases": sorted(CANCELLED_CASE_CACHE.get("case_nos") or []),
@@ -3472,6 +3480,10 @@ def _ensure_biz_snapshots_loaded():
             raw = _state_get_chunked("biz_case_contract_nos")
             if raw:
                 CASE_CONTRACT_CACHE.update(json.loads(raw))
+        if not CASE_FOLDER_CACHE:
+            raw = _state_get_chunked("biz_case_folders")
+            if raw:
+                CASE_FOLDER_CACHE.update(json.loads(raw))
         if not OWNER_CONTACT_CACHE:
             raw = _state_get_chunked("biz_owner_contacts")
             if raw:
@@ -7152,11 +7164,12 @@ def _card_to_flex(card):
         contents.append({"type": "text", "text": heading, "size": "sm", "weight": "bold", "color": card["color"], "margin": "lg"})
         for ln in lines:
             if isinstance(ln, (tuple, list)):
-                text, uri = ln
+                text, uri = ln[0], ln[1]
+                label = ln[2] if len(ln) > 2 else "📤 發送"   # 第三個元素＝自訂按鈕文字（缺件通知用「📂 上傳」）
                 contents.append({"type": "box", "layout": "horizontal", "margin": "sm", "spacing": "sm", "alignItems": "center", "contents": [
                     {"type": "text", "text": text, "size": "sm", "wrap": True, "color": "#1B2333", "flex": 5},
                     {"type": "button", "style": "secondary", "height": "sm", "flex": 3,
-                     "action": {"type": "uri", "label": "📤 發送", "uri": uri}},
+                     "action": {"type": "uri", "label": label, "uri": uri}},
                 ]})
             else:
                 contents.append({"type": "text", "text": ln, "size": "sm", "wrap": True, "margin": "xs", "color": "#1B2333"})
@@ -8069,7 +8082,7 @@ def _card_to_slack(card):
     for i in range(0, len(rows), 10):
         blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"[:2000]} for k, v in rows[i:i + 10]]})
     for heading, lines in card.get("sections") or []:
-        body = "\n".join(x[0] if isinstance(x, (tuple, list)) else x for x in lines)
+        body = "\n".join((x[0] + (f"  <{x[1]}|{x[2]}>" if len(x) > 2 and str(x[1]).startswith("http") else "")) if isinstance(x, (tuple, list)) else x for x in lines)
         if "可複製" in heading:   # 要複製貼給屋主的訊息：放進程式碼區塊，Slack 上有「複製」按鈕、換行也不會跑掉
             body = "```" + body.replace("```", "’’’") + "```"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body}"[:3000]}})
@@ -9143,6 +9156,86 @@ def _md_build_message(rep, items):
     return "\n".join(out)
 
 
+def _md_folder_url(case_no):
+    """業務自治區「資料夾連結」→ Drive 資料夾網址（本機觀測中心定時推送；沒有就回空字串）。"""
+    _ensure_biz_snapshots_loaded()
+    fid = CASE_FOLDER_CACHE.get((case_no or "").strip())
+    return f"https://drive.google.com/drive/folders/{fid}" if fid else ""
+
+
+MD_CARD_CASES_PER_CARD = 6
+MD_CARD_MAX = 12
+
+
+def _md_cards(items, tag, color, title, subtitle, btn_label, show_rep=False, footer_extra=""):
+    """缺件 → 字卡（一個案場一列，右邊「📂 上傳」按鈕開該案業務雲端資料夾）。案場多就拆成幾張，LINE 以輪播（左右滑）一則送出。"""
+    by_vendor = collections.OrderedDict()
+    for it in items:
+        by_vendor.setdefault(it["vendor"] or "", collections.OrderedDict()).setdefault(it["alias"] or it["case_no"], []).append(it)
+    rows = []   # [(vendor, name, its)]
+    for vendor, cases in by_vendor.items():
+        for name, its in cases.items():
+            rows.append((vendor, name, its))
+    cards = []
+    n_cases = len(rows)
+    for i in range(0, len(rows), MD_CARD_CASES_PER_CARD):
+        chunk = rows[i:i + MD_CARD_CASES_PER_CARD]
+        sections = []
+        for vendor in dict.fromkeys(v for v, _, _ in chunk):
+            lines = []
+            for v, name, its in chunk:
+                if v != vendor:
+                    continue
+                head = name + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else "")
+                body = "\n".join(f"・{it['doc_type']}" + (f"（{it['note']}）" if it["note"] else "") for it in its)
+                url = _md_folder_url(its[0]["case_no"])
+                text = f"{head}\n{body}"
+                lines.append((text, url, btn_label) if url else text)
+            sections.append((f"◆{vendor}缺件" if vendor else "◆缺件", lines))
+        page = f"（{i // MD_CARD_CASES_PER_CARD + 1}/{(len(rows) + MD_CARD_CASES_PER_CARD - 1) // MD_CARD_CASES_PER_CARD}）" if len(rows) > MD_CARD_CASES_PER_CARD else ""
+        cards.append(_card(tag + page, color, title, subtitle, sections=sections,
+                           footer=f"共 {n_cases} 個案場、{len(items)} 項。{footer_extra}".strip()))
+    return cards[:MD_CARD_MAX]
+
+
+def _md_notice_cards(rep, items):
+    """通知業務的字卡：第一組＝要業務提供的（橘）；往右滑＝業務助理申請的、只是讓業務知道的（灰藍）。"""
+    own = [i for i in items if i["provider"] != "業務助理"]
+    assist = [i for i in items if i["provider"] == "業務助理"]
+    cards = []
+    if own:
+        cards += _md_cards(own, "📎 缺件提醒｜請您提供", "#D97706", f"{rep} 您好，以下案場廠商還缺資料",
+                           "麻煩協助向屋主／相關單位取得後，按「📂 上傳」把檔案放進該案的雲端資料夾。", "📂 上傳",
+                           footer_extra="資料放好後請回覆我，謝謝！")
+    if assist:
+        cards += _md_cards(assist, "📎 缺件通知｜業務助理處理中", "#475569", "以下資料由「業務助理」申請",
+                           "只是同步讓您知道，由業務助理處理，您不需要另外提供。", "📂 資料夾",
+                           footer_extra="（業務助理處理中）")
+    return cards[:MD_CARD_MAX]
+
+
+def _md_push_cards_to_name(name, cards, text):
+    """業務有綁 LINE → 字卡輪播一則送出；有綁 Slack → 每張字卡私訊。LINE 失敗（含沒綁／額度用完）退回純文字。"""
+    name = (name or "").strip()
+    if not name or not cards:
+        return False
+    try:
+        b = _get_binding(name)
+    except Exception as e:
+        print(f"[_md_push_cards_to_name] 查綁定失敗：{e}", flush=True)
+        return False
+    ok = False
+    if b["uid"]:
+        ok, err = _line_push_cards(cards, b["uid"])
+        if not ok:
+            print(f"[_md_push_cards_to_name] LINE 字卡推播給 {name} 失敗：{err}", flush=True)
+    slack_ok = False
+    if b["slack"]:
+        for c in cards:
+            slack_ok = _slack_notify(b["slack"], c) or slack_ok
+    return ok or slack_ok
+
+
 def _md_build_assistant_message(to, items):
     by_case, lines = _md_lines_by_case(items, show_rep=True)
     out = [f"【缺件申請】{to} 您好，以下案場廠商還缺資料，麻煩協助申請取得後提供給我：", ""] + lines
@@ -9208,7 +9301,10 @@ def md_notice_preview():
                 bound = False
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+    cards = _md_notice_cards(rep, items) if items else []
+    miss = sorted({i["case_no"] for i in items if i["case_no"] and not _md_folder_url(i["case_no"])})
     return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
+                    "cards": len(cards), "no_folder": miss,
                     "text": _md_build_message(rep, items) if items else ""})
 
 
@@ -9230,7 +9326,10 @@ def md_notify():
         if not items:
             return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
         text = _md_build_assistant_message(to or "業務助理", items)
-        sent = True if manual else _push_to_name(to, text)
+        cards = _md_cards(items, "📎 缺件申請｜請協助申請", "#D97706", f"{to or '業務助理'} 您好，以下案場廠商還缺資料",
+                          "麻煩協助申請取得後，按「📂 上傳」放進該案的雲端資料夾。", "📂 上傳", show_rep=True,
+                          footer_extra="資料拿到後請直接回覆我，謝謝！")
+        sent = True if manual else _md_push_cards_to_name(to, cards, text)
         if sent:
             _md_stamp_notified(items)
         return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
@@ -9244,7 +9343,7 @@ def md_notify():
     if not items:
         return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
     text = _md_build_message(rep, items)
-    sent = True if manual else _push_to_name(rep, text)
+    sent = True if manual else _md_push_cards_to_name(rep, _md_notice_cards(rep, items), text)
     if sent:
         _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
     return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text})
