@@ -5702,6 +5702,103 @@ def vendor_requests_set_status(rid):
     return jsonify({"ok": True})
 
 
+# ---------- 廠商預約頁「缺件通報」(2026-11-02) ----------
+# EPC(廠商)在預約頁自己填「哪個案場缺什麼資料」→ 寫進缺件追蹤(來源=廠商填報)→ 即時 Slack、LINE 進每日中午彙整。
+VP_MD_TYPES = ["竣工圖", "使用執照", "使用執照附件", "無使用執照證明", "使用分區證明", "舊有房屋證明", "電費單", "身分證", "公證書", "其他"]
+VP_MD_SOURCE = "廠商填報"
+VP_MD_MAX_OPEN = 80
+
+
+@app.route("/api/vendor-portal/<token>/missing")
+def vendor_portal_missing_list(token):
+    """這家廠商的缺件(陽光自己建的＋廠商填報的):缺件全部、已取得只給最近 30 天。不含業務、誰提供等內部資訊。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    try:
+        items = [i for i in _md_load() if i["vendor"] == vendor]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    cut = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=30)).strftime("%Y-%m-%d")
+    out = []
+    for i in items:
+        if i["status"] == MD_STATUS_GOT and (i["got"] or "") < cut:
+            continue
+        out.append({"id": i["id"], "case_no": i["case_no"], "alias": i["alias"], "doc_type": i["doc_type"], "note": i["note"],
+                    "status": i["status"], "created": i["created"], "got": i["got"],
+                    "mine": i["source"] == VP_MD_SOURCE, "cancel": i["source"] == VP_MD_SOURCE and i["status"] == MD_STATUS_MISSING})
+    out.sort(key=lambda x: (x["status"] != MD_STATUS_MISSING, x["case_no"]))
+    return jsonify({"items": out, "types": VP_MD_TYPES})
+
+
+@app.route("/api/vendor-portal/<token>/missing", methods=["POST"])
+def vendor_portal_missing_submit(token):
+    """body: {case, doc_types:[...], note, contact}"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    body = request.get_json(silent=True) or {}
+    case_no = (body.get("case") or "").strip()
+    types = list(dict.fromkeys(t for t in (body.get("doc_types") or []) if t in VP_MD_TYPES))
+    note = (body.get("note") or "").strip()[:300]
+    contact = (body.get("contact") or "").strip()[:60]
+    if not case_no or not types:
+        return jsonify({"error": "請選擇案號，並勾選缺哪些資料"}), 400
+    if "其他" in types and not note:
+        return jsonify({"error": "勾「其他」請在備註寫明缺什麼資料"}), 400
+    if not contact:
+        return jsonify({"error": "請填聯絡人（姓名或電話），陽光有問題才知道找誰"}), 400
+    c = _vp_case_of_vendor(vendor, case_no)
+    if not c:
+        return jsonify({"error": f"找不到「{case_no}」，或這個案號不是{vendor}的案件，請重新搜尋後選擇"}), 403
+    try:
+        open_mine = [i for i in _md_load(only_missing=True) if i["vendor"] == vendor and i["source"] == VP_MD_SOURCE]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if len(open_mine) >= VP_MD_MAX_OPEN:
+        return jsonify({"error": "待處理的缺件通報太多了，請等窗口處理後再送"}), 429
+    rep = _canon_rep(_rep_for_case(case_no))
+    alias = f"{case_no}（{c['alias']}）" if c.get("alias") and c["alias"] != case_no else case_no
+    try:
+        created, skipped, err = _md_create(case_no, alias, vendor, types, note, rep, source=VP_MD_SOURCE, reporter=contact)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if err:
+        return jsonify({"error": "儲存失敗，請稍後再試", "detail": err[:200], "created": created}), 502
+    if created:
+        try:
+            card = _card("📎 廠商回報缺件", "#D97706", f"{vendor}｜{case_no} {c.get('alias') or ''}".strip(), "",
+                         rows=[("缺件", "、".join(created)), ("備註", note), ("填報人", contact), ("負責業務", rep)],
+                         button=("到缺件追蹤", _dash_url()), footer="廠商在預約頁自己通報的；到主控台「缺件追蹤」處理、通知業務。")
+            _line_push_card(card)    # Slack 即時；LINE 進每日中午彙整
+        except Exception as e:
+            print(f"[vendor-portal] 缺件通報推播失敗：{e}", flush=True)
+    return jsonify({"ok": True, "created": created, "skipped": skipped})
+
+
+@app.route("/api/vendor-portal/<token>/missing/<rid>/cancel", methods=["POST"])
+def vendor_portal_missing_cancel(token, rid):
+    """廠商撤回自己填的、還在「缺件」的通報(填錯用)。陽光自己建的、已取得的不能撤。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    if not _re.match(r"^rec[A-Za-z0-9]{14}$", rid or ""):
+        return jsonify({"error": "不正確"}), 400
+    try:
+        r = requests.get(f"{MD_API_URL}/{rid}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=20)
+        if r.status_code >= 400:
+            return jsonify({"error": "找不到這筆"}), 404
+        it = _md_to_dict(r.json())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if it["vendor"] != vendor or it["source"] != VP_MD_SOURCE or it["status"] != MD_STATUS_MISSING:
+        return jsonify({"error": "這筆不能撤回（只有您自己填、而且還在缺件中的才能撤回）"}), 403
+    d = requests.delete(f"{MD_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+    if d.status_code >= 400:
+        return jsonify({"error": "撤回失敗"}), 502
+    return jsonify({"ok": True})
+
+
 @app.route("/api/vendor-portal-links")
 def vendor_portal_links():
     """每家廠商的專屬預約連結（給 PM 複製傳給廠商）。"""
@@ -8837,6 +8934,7 @@ MD_F = {
     "provider": "fld61thfg3BhdkD5A", "status": "fld0BWszqHASi1p8u", "created": "fldrthxYsx6PO4Efh",
     "confirmed": "fldSeCVW1w4Flkv4R", "got": "fldLUmDsNHrw1Hrj8", "notified": "fldGIqa2OxbwU2MHx",
     "notify_count": "fldGWKyrcc9H0afA1",
+    "source": "fldErz5HBNOAtkz9N", "reporter": "fldgA6l4c0aucxF64",   # 2026-11-02 廠商填報:來源=「廠商填報」、填報人=聯絡人
 }
 MD_STATUS_MISSING, MD_STATUS_GOT = "缺件", "已取得"
 MD_PROVIDER_MARIO = "Mario"   # 這類資料由 Mario 自己提供（例如出場保固書），不會寫進通知業務的訊息
@@ -8858,6 +8956,7 @@ def _md_to_dict(r):
         "provider": g("provider") or "", "status": g("status") or MD_STATUS_MISSING,
         "created": g("created") or "", "confirmed": g("confirmed") or "", "got": g("got") or "",
         "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
+        "source": g("source") or "", "reporter": g("reporter") or "",
     }
 
 
@@ -8900,24 +8999,35 @@ def md_add():
     provider = (body.get("provider") or "").strip()
     note = (body.get("note") or "").strip()
     try:
-        existing = {(i["case_no"] or i["alias"], i["doc_type"]) for i in _md_load(only_missing=True)}
+        created, skipped, err = _md_create(case_no, alias, (body.get("vendor") or "").strip(), types, note, rep, provider)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+    if err:
+        return jsonify({"error": "Airtable 寫入失敗", "detail": err, "created": created}), 502
+    return jsonify({"ok": True, "created": created, "skipped": skipped, "rep": rep})
+
+
+def _md_create(case_no, alias, vendor, types, note, rep, provider="", source="", reporter=""):
+    """建立缺件(同案號＋同類型已有「缺件」的不重複)。回傳 (created, skipped, error_text)。"""
+    existing = {(i["case_no"] or i["alias"], i["doc_type"]) for i in _md_load(only_missing=True)}
     created, skipped = [], []
     for t in types:
         if ((case_no or alias), t) in existing:
             skipped.append(t)
             continue
-        fields = {MD_F["alias"]: alias or case_no, MD_F["case_no"]: case_no,
-                  MD_F["vendor"]: (body.get("vendor") or "").strip(),
+        fields = {MD_F["alias"]: alias or case_no, MD_F["case_no"]: case_no, MD_F["vendor"]: vendor,
                   MD_F["doc_type"]: t, MD_F["note"]: note, MD_F["rep"]: rep,
                   MD_F["provider"]: provider or _md_default_provider(t),
                   MD_F["status"]: MD_STATUS_MISSING, MD_F["created"]: _md_today()}
+        if source:
+            fields[MD_F["source"]] = source
+        if reporter:
+            fields[MD_F["reporter"]] = reporter
         resp = requests.post(MD_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
         if resp.status_code >= 400:
-            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text, "created": created}), 502
+            return created, skipped, resp.text
         created.append(t)
-    return jsonify({"ok": True, "created": created, "skipped": skipped, "rep": rep})
+    return created, skipped, ""
 
 
 MD_CLOSED_STATUS = {"結案", "撤案", "封存", "預計撤案", "已結案待歸檔"}
