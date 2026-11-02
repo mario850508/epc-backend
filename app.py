@@ -9103,16 +9103,22 @@ def md_confirm_many():
 
 
 def _md_lines_by_case(items, show_rep=False):
+    """依廠商分段(◆廠商名)、段內依案場分組，業務一看就知道這批缺件是哪家廠商要的(2026-11-02)。"""
     by_case = collections.OrderedDict()
+    by_vendor = collections.OrderedDict()
     for it in items:
         by_case.setdefault(it["alias"] or it["case_no"], []).append(it)
+        by_vendor.setdefault(it["vendor"] or "", collections.OrderedDict()).setdefault(it["alias"] or it["case_no"], []).append(it)
     lines = []
-    for name, its in by_case.items():
-        lines.append(f"▍{name}" + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else ""))
-        for it in its:
-            extra = f"（{it['note']}）" if it["note"] else ""
-            lines.append(f"　・{it['doc_type']}{extra}")
-        lines.append("")
+    for vendor, cases in by_vendor.items():
+        if vendor:
+            lines += [f"◆{vendor}缺件", ""]
+        for name, its in cases.items():
+            lines.append(f"▍{name}" + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else ""))
+            for it in its:
+                extra = f"（{it['note']}）" if it["note"] else ""
+                lines.append(f"　・{it['doc_type']}{extra}")
+            lines.append("")
     return by_case, lines
 
 
