@@ -9239,6 +9239,33 @@ def _md_push_cards_to_name(name, cards, text):
     return ok or slack_ok
 
 
+def _md_send_copy_to_me(rep, cards):
+    """通知業務時同時傳副本給預設收件人（使用者本人）：LINE 字卡＋Slack。業務本人就是預設收件人時不重複傳。"""
+    if not cards:
+        return False
+    try:
+        _, me = _line_config()
+        try:
+            rep_uid = _get_binding(rep)["uid"]
+        except Exception:
+            rep_uid = ""
+        if me and rep_uid and rep_uid == me:
+            return False
+        copy = [dict(c) for c in cards]
+        copy[0]["note"] = f"📋 副本：同一份已傳給「{rep}」（這是業務看到的樣子）"
+        ok = False
+        if me:
+            ok, err = _line_push_cards(copy, me)
+            if not ok:
+                print(f"[_md_send_copy_to_me] LINE 副本失敗：{err}", flush=True)
+        for c in copy:
+            _slack_notify_default(c)
+        return ok
+    except Exception as e:
+        print(f"[_md_send_copy_to_me] 例外：{e!r}", flush=True)
+        return False
+
+
 def _md_build_assistant_message(to, items):
     by_case, lines = _md_lines_by_case(items, show_rep=True)
     out = [f"【缺件申請】{to} 您好，以下案場廠商還缺資料，麻煩協助申請取得後提供給我：", ""] + lines
@@ -9346,16 +9373,14 @@ def md_notify():
     if not items:
         return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
     text = _md_build_message(rep, items)
-    # 2026-11-02：可以改傳給別人（例如先傳給自己，再自己轉給業務）。使用者確認：傳給自己再轉傳也直接算「已通知」。
-    to = (body.get("to") or "").strip()
-    other = bool(to) and to != rep and not manual
     cards = _md_notice_cards(rep, items)
-    if other and cards:
-        cards[0] = dict(cards[0], note=f"📨 這是要轉給「{rep}」的版本（先傳給您）")
-    sent = True if manual else _md_push_cards_to_name(to if other else rep, cards, text)
+    sent = True if manual else _md_push_cards_to_name(rep, cards, text)
+    copied = False
+    if sent and not manual:
+        copied = _md_send_copy_to_me(rep, cards)   # 2026-11-02：同時傳一份一模一樣的副本給使用者，確認業務看到的樣子
     if sent:
         _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
-    return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text, "to": to if other else rep, "stamped": bool(sent)})
+    return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text, "to": rep, "copied": bool(copied)})
 
 
 @app.route("/api/ops-cases")
