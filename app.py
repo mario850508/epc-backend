@@ -9343,16 +9343,16 @@ def md_notify():
     if not items:
         return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
     text = _md_build_message(rep, items)
-    # 2026-11-02：可以改傳給別人（例如先傳給自己，再自己轉給業務）。傳給別人不算「已通知業務」，不記通知日。
+    # 2026-11-02：可以改傳給別人（例如先傳給自己，再自己轉給業務）。使用者確認：傳給自己再轉傳也直接算「已通知」。
     to = (body.get("to") or "").strip()
     other = bool(to) and to != rep and not manual
     cards = _md_notice_cards(rep, items)
     if other and cards:
         cards[0] = dict(cards[0], note=f"📨 這是要轉給「{rep}」的版本（先傳給您）")
     sent = True if manual else _md_push_cards_to_name(to if other else rep, cards, text)
-    if sent and not other:
+    if sent:
         _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
-    return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text, "to": to if other else rep, "stamped": bool(sent and not other)})
+    return jsonify({"ok": True, "sent": bool(sent), "count": len(items), "text": text, "to": to if other else rep, "stamped": bool(sent)})
 
 
 @app.route("/api/ops-cases")
