@@ -262,6 +262,7 @@ AUTH_PUBLIC_EXACT = {
     "/api/line/liff-config", "/api/line/bind-rep", "/api/line/bind-scheduler",   # LIFF 綁定頁
     "/api/line/bind-procurement",
     "/api/site-survey-cancelled-sync", "/api/line/run-job",                      # 自己驗證金鑰
+    "/api/missing-docs/supplied",                                                # 字卡「已補件」按鈕（簽章 token）
 }
 AUTH_MACHINE_EXACT = {
     "/api/pdf-rename/watcher-config", "/api/pdf-rename/watcher-upload", "/api/pdf-rename/watcher-heartbeat",
@@ -7166,11 +7167,17 @@ def _card_to_flex(card):
             if isinstance(ln, (tuple, list)):
                 text, uri = ln[0], ln[1]
                 label = ln[2] if len(ln) > 2 else "📤 發送"   # 第三個元素＝自訂按鈕文字（缺件通知用「📂 上傳」）
-                contents.append({"type": "box", "layout": "horizontal", "margin": "sm", "spacing": "sm", "alignItems": "center", "contents": [
-                    {"type": "text", "text": text, "size": "sm", "wrap": True, "color": "#1B2333", "flex": 5},
-                    {"type": "button", "style": "secondary", "height": "sm", "flex": 3,
-                     "action": {"type": "uri", "label": label, "uri": uri}},
-                ]})
+                btns = []
+                if uri:
+                    btns.append({"type": "button", "style": "secondary", "height": "sm",
+                                 "action": {"type": "uri", "label": label, "uri": uri}})
+                if len(ln) > 4 and ln[3]:   # 第四、五個元素＝第二顆按鈕（缺件通知用綠色「✅ 已補件」）
+                    btns.append({"type": "button", "style": "primary", "color": "#16A34A", "height": "sm",
+                                 "action": {"type": "uri", "label": ln[4], "uri": ln[3]}})
+                row = [{"type": "text", "text": text, "size": "sm", "wrap": True, "color": "#1B2333", "flex": 5}]
+                if btns:
+                    row.append({"type": "box", "layout": "vertical", "spacing": "sm", "flex": 3, "contents": btns})
+                contents.append({"type": "box", "layout": "horizontal", "margin": "sm", "spacing": "sm", "alignItems": "center", "contents": row})
             else:
                 contents.append({"type": "text", "text": ln, "size": "sm", "wrap": True, "margin": "xs", "color": "#1B2333"})
     if card.get("note"):
@@ -8082,7 +8089,8 @@ def _card_to_slack(card):
     for i in range(0, len(rows), 10):
         blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"[:2000]} for k, v in rows[i:i + 10]]})
     for heading, lines in card.get("sections") or []:
-        body = "\n".join((x[0] + (f"  <{x[1]}|{x[2]}>" if len(x) > 2 and str(x[1]).startswith("http") else "")) if isinstance(x, (tuple, list)) else x for x in lines)
+        body = "\n".join((x[0] + (f"  <{x[1]}|{x[2]}>" if len(x) > 2 and str(x[1]).startswith("http") else "")
+                          + (f"  <{x[3]}|{x[4]}>" if len(x) > 4 and str(x[3]).startswith("http") else "")) if isinstance(x, (tuple, list)) else x for x in lines)
         if "可複製" in heading:   # 要複製貼給屋主的訊息：放進程式碼區塊，Slack 上有「複製」按鈕、換行也不會跑掉
             body = "```" + body.replace("```", "’’’") + "```"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*\n{body}"[:3000]}})
@@ -8947,6 +8955,7 @@ MD_F = {
     "provider": "fld61thfg3BhdkD5A", "status": "fld0BWszqHASi1p8u", "created": "fldrthxYsx6PO4Efh",
     "confirmed": "fldSeCVW1w4Flkv4R", "got": "fldLUmDsNHrw1Hrj8", "notified": "fldGIqa2OxbwU2MHx",
     "notify_count": "fldGWKyrcc9H0afA1",
+    "supplied": "fldW5DnCptA9NF0w1",   # 2026-11-03 業務在字卡按「✅ 已補件」的日期（等陽光確認後才標已取得）
     "source": "fldErz5HBNOAtkz9N", "reporter": "fldgA6l4c0aucxF64",   # 2026-11-02 廠商填報:來源=「廠商填報」、填報人=聯絡人
 }
 MD_STATUS_MISSING, MD_STATUS_GOT = "缺件", "已取得"
@@ -8969,7 +8978,7 @@ def _md_to_dict(r):
         "provider": g("provider") or "", "status": g("status") or MD_STATUS_MISSING,
         "created": g("created") or "", "confirmed": g("confirmed") or "", "got": g("got") or "",
         "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
-        "source": g("source") or "", "reporter": g("reporter") or "",
+        "source": g("source") or "", "reporter": g("reporter") or "", "supplied": g("supplied") or "",
     }
 
 
@@ -9170,7 +9179,31 @@ MD_CARD_CASES_PER_CARD = 6
 MD_CARD_MAX = 12
 
 
-def _md_cards(items, tag, color, title, subtitle, btn_label, show_rep=False, footer_extra=""):
+def _md_supply_token(case_no, scope, who):
+    payload = _b64(json.dumps({"c": case_no, "s": scope, "w": who, "x": int(time.time()) + 60 * 86400},
+                              ensure_ascii=False, separators=(",", ":")).encode())
+    sig = _b64(hmac.new(_auth_secret(), ("ms." + payload).encode(), hashlib.sha256).digest())[:24]
+    return f"ms.{payload}.{sig}"
+
+
+def _md_supply_parse(token):
+    try:
+        _, payload, sig = token.split(".", 2)
+        good = _b64(hmac.new(_auth_secret(), ("ms." + payload).encode(), hashlib.sha256).digest())[:24]
+        if not hmac.compare_digest(sig, good):
+            return None
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return data if int(data.get("x", 0)) > time.time() else None
+    except Exception:
+        return None
+
+
+def _md_supply_url(case_no, scope, who):
+    base = os.environ.get("BACKEND_PUBLIC_URL", "https://epc-backend-4aj2.onrender.com").strip().rstrip("/")
+    return f"{base}/api/missing-docs/supplied?t={_md_supply_token(case_no, scope, who)}"
+
+
+def _md_cards(items, tag, color, title, subtitle, btn_label, show_rep=False, footer_extra="", supply_scope="", supply_who=""):
     """缺件 → 字卡（一個案場一列，右邊「📂 上傳」按鈕開該案業務雲端資料夾）。案場多就拆成幾張，LINE 以輪播（左右滑）一則送出。"""
     by_vendor = collections.OrderedDict()
     for it in items:
@@ -9193,7 +9226,11 @@ def _md_cards(items, tag, color, title, subtitle, btn_label, show_rep=False, foo
                 body = "\n".join(f"・{it['doc_type']}" + (f"（{it['note']}）" if it["note"] else "") for it in its)
                 url = _md_folder_url(its[0]["case_no"])
                 text = f"{head}\n{body}"
-                lines.append((text, url, btn_label) if url else text)
+                done = _md_supply_url(its[0]["case_no"], supply_scope, supply_who) if supply_scope and its[0]["case_no"] else ""
+                if done:
+                    lines.append((text, url, btn_label, done, "✅ 已補件"))
+                else:
+                    lines.append((text, url, btn_label) if url else text)
             sections.append((f"◆{vendor}缺件" if vendor else "◆缺件", lines))
         page = f"（{i // MD_CARD_CASES_PER_CARD + 1}/{(len(rows) + MD_CARD_CASES_PER_CARD - 1) // MD_CARD_CASES_PER_CARD}）" if len(rows) > MD_CARD_CASES_PER_CARD else ""
         cards.append(_card(tag + page, color, title, subtitle, sections=sections,
@@ -9208,8 +9245,8 @@ def _md_notice_cards(rep, items):
     cards = []
     if own:
         cards += _md_cards(own, "📎 缺件提醒｜請您提供", "#D97706", f"{rep} 您好，以下案場廠商還缺資料",
-                           "麻煩協助向屋主／相關單位取得後，按「📂 上傳」把檔案放進該案的雲端資料夾。", "📂 上傳",
-                           footer_extra="資料放好後請回覆我，謝謝！")
+                           "麻煩協助向屋主／相關單位取得後，按「📂 上傳」把檔案放進該案的雲端資料夾，放好再按「✅ 已補件」。", "📂 上傳",
+                           footer_extra="按「✅ 已補件」系統會直接通知我，謝謝！", supply_scope="own", supply_who=rep)
     if assist:
         cards += _md_cards(assist, "📎 缺件通知｜業務助理處理中", "#475569", "以下資料由「業務助理」申請",
                            "只是同步讓您知道，由業務助理處理，您不需要另外提供。", "📂 資料夾",
@@ -9300,8 +9337,59 @@ def _md_stamp_notified(items):
     for i in range(0, len(items), 10):
         chunk = items[i:i + 10]
         requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
-            {"id": it["id"], "fields": {MD_F["notified"]: today, MD_F["notify_count"]: (it["notify_count"] or 0) + 1}}
+            {"id": it["id"], "fields": {MD_F["notified"]: today, MD_F["notify_count"]: (it["notify_count"] or 0) + 1,
+                                        MD_F["supplied"]: None}}   # 再通知一次＝重新開始，舊的「已補件」清掉
             for it in chunk]})
+
+
+def _md_supply_page(title, msg, ok=True):
+    from html import escape
+    color = "#16A34A" if ok else "#B45309"
+    html_ = (f"<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'>"
+             f"<meta name='viewport' content='width=device-width,initial-scale=1'><title>{escape(title)}</title></head>"
+             f"<body style='margin:0;font-family:-apple-system,\"Noto Sans TC\",sans-serif;background:#F6F7F9;color:#1B2333;'>"
+             f"<div style='max-width:420px;margin:12vh auto;padding:28px 22px;background:#fff;border-radius:16px;box-shadow:0 2px 14px #0001;text-align:center;'>"
+             f"<div style='font-size:44px'>{'✅' if ok else '⚠️'}</div>"
+             f"<h2 style='color:{color};margin:10px 0 8px'>{escape(title)}</h2>"
+             f"<div style='font-size:15px;line-height:1.7;white-space:pre-line'>{escape(msg)}</div>"
+             f"</div></body></html>")
+    return Response(html_, mimetype="text/html")
+
+
+@app.route("/api/missing-docs/supplied", methods=["GET"])
+def md_supplied():
+    """字卡上業務／業務助理按「✅ 已補件」：簽章 token（案號＋誰＋範圍）→ 記今天為補件日 → 通知 Mario。
+    不會自動標「已取得」，要 Mario 看過資料夾確認後再標。同一批重複按不會重複通知。"""
+    data = _md_supply_parse(request.args.get("t", ""))
+    if not data:
+        return _md_supply_page("連結失效", "這個連結已過期或不正確，請直接回覆陽光窗口。", ok=False), 400
+    case_no, scope, who = data.get("c", ""), data.get("s", ""), data.get("w", "")
+    try:
+        mine = [i for i in _md_load(only_missing=True) if i["case_no"] == case_no and
+                ((i["provider"] == "業務助理") if scope == "assist" else (i["provider"] not in ("業務助理", MD_PROVIDER_MARIO)))]
+    except Exception as e:
+        print(f"[md_supplied] 讀缺件失敗：{e!r}", flush=True)
+        return _md_supply_page("暫時無法處理", "系統忙碌中，請稍後再按一次。", ok=False), 502
+    if not mine:
+        return _md_supply_page("已收到", "這個案場目前沒有待補的資料，不需要再處理。")
+    fresh = [i for i in mine if not i["supplied"]]
+    if not fresh:
+        return _md_supply_page("已通知過了", "陽光已經知道您補件了，會盡快確認，謝謝！")
+    today = _md_today()
+    for k in range(0, len(fresh), 10):
+        requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+            {"id": it["id"], "fields": {MD_F["supplied"]: today}} for it in fresh[k:k + 10]]})
+    try:
+        folder = _md_folder_url(case_no)
+        alias = fresh[0]["alias"] or case_no
+        rows = [("廠商", fresh[0]["vendor"]), ("補件內容", "、".join(i["doc_type"] + (f"（{i['note']}）" if i["note"] else "") for i in fresh)),
+                ("誰按的", who or "業務")]
+        buttons = ([("📂 開資料夾確認", folder)] if folder else []) + [("🔎 缺件追蹤", _dash_url())]
+        _line_push_card(_card("📬 已補件｜請確認資料", "#16A34A", alias, subtitle=f"{who or '業務'} 按了「已補件」",
+                              rows=rows, note="請到資料夾確認檔案齊全後，到缺件追蹤按「✅ 已拿到」。", buttons=buttons))
+    except Exception as e:
+        print(f"[md_supplied] 通知失敗：{e!r}", flush=True)
+    return _md_supply_page("已通知陽光", "謝謝！陽光收到您補件的通知了，確認資料後會處理。")
 
 
 @app.route("/api/missing-docs/notice", methods=["GET"])
@@ -9357,8 +9445,8 @@ def md_notify():
             return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
         text = _md_build_assistant_message(to or "業務助理", items)
         cards = _md_cards(items, "📎 缺件申請｜請協助申請", "#D97706", f"{to or '業務助理'} 您好，以下案場廠商還缺資料",
-                          "麻煩協助申請取得後，按「📂 上傳」放進該案的雲端資料夾。", "📂 上傳", show_rep=True,
-                          footer_extra="資料拿到後請直接回覆我，謝謝！")
+                          "麻煩協助申請取得後，按「📂 上傳」放進該案的雲端資料夾，放好再按「✅ 已補件」。", "📂 上傳", show_rep=True,
+                          footer_extra="按「✅ 已補件」系統會直接通知我，謝謝！", supply_scope="assist", supply_who=to or "業務助理")
         sent = True if manual else _md_push_cards_to_name(to, cards, text)
         if sent:
             _md_stamp_notified(items)
