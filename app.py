@@ -8955,6 +8955,7 @@ MD_F = {
     "provider": "fld61thfg3BhdkD5A", "status": "fld0BWszqHASi1p8u", "created": "fldrthxYsx6PO4Efh",
     "confirmed": "fldSeCVW1w4Flkv4R", "got": "fldLUmDsNHrw1Hrj8", "notified": "fldGIqa2OxbwU2MHx",
     "notify_count": "fldGWKyrcc9H0afA1",
+    "vendor_notified": "fldqZ2Gznskb8e8dz",   # 2026-11-04 已把「補件完成」通知廠商的日期
     "supplied": "fldW5DnCptA9NF0w1",   # 2026-11-03 業務在字卡按「✅ 已補件」的日期（等陽光確認後才標已取得）
     "source": "fldErz5HBNOAtkz9N", "reporter": "fldgA6l4c0aucxF64",   # 2026-11-02 廠商填報:來源=「廠商填報」、填報人=聯絡人
 }
@@ -8979,6 +8980,7 @@ def _md_to_dict(r):
         "created": g("created") or "", "confirmed": g("confirmed") or "", "got": g("got") or "",
         "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
         "source": g("source") or "", "reporter": g("reporter") or "", "supplied": g("supplied") or "",
+        "vendor_notified": g("vendor_notified") or "",
     }
 
 
@@ -9390,6 +9392,81 @@ def md_supplied():
     except Exception as e:
         print(f"[md_supplied] 通知失敗：{e!r}", flush=True)
     return _md_supply_page("已通知陽光", "謝謝！陽光收到您補件的通知了，確認資料後會處理。")
+
+
+MD_GOT_NOTICE_DAYS = 21   # 「已取得」多久內還沒通知廠商的，才列進「通知廠商已補件」
+
+
+def _md_got_pending(vendor=""):
+    """最近（21 天內）標成「已取得」、還沒通知廠商的項目。"""
+    today = datetime.strptime(_md_today(), "%Y-%m-%d").date()
+    out = []
+    for it in _md_load():
+        if it["status"] != MD_STATUS_GOT or it["vendor_notified"] or not it["got"] or not it["vendor"]:
+            continue
+        if vendor and it["vendor"] != vendor:
+            continue
+        try:
+            if (today - datetime.strptime(it["got"][:10], "%Y-%m-%d").date()).days > MD_GOT_NOTICE_DAYS:
+                continue
+        except ValueError:
+            continue
+        out.append(it)
+    return out
+
+
+def _md_got_message(vendor, items):
+    by_case = collections.OrderedDict()
+    for it in sorted(items, key=lambda x: _md_case_key(x["case_no"] or x["alias"])):
+        by_case.setdefault((it["alias"] or it["case_no"], it["case_no"]), []).append(it)
+    lines = [f"{vendor} 您好，", "以下案場先前缺的資料，陽光已收到、資料齊了：", ""]
+    for (alias, case_no), its in by_case.items():
+        docs = "、".join(i["doc_type"] + (f"（{i['note']}）" if i["note"] else "") for i in its)
+        lines.append(f"▸ {alias}" + (f"（{case_no}）" if case_no and case_no != alias else "") + f"：{docs}")
+    lines += ["", f"共 {len(by_case)} 個案場、{len(items)} 項。麻煩繼續後續作業，謝謝！"]
+    return "\n".join(lines)
+
+
+def _md_case_key(case_no):
+    """排序規則同發票請款：潤特→工程、新北→桃園→新竹→苗栗→宜蘭、案號小到大。"""
+    m = _re.match(r"^(潤特|工程)?(.*?)(\d+)號?$", case_no or "")
+    if not m:
+        return (2, 9, case_no or "", 0)
+    regions = ["新北", "桃園", "新竹", "苗栗", "宜蘭"]
+    reg = next((i for i, r in enumerate(regions) if r in m.group(2)), 9)
+    return (0 if m.group(1) == "潤特" else 1, reg, m.group(2), int(m.group(3)))
+
+
+@app.route("/api/missing-docs/got-notice", methods=["GET"])
+def md_got_notice():
+    """「通知廠商已補件」預覽：每家廠商一段文字（陽光已收到的資料），只含 21 天內標成已取得、還沒通知廠商的。?vendor= 可只看一家。"""
+    vendor = (request.args.get("vendor") or "").strip()
+    try:
+        items = _md_got_pending(vendor)
+    except Exception as e:
+        return jsonify({"error": str(e), "groups": []}), 502
+    by_vendor = collections.OrderedDict()
+    for it in items:
+        by_vendor.setdefault(it["vendor"], []).append(it)
+    groups = [{"vendor": v, "count": len(its), "ids": [i["id"] for i in its], "text": _md_got_message(v, its)}
+              for v, its in by_vendor.items()]
+    return jsonify({"groups": groups, "days": MD_GOT_NOTICE_DAYS})
+
+
+@app.route("/api/missing-docs/got-notice/mark", methods=["POST"])
+def md_got_notice_mark():
+    """使用者把訊息傳給廠商後按「確認已通知廠商」：只記日期，不發任何訊息。body: {ids:[...]}"""
+    ids = (request.get_json(force=True) or {}).get("ids") or []
+    today = _md_today()
+    done = 0
+    for i in range(0, len(ids), 10):
+        chunk = ids[i:i + 10]
+        resp = requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={
+            "records": [{"id": rid, "fields": {MD_F["vendor_notified"]: today}} for rid in chunk]})
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text, "done": done}), 502
+        done += len(chunk)
+    return jsonify({"ok": True, "done": done})
 
 
 @app.route("/api/missing-docs/notice", methods=["GET"])
