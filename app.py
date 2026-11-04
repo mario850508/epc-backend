@@ -838,7 +838,7 @@ def _case_alias(case_no):
 
 
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None, companions=None, buffer_min=0, allow_overlap=False):
+                       owner_name=None, owner_phone=None, companions=None, buffer_min=0, allow_overlap=False, any_crew=False):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -868,7 +868,8 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     conflict = None
     if not allow_overlap:   # allow_overlap：窗口看過同廠商當天的其他行程，判斷不會互相阻擋，才允許同時段預約
         try:
-            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=slot_type)
+            # any_crew：屋主自己選時間時，場勘跟施工類也互相佔用（2026-11-04）；窗口自己排才分班
+            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=None if any_crew else slot_type)
         except Exception as e:
             return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
@@ -2358,7 +2359,7 @@ def owner_booking_get(otoken):
             pass
     elif status != "done":
         try:
-            out["busy_slots"] = _vendor_busy_slots(task["vendor"], task["type"])
+            out["busy_slots"] = _vendor_busy_slots(task["vendor"], None)   # 屋主自己選：場勘／施工類全部算佔用（2026-11-04）
         except Exception as e:
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
     if task.get("group_id"):
@@ -2415,7 +2416,7 @@ def owner_booking_book(otoken):
     record, err = _book_vendor_slot(
         task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
         f"屋主 {name}", db_note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
-        buffer_min=task.get("buffer_min", 0),
+        buffer_min=task.get("buffer_min", 0), any_crew=True,
     )
     if err:
         err_body, status = err
