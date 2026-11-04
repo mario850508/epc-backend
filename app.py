@@ -2270,26 +2270,34 @@ def _vendor_day_bookings(vendor):
     return out
 
 
-def _county_changes(seq):
+def _county_excess(seq):
+    """一天的縣市順序裡「多餘的來回」次數：連續同縣市算一段，段數減掉縣市數（桃桃新＝0、桃新桃＝1）。"""
     seq = [c for c in seq if c]
-    return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+    if not seq:
+        return 0
+    runs = 1 + sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+    return runs - len(set(seq))
 
 
 def _region_gaps(day_bookings, county):
-    """2026-11-04 屋主自選：同廠商當天已有別縣市行程時，這案不能夾在中間讓廠商來回跑（只能排最前面或最後面）。
-    回傳 (不開放的空檔 [(起分鐘, 迄分鐘)], 當天有沒有別縣市行程)。夾進去後縣市切換次數沒有變多的空檔照開放。"""
+    """2026-11-04 屋主自選：避免廠商在縣市之間來回跑。把這案插進當天同廠商的行程（依時間排序）後，
+    如果「多餘的來回」比原本多（例如桃桃中間插新竹、桃新後面再接桃），那個位置（前面／空檔／後面）就不開放。
+    回傳 (不開放的時間範圍 [(起分鐘, 迄分鐘)], 當天有沒有別縣市行程)。"""
     bs = sorted(day_bookings, key=lambda b: _parse_hhmm(b["start"]))
     far = bool(county) and any(b["county"] and b["county"] != county for b in bs)
     blocked = []
-    if not far or len(bs) < 2:
+    if not far:
         return blocked, far
     old = [b["county"] for b in bs]
-    run_end = _parse_hhmm(bs[0]["end"])
-    for i in range(1, len(bs)):
-        gs, ge = run_end, _parse_hhmm(bs[i]["start"])
-        if ge > gs and _county_changes(old[:i] + [county] + old[i:]) > _county_changes(old):
+    base = _county_excess(old)
+    run_end = 0
+    for i in range(len(bs) + 1):
+        gs = run_end
+        ge = _parse_hhmm(bs[i]["start"]) if i < len(bs) else 24 * 60 - 1
+        if ge > gs and _county_excess(old[:i] + [county] + old[i:]) > base:
             blocked.append((gs, ge))
-        run_end = max(run_end, _parse_hhmm(bs[i]["end"]))
+        if i < len(bs):
+            run_end = max(run_end, _parse_hhmm(bs[i]["end"]))
     return blocked, far
 
 

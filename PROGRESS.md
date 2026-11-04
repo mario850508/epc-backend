@@ -295,3 +295,4 @@ eparse_full.log。
 - 實作（app.py）：`_county_of`（案號／別名／已知地址找縣市，新竹縣市算同一個）、`_vendor_day_bookings`、`_region_gaps`（夾進去後縣市切換次數變多的空檔 → 不開放；已是桃新桃之類夾進去不變多的照開）、`_owner_region_info`／`_owner_slot_cuts_region`。`owner_booking_get` 把不開放的空檔加進 busy_slots（region:true，頁面灰色「此時段已有安排」）、回傳 `far_dates`；`owner_booking_book` 送出時再檢查一次（409）。進場（整天）、聯合排程不套用；判斷不出縣市的案件不套用。
 - owner.html：`farNote()` 在選時間下方與預約完成頁顯示提醒（`far_dates` 含該日才顯示）。
 - 窗口自己在主控台指定時間不受此限（照舊只提醒重疊）。已排好的預約不追溯。
+- 2026-11-04 補強：規則改成「多餘的來回次數不能變多」（`_county_excess`／`_region_gaps` 前面、空檔、後面都檢查）。例：桃園 9–10 單筆 → 新竹可排後面（沒有夾到）；桃園 9–10＋新竹 11:30 之後，桃園案件不能再排 12:30 以後（桃新桃）；桃桃中間仍不開放新竹。
