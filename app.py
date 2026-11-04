@@ -9422,7 +9422,7 @@ def _md_got_message(vendor, items):
     lines = [f"{vendor} 您好，", "以下案場先前缺的資料，陽光已收到、資料齊了：", ""]
     for (alias, case_no), its in by_case.items():
         docs = "、".join(i["doc_type"] + (f"（{i['note']}）" if i["note"] else "") for i in its)
-        lines.append(f"▸ {alias}" + (f"（{case_no}）" if case_no and case_no != alias else "") + f"：{docs}")
+        lines.append(f"▸ {alias}" + (f"（{case_no}）" if case_no and case_no not in alias else "") + f"：{docs}")
     lines += ["", f"共 {len(by_case)} 個案場、{len(items)} 項。麻煩繼續後續作業，謝謝！"]
     return "\n".join(lines)
 
