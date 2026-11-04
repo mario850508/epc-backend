@@ -15535,7 +15535,9 @@ MC_F = {
     # 2026-10-23：工程合約那側的人工修正（空白＝用專案細節系統容量／工程合約電價）＋有調整時的處理進度
     "contract_cap": "fldHU68zisgepVeG0", "contract_price": "fld8rAXXGV4VVrrp3", "adj_status": "fldRlGGa6HHwuQnX8",
 }
-MC_ADJ_STATUSES = ("待廠商提供", "已收到折讓／發票", "已通知內部")
+MC_ADJ_STATUSES = ("待出協議書", "協議書已完成")
+# 2026-11-04 之前的舊狀態名稱：讀出來時換成新的（Airtable 舊資料不用改）
+MC_ADJ_LEGACY = {"待廠商提供": "待出協議書", "已收到折讓／發票": "待出協議書", "已通知內部": "協議書已完成"}
 MC_KINDS = ("掛表", "撤案")
 FIELD_SYSTEM_CAPACITY = "fldQwb2qdQiYN3fIi"   # 專案細節「系統容量」(kW)
 FIELD_CONTRACT_PRICE = "fldzJoM0X3Gcnfq3z"    # 專案細節 工程合約電價（有些案件沒填）
@@ -15712,7 +15714,7 @@ def get_meter_check():
                 "check_id": r["id"], "cap_confirm": f.get(MC_F["cap"]), "price_confirm": f.get(MC_F["price"]),
                 "note": f.get(MC_F["note"]) or "", "by": f.get(MC_F["by"]) or "", "updated": f.get(MC_F["updated"]) or "",
                 "contract_cap": f.get(MC_F["contract_cap"]), "contract_price": f.get(MC_F["contract_price"]),
-                "adj_status": f.get(MC_F["adj_status"]) or "",
+                "adj_status": MC_ADJ_LEGACY.get(f.get(MC_F["adj_status"]) or "", f.get(MC_F["adj_status"]) or ""),
             }
 
         doc_caps, engs = f_docs.result(), f_engs.result()
@@ -15776,6 +15778,7 @@ def upsert_meter_check():
         fields[MC_F["note"]] = (b.get("note") or "").strip()
     if "adj_status" in b:
         st = (b.get("adj_status") or "").strip()
+        st = MC_ADJ_LEGACY.get(st, st)
         if st and st not in MC_ADJ_STATUSES:
             return jsonify({"error": "調整處理狀態不正確"}), 400
         fields[MC_F["adj_status"]] = st or None
@@ -15790,17 +15793,75 @@ def upsert_meter_check():
         )
         if found:
             rid = found[0]["id"]
-            resp = requests.patch(f"{MC_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=20)
+            resp = requests.patch(f"{MC_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
         else:
             fields.update({MC_F["title"]: f"{month} {kind} {case_no}", MC_F["month"]: month,
                            MC_F["case_no"]: case_no, MC_F["kind"]: kind})
-            resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=20)
+            resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
         resp.raise_for_status()
         _mc_cache_clear(month)
         return jsonify({"ok": True, "check_id": resp.json()["id"]})
     except Exception as e:
         print(f"[upsert_meter_check] {month} {case_no} 失敗：{e}", flush=True)
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/meter-check/agreement", methods=["POST"])
+def meter_check_agreement_upload():
+    """掛表資訊確認：上傳雙方簽完的協議書 → 走公文更名流程直接確認（檔名 簡稱_日期_協議書），
+    背景歸檔程式會放進案場資料夾 03 契約；同時把這案的「調整處理」設成「協議書已完成」。
+    body: {month, case_no, filename, data(base64), by?}"""
+    b = request.get_json(silent=True) or {}
+    month = (b.get("month") or "").strip()
+    case_no = (b.get("case_no") or "").strip()
+    if not _re.fullmatch(r"\d{4}-\d{2}", month) or not case_no:
+        return jsonify({"error": "缺少 month／case_no"}), 400
+    try:
+        data = base64.b64decode(b.get("data") or "")
+    except Exception:
+        return jsonify({"error": "檔案內容不是 base64"}), 400
+    if not data:
+        return jsonify({"error": "沒有收到檔案"}), 400
+    by = str(b.get("by") or "").strip()[:40]
+    name = b.get("filename") or "協議書.pdf"
+    r = _pdf_create_from_bytes(name, data, uploader=by, source="掛表資訊確認（協議書）")
+    if not r.get("ok"):
+        return jsonify({"error": r.get("error") or "上傳失敗"}), 400
+    rid = r["id"]
+    try:
+        cur = _pdf_record_to_dict(_pdf_get_record(rid))
+        today = _tw_now().strftime("%Y-%m-%d")
+        if cur["status"] in (PDF_ST_CONFIRMED, PDF_ST_ARCHIVED):
+            final_name = cur.get("final_name") or ""
+            dup_note = "這份檔案之前已經上傳過，沒有重複歸檔"
+        else:
+            dup_note = ""
+            case = next((c for c in _pdf_case_ref() if c["case_no"] == case_no), None)
+            ext = cur["file_ext"] if cur["file_ext"] in PDF_OFFICE_EXTS else ".pdf"
+            final_name = _pdf_build_name(_pdf_settings().get("template"), case or {"case_no": case_no}, "協議書", today, ext)
+            _pdf_patch(rid, {
+                PDF_F["case_no"]: case_no, PDF_F["alias"]: (case or {}).get("alias", ""),
+                PDF_F["doc_type"]: "協議書", PDF_F["doc_date"]: today, PDF_F["final_name"]: final_name,
+                PDF_F["status"]: PDF_ST_CONFIRMED, PDF_F["no_archive"]: False,
+                PDF_F["confirmed_at"]: _tw_now_iso(), PDF_F["confirmed_by"]: by or "掛表資訊確認",
+            })
+            _pdf_items_dirty()
+        esc = case_no.replace("'", chr(92) + "'")
+        found = airtable_get_all(MC_API_URL, f"AND({{{MC_F['month']}}}='{month}',{{{MC_F['case_no']}}}='{esc}',{{{MC_F['kind']}}}='掛表')", [MC_F["case_no"]])
+        fields = {MC_F["adj_status"]: "協議書已完成", MC_F["updated"]: _tw_now().strftime("%Y-%m-%d %H:%M")}
+        if by:
+            fields[MC_F["by"]] = by
+        if found:
+            resp = requests.patch(f"{MC_API_URL}/{found[0]['id']}", headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
+        else:
+            fields.update({MC_F["title"]: f"{month} 掛表 {case_no}", MC_F["month"]: month, MC_F["case_no"]: case_no, MC_F["kind"]: "掛表"})
+            resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
+        resp.raise_for_status()
+        _mc_cache_clear(month)
+        return jsonify({"ok": True, "final_name": final_name, "note": dup_note, "record_id": rid})
+    except Exception as e:
+        print(f"[meter_check_agreement_upload] {month} {case_no} 失敗：{e}", flush=True)
+        return jsonify({"error": f"檔案已收到但後續處理失敗：{e}", "record_id": rid}), 502
 
 
 @app.route("/api/meter-check/<record_id>", methods=["DELETE"])
