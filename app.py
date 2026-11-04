@@ -2242,6 +2242,82 @@ def _vendor_busy_slots(vendor, types=None):
     return out
 
 
+_COUNTY_RE = re.compile(r"(臺北|台北|新北|基隆|桃園|新竹|苗栗|臺中|台中|彰化|南投|雲林|嘉義|臺南|台南|高雄|屏東|宜蘭|花蓮|臺東|台東|澎湖|金門|連江)")
+
+
+def _county_of(*texts):
+    """從案號／別名／地址找縣市（台→臺；新竹縣市算同一個）；找不到回空字串。"""
+    for t in texts:
+        m = _COUNTY_RE.search(t or "")
+        if m:
+            return m.group(1).replace("台", "臺")
+    return ""
+
+
+def _vendor_day_bookings(vendor):
+    """同廠商今天以後的所有已預約（不分班別），附縣市（由案號／別名／已知地址判斷，判斷不出來是空字串）。"""
+    esc = vendor.replace("'", chr(92) + "'")
+    formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',"
+               f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
+    out = []
+    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS]):
+        bf = br["fields"]
+        if not (bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END)):
+            continue
+        cn = bf.get(FIELD_SLOT_CASE_NO, "")
+        out.append({"id": br["id"], "date": bf[FIELD_SLOT_DATE], "start": bf[FIELD_SLOT_START], "end": bf[FIELD_SLOT_END],
+                    "county": _county_of(cn, bf.get(FIELD_SLOT_ALIAS, ""), CASE_ADDR_CACHE.get(cn, ""))})
+    return out
+
+
+def _county_changes(seq):
+    seq = [c for c in seq if c]
+    return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+
+
+def _region_gaps(day_bookings, county):
+    """2026-11-04 屋主自選：同廠商當天已有別縣市行程時，這案不能夾在中間讓廠商來回跑（只能排最前面或最後面）。
+    回傳 (不開放的空檔 [(起分鐘, 迄分鐘)], 當天有沒有別縣市行程)。夾進去後縣市切換次數沒有變多的空檔照開放。"""
+    bs = sorted(day_bookings, key=lambda b: _parse_hhmm(b["start"]))
+    far = bool(county) and any(b["county"] and b["county"] != county for b in bs)
+    blocked = []
+    if not far or len(bs) < 2:
+        return blocked, far
+    old = [b["county"] for b in bs]
+    run_end = _parse_hhmm(bs[0]["end"])
+    for i in range(1, len(bs)):
+        gs, ge = run_end, _parse_hhmm(bs[i]["start"])
+        if ge > gs and _county_changes(old[:i] + [county] + old[i:]) > _county_changes(old):
+            blocked.append((gs, ge))
+        run_end = max(run_end, _parse_hhmm(bs[i]["end"]))
+    return blocked, far
+
+
+def _owner_region_info(task, dates=None, exclude_id=None):
+    """屋主頁用：回傳 (不開放的空檔 busy 區間清單, 有別縣市行程的日期清單)。進場（整天）、聯合排程不套用。"""
+    if task.get("group_id") or _owner_date_only(task) or not task.get("vendor"):
+        return [], []
+    county = _county_of(task.get("case"), task.get("alias")) or _county_of(_case_address(task.get("case")))
+    if not county:
+        return [], []
+    books = [b for b in _vendor_day_bookings(task["vendor"]) if b["id"] != exclude_id]
+    blocked, far_dates = [], []
+    for d in (dates if dates is not None else task.get("candidate_dates") or []):
+        gaps, far = _region_gaps([b for b in books if b["date"] == d], county)
+        if far:
+            far_dates.append(d)
+        for gs, ge in gaps:
+            blocked.append({"date": d, "start_time": f"{gs // 60:02d}:{gs % 60:02d}", "end_time": f"{ge // 60:02d}:{ge % 60:02d}", "region": True})
+    return blocked, far_dates
+
+
+def _owner_slot_cuts_region(task, slot):
+    """屋主選的時段會不會夾在別縣市的行程中間（送出時再檢查一次，避免兩個人同時選）。"""
+    blocked, _ = _owner_region_info(task, [slot["date"]])
+    st, et = _parse_hhmm(slot["start_time"]), _parse_hhmm(slot["end_time"])
+    return any(st < _parse_hhmm(b["end_time"]) and _parse_hhmm(b["start_time"]) < et for b in blocked)
+
+
 def _owner_slot_from_start(task, date, start):
     """依屋主選的日期＋開始時間算出完整時段，並檢查是否落在可選時段內。回 (slot, 錯誤訊息)。"""
     try:
@@ -2355,6 +2431,10 @@ def owner_booking_get(otoken):
                 bf = resp.json().get("fields", {})
                 out["booked"] = {"date": bf.get(FIELD_SLOT_DATE), "start_time": bf.get(FIELD_SLOT_START),
                                  "end_time": bf.get(FIELD_SLOT_END)}
+                try:
+                    out["far_dates"] = _owner_region_info(task, [bf.get(FIELD_SLOT_DATE)], exclude_id=task["booking_id"])[1]
+                except Exception as e:
+                    print(f"[owner_booking_get] 縣市判斷失敗：{e}", flush=True)
         except Exception:
             pass
     elif status != "done":
@@ -2362,6 +2442,12 @@ def owner_booking_get(otoken):
             out["busy_slots"] = _vendor_busy_slots(task["vendor"], None)   # 屋主自己選：場勘／施工類全部算佔用（2026-11-04）
         except Exception as e:
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
+        try:   # 別縣市行程中間的空檔不開放（避免廠商來回跑）；far_dates＝當天有別縣市行程的日期（頁面提示到達時間可能調整）
+            rb, far = _owner_region_info(task)
+            out["busy_slots"] += rb
+            out["far_dates"] = far
+        except Exception as e:
+            print(f"[owner_booking_get] 縣市判斷失敗：{e}", flush=True)
     if task.get("group_id"):
         g = _get_group(task["group_id"])
         if g:
@@ -2411,6 +2497,11 @@ def owner_booking_book(otoken):
     name, phone, err_msg = _owner_contact(body)
     if err_msg:
         return jsonify({"error": err_msg}), 400
+    try:
+        if not _owner_date_only(task) and _owner_slot_cuts_region(task, slot):
+            return jsonify({"error": "這個時間剛好被別人預約了，請換一個時間"}), 409
+    except Exception as e:
+        print(f"[owner_booking_book] 縣市檢查失敗（不擋預約）：{e}", flush=True)
     note = (body.get("note") or "").strip()[:300]
     db_note = note + (("　" if note else "") + f"［預計施工 {_owner_multiday_label(task)}］" if _owner_date_only(task) else "")
     record, err = _book_vendor_slot(

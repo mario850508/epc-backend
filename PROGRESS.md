@@ -289,3 +289,9 @@ eparse_full.log。
 - 使用者說明：「場勘跟施工類不互相佔時段」（2026-10-20 規則）只限窗口自己在主控台安排時；屋主自己在連結頁選時間，要把同廠商所有行程（不分場勘／施工）都算佔用。
 - 實作：`_book_vendor_slot(any_crew=True)` 時衝突檢查不分班（`types=None`）；`owner_booking_get` 的 busy_slots 改用 `_vendor_busy_slots(vendor, None)`；`owner_booking_book`（屋主自選送出）帶 any_crew=True。窗口排程、業務免登入連結（public-task/book）、屋主確認窗口選定時間、聯合排程維持原本分班規則。
 - 已存在的預約不追溯。
+
+## 屋主自選：別縣市行程中間的空檔不開放＋到達時間提醒（2026-11-04）
+- 問題：同廠商桃園案件中間夾一案新竹，廠商會來回跑。使用者同意方案：屋主自選時，當天已有別縣市行程的話，這案只能排當天最前面或最後面，不開放夾在中間；並在頁面提醒「到達時間可能依前面案場狀況調整」。
+- 實作（app.py）：`_county_of`（案號／別名／已知地址找縣市，新竹縣市算同一個）、`_vendor_day_bookings`、`_region_gaps`（夾進去後縣市切換次數變多的空檔 → 不開放；已是桃新桃之類夾進去不變多的照開）、`_owner_region_info`／`_owner_slot_cuts_region`。`owner_booking_get` 把不開放的空檔加進 busy_slots（region:true，頁面灰色「此時段已有安排」）、回傳 `far_dates`；`owner_booking_book` 送出時再檢查一次（409）。進場（整天）、聯合排程不套用；判斷不出縣市的案件不套用。
+- owner.html：`farNote()` 在選時間下方與預約完成頁顯示提醒（`far_dates` 含該日才顯示）。
+- 窗口自己在主控台指定時間不受此限（照舊只提醒重疊）。已排好的預約不追溯。
