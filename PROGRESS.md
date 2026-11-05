@@ -309,3 +309,11 @@ eparse_full.log。
 - 前端 epic-dashboard/route.js、index.html（分頁/subview/script）、slots.js（showSlotsTab 掛 loadRouteTab）。
 - 已知限制：地址轉座標常只到路名層級（會標警告）；OSRM／Nominatim 為免費公共服務，量大或不穩要改 Google Maps API；未考慮廠商出發地、當天已有預約。
 - 之後若好用：可加「套用到預約」（依時程一次建立預約／通知屋主）、當天已有預約納入、出發地。
+
+## 2026-11-05 車程緩衝改成「每段只算一次」＋預約可單獨改緩衝
+- 使用者決定：車程緩衝不再前後各擴一次；只算「開車到下一個行程」那一段。排在既有預約後面→隔「這案自己的緩衝」；排在既有預約前面→隔「那筆預約自己記錄的緩衝」。舊預約沒記錄緩衝→當 30 分鐘（`DEFAULT_BOOKING_BUFFER`、`_slot_buffer`）。
+- Airtable 預約表新增數字欄位「車程緩衝(分)」fld7ZDgjliw2zcZQa（空白＝沒記錄）；任務流程（屋主/業務自選、窗口選定、聯合排程確認）建立預約時寫入任務的緩衝（`record_buffer`，不影響衝突檢查），PM 直接預約不寫（留空）。
+- 規則只在新任務緩衝>0 時啟用（緩衝 0＝不檢查，同舊行為）；PM 自己排時間不受限。
+- `_find_slot_conflict`、`_vendor_busy_slots`/public-task busy_slots（多回 buffer）、owner.html `startOptions`、book.html `getBusyRanges` 同步改；`GET /api/vendor-slots` 的預約多回 `buffer_min`；`PATCH /api/vendor-slots/<id>` 接受 `buffer_min`（空字串＝清掉）。
+- 主控台「✏️ 變更預約」多「🚗 車程緩衝」下拉（沒記錄/0/30/…/180），已預約的屋主也能改緩衝。slots.js v44。
+- 例：11/16 桃園53 09:00–10:00、桃園58 15:00–16:00，新竹案緩衝 30 → 可選 10:30–13:30（舊規則前後各 90 只剩 11:30–12:30）。

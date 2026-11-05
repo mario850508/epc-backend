@@ -522,6 +522,7 @@ OWNER_CONTACT_CACHE = {}  # {案號: {"name": ..., "phone": ...}}
 # 資料量不大（一次大概就是幾個廠商、幾天、幾個案子），不用像 pending/entry/
 # completed 或場勘安排那樣做背景快取，直接即時查 Airtable 就好。
 SLOT_TABLE_ID = "tbl4paq7aP2itEOk0"
+FIELD_SLOT_BUFFER = "fld7ZDgjliw2zcZQa"      # 車程緩衝(分)：開車到這個預約要留的路程時間；空白＝沒記錄，當 30（2026-11-05）
 FIELD_SLOT_TITLE = "fld4zSws0QYIpgiZE"       # 標題（後端自動產生，純顯示用）
 FIELD_SLOT_KIND = "flds9FOlX6Z4vS2YS"        # 記錄類型：開放時段／已預約
 FIELD_SLOT_VENDOR = "fldx0GNtq5juS4itt"      # 廠商
@@ -653,7 +654,7 @@ def list_vendor_slots():
             FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
             FIELD_SLOT_REGISTRANT, FIELD_SLOT_NOTE, FIELD_SLOT_OWNER_NAME, FIELD_SLOT_OWNER_PHONE,
             FIELD_SLOT_VENDOR_NOTIFIED, FIELD_SLOT_CANCEL_REASON, FIELD_SLOT_CANCELLED_AT, FIELD_SLOT_COMPANIONS,
-            FIELD_SLOT_ACK_AT, FIELD_SLOT_ACK_BY, FIELD_SLOT_ISSUE,
+            FIELD_SLOT_ACK_AT, FIELD_SLOT_ACK_BY, FIELD_SLOT_ISSUE, FIELD_SLOT_BUFFER,
         ]
         records = airtable_get_all(SLOT_API_URL, "TRUE()", fields)
     except Exception as e:
@@ -691,6 +692,7 @@ def list_vendor_slots():
                 "companions": f.get(FIELD_SLOT_COMPANIONS, ""),
                 "vendor_ack_at": f.get(FIELD_SLOT_ACK_AT, ""), "vendor_ack_by": f.get(FIELD_SLOT_ACK_BY, ""),
                 "vendor_issue": f.get(FIELD_SLOT_ISSUE, ""),
+                "buffer_min": f.get(FIELD_SLOT_BUFFER),   # None＝沒記錄（系統當 30 分鐘）
                 "vendor_can_ack": (f.get(FIELD_SLOT_VENDOR) or "") in VP_VENDORS,
             })
             bookings.append(item)
@@ -747,6 +749,20 @@ def _same_crew(types_a, types_b):
     return bool(_crew_groups(types_a) & _crew_groups(types_b))
 
 
+DEFAULT_BOOKING_BUFFER = 30   # 預約沒有記錄車程緩衝時，當作 30 分鐘（2026-11-05 使用者決定）
+
+
+def _slot_buffer(v):
+    """預約記錄上的車程緩衝（分鐘）；空白（沒記錄）當 30。"""
+    if v is None or v == "":
+        return DEFAULT_BOOKING_BUFFER
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return DEFAULT_BOOKING_BUFFER
+    return max(0, min(180, n))
+
+
 def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0, types=None):
     """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
     資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
@@ -758,7 +774,7 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
     )
     existing = airtable_get_all(
         SLOT_API_URL, formula,
-        [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT],
+        [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT, FIELD_SLOT_BUFFER],
     )
     found = []
     for r in existing:
@@ -772,8 +788,17 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
             continue   # 場勘跟施工是不同班的人，不互相佔用時段
         near = False
         if not _slots_overlap(start_time, end_time, es, ee):
-            # 車程緩衝：跟別的預約之間至少要隔 buffer_min 分鐘（前後都算）
-            if not (buffer_min and _parse_hhmm(start_time) < _parse_hhmm(ee) + buffer_min and _parse_hhmm(es) < _parse_hhmm(end_time) + buffer_min):
+            # 車程緩衝（2026-11-05 改）：只算「開車到下一個行程」那一段，每段只算一次——
+            #   這案排在既有預約後面：開始 ≥ 既有結束 + 這案自己的緩衝；
+            #   這案排在既有預約前面：既有開始 ≥ 這案結束 + 既有那筆自己記錄的緩衝（沒記錄當 30 分鐘）。
+            if not buffer_min:
+                continue
+            ns, ne, xs, xe = _parse_hhmm(start_time), _parse_hhmm(end_time), _parse_hhmm(es), _parse_hhmm(ee)
+            if xe <= ns:
+                too_close = ns < xe + buffer_min
+            else:
+                too_close = xs < ne + _slot_buffer(ef.get(FIELD_SLOT_BUFFER))
+            if not too_close:
                 continue
             near = True
         found.append({
@@ -838,7 +863,7 @@ def _case_alias(case_no):
 
 
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None, companions=None, buffer_min=0, allow_overlap=False, any_crew=False):
+                       owner_name=None, owner_phone=None, companions=None, buffer_min=None, allow_overlap=False, any_crew=False, record_buffer=None):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -869,12 +894,12 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     if not allow_overlap:   # allow_overlap：窗口看過同廠商當天的其他行程，判斷不會互相阻擋，才允許同時段預約
         try:
             # any_crew：屋主自己選時間時，場勘跟施工類也互相佔用（2026-11-04）；窗口自己排才分班
-            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min, types=None if any_crew else slot_type)
+            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min or 0, types=None if any_crew else slot_type)
         except Exception as e:
             return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
         if conflict.get("buffer"):
-            return None, ({"error": f"跟同一天 {conflict['start_time']}–{conflict['end_time']} 的預約太近了，中間要留 {buffer_min} 分鐘的車程時間，請換一個時間", "conflict": conflict}, 409)
+            return None, ({"error": f"跟同一天 {conflict['start_time']}–{conflict['end_time']} 的預約太近了，中間要留車程時間，請換一個時間", "conflict": conflict}, 409)
         return None, ({"error": "這個時段已經被佔用了", "conflict": conflict}, 409)
 
     try:
@@ -891,6 +916,9 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
             FIELD_SLOT_REGISTRANT: registrant,
             FIELD_SLOT_NOTE: (note or "").strip(),
         }
+        rb = buffer_min if buffer_min is not None else record_buffer   # 任務帶來的車程緩衝（0＝不留）；PM 直接預約沒帶就留空（之後當 30 分鐘）
+        if rb is not None:
+            fields[FIELD_SLOT_BUFFER] = _slot_buffer(rb)
         if owner_name:
             fields[FIELD_SLOT_OWNER_NAME] = owner_name.strip()
         if owner_phone:
@@ -1671,7 +1699,7 @@ def get_vendor_slot_task_by_token(token):
                 f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))"
             )
             busy_records = airtable_get_all(
-                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE],
+                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER],
             )
             for br in busy_records:
                 bf = br["fields"]
@@ -1682,6 +1710,7 @@ def get_vendor_slot_task_by_token(token):
                         "date": bf[FIELD_SLOT_DATE],
                         "start_time": bf[FIELD_SLOT_START],
                         "end_time": bf[FIELD_SLOT_END],
+                        "buffer": _slot_buffer(bf.get(FIELD_SLOT_BUFFER)),
                     })
         except Exception as e:
             print(f"[get_vendor_slot_task_by_token] 撈已預約時段失敗（不影響頁面）：{e}", flush=True)
@@ -1836,7 +1865,7 @@ def complete_vendor_slot_task(record_id):
     record, err = _book_vendor_slot(
         task["vendor"], date, start, end, task["case"], task["alias"], task["type"], registrant, db_note,
         owner_name=owner_name, owner_phone=owner_phone, companions=task.get("companions"),
-        allow_overlap=bool(body.get("allow_overlap")),
+        allow_overlap=bool(body.get("allow_overlap")), record_buffer=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
@@ -2066,7 +2095,7 @@ def confirm_vendor_slot_chosen(token):
         task["case"], task["alias"], task["type"],
         (body.get("registrant") or task["assignee"] or "").strip(), body.get("note"),
         owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
-        allow_overlap=bool(chosen.get("overlap_ok")),
+        allow_overlap=bool(chosen.get("overlap_ok")), record_buffer=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
@@ -2233,12 +2262,12 @@ def _vendor_busy_slots(vendor, types=None):
     formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',"
                f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
     out = []
-    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE]):
+    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER]):
         bf = br["fields"]
         if types is not None and not _same_crew(types, bf.get(FIELD_SLOT_TYPE) or []):
             continue
         if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
-            out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END]})
+            out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END], "buffer": _slot_buffer(bf.get(FIELD_SLOT_BUFFER))})
     return out
 
 
@@ -2669,7 +2698,7 @@ def owner_booking_confirm(otoken):
     record, err = _book_vendor_slot(
         task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
         task["type"], f"屋主 {name}", note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
-        allow_overlap=bool(chosen.get("overlap_ok")),
+        allow_overlap=bool(chosen.get("overlap_ok")), record_buffer=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
@@ -15156,7 +15185,7 @@ def joint_confirm_for_owner(gid, task_id):
         task["vendor"], chosen["date"], chosen["start_time"], chosen["end_time"], task["case"], task["alias"],
         task["type"], f"屋主 {name}".strip(), "窗口代屋主確認", owner_name=name, owner_phone=phone,
         companions=task.get("companions"),
-        allow_overlap=bool(body.get("allow_overlap") or chosen.get("overlap_ok")),
+        allow_overlap=bool(body.get("allow_overlap") or chosen.get("overlap_ok")), record_buffer=task.get("buffer_min", 0),
     )
     if err:
         err_body, status = err
@@ -15574,6 +15603,9 @@ def update_vendor_slot_booking(record_id):
             patch[FIELD_SLOT_OWNER_PHONE] = (body.get("owner_phone") or "").strip()[:40]
         if r["id"] == rec["id"] and "note" in body:
             patch[FIELD_SLOT_NOTE] = (body.get("note") or "").strip()[:500]
+        if "buffer_min" in body:   # 車程緩衝：空白＝清掉（當 30 分鐘）；整組同時預約一起改
+            bm = body.get("buffer_min")
+            patch[FIELD_SLOT_BUFFER] = None if bm in (None, "") else _slot_buffer(bm)
         if new_cases:
             patch[FIELD_SLOT_COMPANIONS] = "、".join(c for c in all_cases if c != rf.get(FIELD_SLOT_CASE_NO, ""))
         resp = requests.patch(f"{SLOT_API_URL}/{r['id']}", headers=airtable_headers(), json={"fields": patch}, timeout=20)
