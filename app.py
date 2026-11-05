@@ -17426,6 +17426,304 @@ def invoice_cases():
 
 
 
+# ============================================================
+# 路線排程（測試版，2026-11-05）：勾選幾個案件 → 依縣市優先順序排最佳拜訪順序＋時程＋路線圖
+# 座標優先序：業務自治區座標 → Airtable 電廠座標 → 地址轉座標（OpenStreetMap Nominatim，免費、只能到路名/門牌附近）
+# 車程：OSRM 公開伺服器（開車），失敗改用直線距離×1.4 ÷ 45km/h 估算。只算不寫入預約，純測試。
+# ============================================================
+_GEO_CACHE = {}
+_GEO_LOCK = threading.Lock()
+_GEO_LAST = [0.0]
+_GEO_UA = {"User-Agent": "yangguang-epc-route-planner/1.0"}
+_ROUTE_MAX_STOPS = 15
+
+
+def _geo_query(q):
+    """Nominatim 查一次（全站限 1 次/秒）；回傳 (lat, lon) 或 None。"""
+    with _GEO_LOCK:
+        wait = 1.1 - (time.time() - _GEO_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        _GEO_LAST[0] = time.time()
+    r = requests.get("https://nominatim.openstreetmap.org/search",
+                     params={"q": q, "format": "jsonv2", "limit": 1, "countrycodes": "tw", "accept-language": "zh-TW"},
+                     headers=_GEO_UA, timeout=15)
+    r.raise_for_status()
+    arr = r.json()
+    if arr:
+        return float(arr[0]["lat"]), float(arr[0]["lon"])
+    return None
+
+
+def _geocode_variants(addr):
+    """地址由精到粗的查詢版本：[(查詢字串, 精度標籤)]。"""
+    a = re.sub(r"\s+", "", addr or "")
+    a = re.sub(r"[（(].*?[）)]", "", a)
+    out = [(a, "門牌")]
+    m = re.match(r"^(.*?\d+(?:之\d+)?號)", a)
+    if m and m.group(1) != a:
+        out.append((m.group(1), "門牌"))
+    m = re.match(r"^(.*?(?:路|街|大道)(?:[一二三四五六七八九十\d]+段)?)", a)
+    if m:
+        out.append((m.group(1), "路段（位置會有偏差）"))
+    m = re.match(r"^(.*?[縣市].*?[區鄉鎮市])", a)
+    if m:
+        out.append((m.group(1), "行政區（位置只是大概）"))
+    seen, res = set(), []
+    for q, p in out:
+        if q and q not in seen:
+            seen.add(q)
+            res.append((q, p))
+    return res
+
+
+def _geocode_address(addr):
+    """回傳 {lat, lon, precision} 或 {error}。有快取；找不到會逐步放寬（門牌→路→行政區）。"""
+    key = re.sub(r"\s+", "", addr or "")
+    if not key:
+        return {"error": "沒有地址"}
+    if key in _GEO_CACHE:
+        return _GEO_CACHE[key]
+    result = {"error": "找不到這個地址的位置"}
+    try:
+        for q, prec in _geocode_variants(key):
+            hit = _geo_query(q)
+            if hit:
+                result = {"lat": hit[0], "lon": hit[1], "precision": prec}
+                break
+    except Exception as e:
+        return {"error": f"地址轉座標失敗：{e}"}   # 暫時性錯誤不快取
+    _GEO_CACHE[key] = result
+    return result
+
+
+def _case_coords_and_addr(case_no):
+    """回傳 (座標 'lat,lon' 或 '', 地址)。"""
+    case_no = (case_no or "").strip()
+    if not case_no:
+        return "", ""
+    coords, addr = "", ""
+    try:
+        _ensure_biz_snapshots_loaded()
+        coords = _parse_coords(BIZ_COORDS_CACHE.get(case_no)) or ""
+    except Exception:
+        pass
+    try:
+        esc = case_no.replace("'", chr(92) + "'")
+        recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_ADDRESS, FIELD_PLANT_COORDS])
+        if recs:
+            f = recs[0]["fields"]
+            addr = " ".join((f.get(FIELD_ADDRESS) or "").split())
+            if not coords:
+                coords = _parse_coords(f.get(FIELD_PLANT_COORDS)) or ""
+    except Exception as e:
+        print(f"[route] 查案件失敗 {case_no}：{e}", flush=True)
+    if not addr:
+        addr = _addr_fallback(case_no)
+    return coords, addr
+
+
+def _haversine_km(a, b):
+    import math
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def _drive_matrix(pts):
+    """pts=[(lat,lon)]；回傳 (秒數矩陣, 來源 'osrm' 或 'estimate')。"""
+    n = len(pts)
+    if n >= 2:
+        try:
+            coords = ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in pts)
+            r = requests.get(f"https://router.project-osrm.org/table/v1/driving/{coords}",
+                             params={"annotations": "duration"}, headers=_GEO_UA, timeout=25)
+            r.raise_for_status()
+            d = r.json()
+            if d.get("code") == "Ok" and d.get("durations") and all(v is not None for row in d["durations"] for v in row):
+                return d["durations"], "osrm"
+        except Exception as e:
+            print(f"[route] OSRM table 失敗，改用估算：{e}", flush=True)
+    return [[0 if i == j else _haversine_km(pts[i], pts[j]) * 1.4 / 45 * 3600 for j in range(n)] for i in range(n)], "estimate"
+
+
+def _group_paths(nodes, D):
+    """一個縣市群組內所有走法的最佳解：回傳 {(起點, 終點): (成本, 路徑)}。n≤9 用精確動態規劃，更大用最近鄰＋2-opt。"""
+    n = len(nodes)
+    out = {}
+    if n == 1:
+        return {(nodes[0], nodes[0]): (0, [nodes[0]])}
+    if n <= 9:
+        INF = float("inf")
+        for si in range(n):
+            dp = [[(INF, -1)] * n for _ in range(1 << n)]
+            dp[1 << si][si] = (0, -1)
+            for mask in range(1 << n):
+                for last in range(n):
+                    c = dp[mask][last][0]
+                    if c == INF:
+                        continue
+                    for nx in range(n):
+                        if mask >> nx & 1:
+                            continue
+                        nc = c + D[nodes[last]][nodes[nx]]
+                        if nc < dp[mask | 1 << nx][nx][0]:
+                            dp[mask | 1 << nx][nx] = (nc, last)
+            full = (1 << n) - 1
+            for ei in range(n):
+                if ei == si or dp[full][ei][0] == INF:
+                    continue
+                path, mask, cur = [], full, ei
+                while cur != -1:
+                    path.append(nodes[cur])
+                    pm, cur2 = mask, dp[mask][cur][1]
+                    mask ^= 1 << cur
+                    cur = cur2
+                path.reverse()
+                out[(nodes[si], nodes[ei])] = (dp[full][ei][0], path)
+        return out
+    for s in nodes:
+        rest = [x for x in nodes if x != s]
+        path = [s]
+        while rest:
+            nxt = min(rest, key=lambda x: D[path[-1]][x])
+            path.append(nxt)
+            rest.remove(nxt)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, len(path) - 1):
+                for j in range(i + 1, len(path)):
+                    new = path[:i] + path[i:j + 1][::-1] + path[j + 1:]
+                    cost = lambda p: sum(D[p[k]][p[k + 1]] for k in range(len(p) - 1))
+                    if cost(new) < cost(path) - 1e-6:
+                        path, improved = new, True
+        out[(s, path[-1])] = (sum(D[path[k]][path[k + 1]] for k in range(len(path) - 1)), path)
+    return out
+
+
+def _best_order(groups, D):
+    """groups=[[節點…],…]（照縣市優先順序）；回傳整天總車程最短的拜訪順序（群組之間順序固定、群組內自由）。"""
+    best = None   # {終點: (累計成本, 完整順序)}
+    for g in groups:
+        paths = _group_paths(g, D)
+        nxt = {}
+        for (s, e), (c, p) in paths.items():
+            if best is None:
+                tot, order = c, p
+            else:
+                cand = [(pc + D[pe][s] + c, porder + p) for pe, (pc, porder) in best.items()]
+                tot, order = min(cand, key=lambda x: x[0])
+            if e not in nxt or tot < nxt[e][0]:
+                nxt[e] = (tot, order)
+        best = nxt
+    return min(best.values(), key=lambda x: x[0])[1]
+
+
+def _osrm_route_geometry(pts_in_order):
+    """依順序串起來的行車路線（[[lat,lon],…]）與每段秒數；失敗回直線。"""
+    if len(pts_in_order) < 2:
+        return [[p[0], p[1]] for p in pts_in_order], None
+    try:
+        coords = ";".join(f"{p[1]:.6f},{p[0]:.6f}" for p in pts_in_order)
+        r = requests.get(f"https://router.project-osrm.org/route/v1/driving/{coords}",
+                         params={"overview": "simplified", "geometries": "geojson"}, headers=_GEO_UA, timeout=25)
+        r.raise_for_status()
+        d = r.json()
+        rt = d["routes"][0]
+        return [[c[1], c[0]] for c in rt["geometry"]["coordinates"]], [lg["duration"] for lg in rt["legs"]]
+    except Exception as e:
+        print(f"[route] OSRM route 失敗，畫直線：{e}", flush=True)
+        return [[p[0], p[1]] for p in pts_in_order], None
+
+
+@app.route("/api/route-plan", methods=["POST"])
+def route_plan():
+    body = request.get_json(silent=True) or {}
+    raw = body.get("stops") or []
+    if not isinstance(raw, list) or not raw:
+        return jsonify({"error": "請至少勾選一個案件"}), 400
+    if len(raw) > _ROUTE_MAX_STOPS:
+        return jsonify({"error": f"一次最多 {_ROUTE_MAX_STOPS} 個地點"}), 400
+    start_min = _parse_hhmm(body.get("start") or "09:00")
+    extra = max(0, min(120, int(body.get("extra_buffer_min") or 0)))
+    lunch = bool(body.get("lunch"))
+    prio = [(_county_of(c) or c) for c in (body.get("region_order") or []) if c]
+    free_order = bool(body.get("free_order"))
+
+    stops = []
+    for i, s in enumerate(raw):
+        case = (s.get("case") or "").strip()
+        addr = " ".join(str(s.get("address") or "").split())
+        coords = _parse_coords(s.get("coords")) if s.get("coords") else ""
+        note_src = ""
+        if case and (not addr or not coords):
+            c2, a2 = _case_coords_and_addr(case)
+            addr = addr or a2
+            coords = coords or c2
+        try:
+            dur = max(10, min(600, int(s.get("duration_min") or 60)))
+        except (TypeError, ValueError):
+            dur = 60
+        st = {"key": s.get("key") or f"s{i}", "case": case, "label": s.get("label") or s.get("alias") or case or addr, "address": addr,
+              "duration_min": dur, "county": _county_of(case, s.get("alias"), addr) or "", "alias": s.get("alias") or ""}
+        if coords:
+            la, lo = (float(x) for x in coords.split(","))
+            st.update({"lat": la, "lon": lo, "precision": "座標（業務自治區／案件表）"})
+        elif addr:
+            g = _geocode_address(addr)
+            if "lat" in g:
+                st.update({"lat": g["lat"], "lon": g["lon"], "precision": g["precision"]})
+            else:
+                st["error"] = g["error"]
+        else:
+            st["error"] = "沒有座標也沒有地址，請手動填地址"
+        stops.append(st)
+
+    bad = [s for s in stops if "lat" not in s]
+    if bad:
+        return jsonify({"error": "有地點找不到位置，請補上或修正地址後重算", "stops": stops}), 422
+
+    pts = [(s["lat"], s["lon"]) for s in stops]
+    D, msrc = _drive_matrix(pts)
+
+    # 縣市分群：依優先順序；沒列到的縣市放後面（案件多的先）；free_order＝不分縣市整體最短
+    if free_order:
+        groups = [list(range(len(stops)))]
+    else:
+        by = collections.OrderedDict()
+        for i, s in enumerate(stops):
+            by.setdefault(s["county"] or "其他", []).append(i)
+        keys = [k for k in prio if k in by] + sorted([k for k in by if k not in prio], key=lambda k: -len(by[k]))
+        groups = [by[k] for k in keys]
+    order = _best_order(groups, D)
+
+    # 時程
+    geom, leg_secs = _osrm_route_geometry([pts[i] for i in order])
+    sched, t, total_drive = [], start_min, 0
+    for pos, idx in enumerate(order):
+        drive = 0
+        if pos > 0:
+            drive = int(round((D[order[pos - 1]][idx]) / 60))
+            total_drive += drive
+            t += drive + extra
+        if lunch and 12 * 60 <= t < 13 * 60:
+            t = 13 * 60
+        s = stops[idx]
+        sched.append({"seq": pos + 1, "key": s["key"], "label": s["label"], "case": s["case"], "county": s["county"],
+                      "address": s["address"], "lat": s["lat"], "lon": s["lon"], "precision": s["precision"],
+                      "drive_min": drive, "start": f"{t // 60:02d}:{t % 60:02d}", "end": f"{(t + s['duration_min']) // 60:02d}:{(t + s['duration_min']) % 60:02d}",
+                      "duration_min": s["duration_min"]})
+        t += s["duration_min"]
+    return jsonify({
+        "ok": True, "schedule": sched, "geometry": geom, "matrix_source": msrc,
+        "total_drive_min": total_drive, "end_time": f"{t // 60:02d}:{t % 60:02d}",
+        "regions": [(stops[g[0]]["county"] or "其他") for g in groups] if not free_order else [],
+        "warnings": ([f"車程用直線距離估算（OSRM 暫時連不上），僅供參考"] if msrc != "osrm" else [])
+                    + [f"{s['label']} 的位置只到「{s['precision']}」，路線可能有偏差" for s in stops if not s["precision"].startswith(("座標", "門牌"))],
+    })
+
+
 if __name__ == "__main__":
     # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
     # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
