@@ -2242,6 +2242,10 @@ def _vendor_busy_slots(vendor, types=None):
     return out
 
 
+# 2026-11-05 使用者決定先關掉「屋主自選不夾在別縣市中間」的擋時段規則（改由 PM 手動分批：先開桃園屋主、確定後再開新竹）。
+# 要重開改成 True 即可；關掉時仍保留 far_dates 提示（當天有別縣市行程→屋主頁提醒到達時間可能調整）。
+OWNER_REGION_BLOCK = False
+
 _COUNTY_RE = re.compile(r"(臺北|台北|新北|基隆|桃園|新竹|苗栗|臺中|台中|彰化|南投|雲林|嘉義|臺南|台南|高雄|屏東|宜蘭|花蓮|臺東|台東|澎湖|金門|連江)")
 
 
@@ -2452,7 +2456,8 @@ def owner_booking_get(otoken):
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
         try:   # 別縣市行程中間的空檔不開放（避免廠商來回跑）；far_dates＝當天有別縣市行程的日期（頁面提示到達時間可能調整）
             rb, far = _owner_region_info(task)
-            out["busy_slots"] += rb
+            if OWNER_REGION_BLOCK:
+                out["busy_slots"] += rb
             out["far_dates"] = far
         except Exception as e:
             print(f"[owner_booking_get] 縣市判斷失敗：{e}", flush=True)
@@ -2506,7 +2511,7 @@ def owner_booking_book(otoken):
     if err_msg:
         return jsonify({"error": err_msg}), 400
     try:
-        if not _owner_date_only(task) and _owner_slot_cuts_region(task, slot):
+        if OWNER_REGION_BLOCK and not _owner_date_only(task) and _owner_slot_cuts_region(task, slot):
             return jsonify({"error": "這個時間剛好被別人預約了，請換一個時間"}), 409
     except Exception as e:
         print(f"[owner_booking_book] 縣市檢查失敗（不擋預約）：{e}", flush=True)
