@@ -324,3 +324,4 @@ eparse_full.log。
 - 前端：owner.html `startOptions`、book.html `getBusyRanges` 用 gap_before／gap_after。
 - 測試：桃園↔桃園約 16 分鐘、新竹↔桃園約 53～57 分鐘（含 +10）。
 - 限制：座標只靠業務自治區／Airtable 有填的案場；沒座標的案子仍用手動緩衝。
+- 2026-11-05 座標檢查：`GET /api/travel-coverage`（指派中任務＋今天以後預約，各案有沒有座標與來源）；路線排程分頁最上方「📍 座標檢查」按鈕顯示，缺座標的排最前面（route.js v2）。

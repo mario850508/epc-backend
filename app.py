@@ -17762,6 +17762,61 @@ def _osrm_route_geometry(pts_in_order):
         return [[p[0], p[1]] for p in pts_in_order], None
 
 
+@app.route("/api/travel-coverage")
+def travel_coverage():
+    """座標檢查（2026-11-05）：指派中的任務＋今天以後的預約，各案有沒有案場座標（自動算車程只用座標）。"""
+    try:
+        _ensure_biz_snapshots_loaded()
+    except Exception:
+        pass
+    rows, seen = [], {}
+
+    def check(case_no):
+        if case_no in seen:
+            return seen[case_no]
+        src, pt = "", None
+        c = _parse_coords(BIZ_COORDS_CACHE.get(case_no)) if case_no else None
+        if c:
+            src = "業務自治區"
+        elif case_no:
+            try:
+                esc = case_no.replace("'", chr(92) + "'")
+                recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_PLANT_COORDS])
+                if recs:
+                    c = _parse_coords(recs[0]["fields"].get(FIELD_PLANT_COORDS))
+                    if c:
+                        src = "Airtable 案件表"
+            except Exception as e:
+                print(f"[coverage] 查 {case_no} 失敗：{e}", flush=True)
+        if c:
+            la, lo = c.split(",")
+            pt = (float(la), float(lo))
+        seen[case_no] = (src, c or "")
+        return seen[case_no]
+
+    try:
+        tasks = [_task_to_dict(r) for r in airtable_get_all(TASK_API_URL, "TRUE()", _task_fields())]
+        formula = f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))"
+        books = airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    for t in tasks:
+        if t.get("status") in (TASK_STATUS_DONE, TASK_STATUS_CANCELLED):
+            continue
+        src, c = check(t.get("case") or "")
+        rows.append({"kind": "任務", "case": t.get("case"), "alias": t.get("alias"), "vendor": t.get("vendor") or "",
+                     "when": "、".join(t.get("candidate_dates") or []), "has": bool(c), "source": src, "coords": c})
+    for b in books:
+        f = b["fields"]
+        cn = f.get(FIELD_SLOT_CASE_NO, "")
+        src, c = check(cn)
+        rows.append({"kind": "預約", "case": cn, "alias": f.get(FIELD_SLOT_ALIAS, ""), "vendor": f.get(FIELD_SLOT_VENDOR) or "",
+                     "when": f"{f.get(FIELD_SLOT_DATE, '')} {f.get(FIELD_SLOT_START, '')}-{f.get(FIELD_SLOT_END, '')}", "has": bool(c), "source": src, "coords": c})
+    rows.sort(key=lambda r: (r["has"], r["kind"], r["vendor"], r["when"]))
+    return jsonify({"rows": rows, "total": len(rows), "missing": sum(1 for r in rows if not r["has"]),
+                    "biz_coords_loaded": len(BIZ_COORDS_CACHE)})
+
+
 @app.route("/api/route-plan", methods=["POST"])
 def route_plan():
     body = request.get_json(silent=True) or {}
