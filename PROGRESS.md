@@ -317,3 +317,10 @@ eparse_full.log。
 - `_find_slot_conflict`、`_vendor_busy_slots`/public-task busy_slots（多回 buffer）、owner.html `startOptions`、book.html `getBusyRanges` 同步改；`GET /api/vendor-slots` 的預約多回 `buffer_min`；`PATCH /api/vendor-slots/<id>` 接受 `buffer_min`（空字串＝清掉）。
 - 主控台「✏️ 變更預約」多「🚗 車程緩衝」下拉（沒記錄/0/30/…/180），已預約的屋主也能改緩衝。slots.js v44。
 - 例：11/16 桃園53 09:00–10:00、桃園58 15:00–16:00，新竹案緩衝 30 → 可選 10:30–13:30（舊規則前後各 90 只剩 11:30–12:30）。
+
+## 2026-11-05 車程自動算（座標）
+- 使用者決定：有座標的案子，車程＝兩案場座標之間 OSRM 實際開車時間＋10 分鐘（`TRAVEL_EXTRA_MIN`），前後各自算（新案排在既有預約前／後分別用 new→existing、existing→new）；沒座標才退回手動緩衝（變更預約可改、舊預約預設 30）。只用座標（業務自治區→Airtable 電廠座標），不用地址轉換；進場（整天）、聯合排程不套用；PM 自己排時間不受限。
+- 後端：`_case_point`（座標快取 6h/無座標 10 分）、`_auto_gaps`（OSRM table、`_PAIR_DRIVE` 快取，OSRM 失敗＝退回手動）、`_find_slot_conflict(auto_case=…)`、`_book_vendor_slot(auto_travel=…)`（屋主自選＋業務自選路徑）、`_attach_travel_gaps`（owner GET／public-task GET 的 busy_slots 多 gap_before／gap_after，另回 auto_travel）。屋主可選開始時間在有自動車程時以 30 分鐘為單位（不再限整點）。
+- 前端：owner.html `startOptions`、book.html `getBusyRanges` 用 gap_before／gap_after。
+- 測試：桃園↔桃園約 16 分鐘、新竹↔桃園約 53～57 分鐘（含 +10）。
+- 限制：座標只靠業務自治區／Airtable 有填的案場；沒座標的案子仍用手動緩衝。

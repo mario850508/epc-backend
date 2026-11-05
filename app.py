@@ -749,6 +749,94 @@ def _same_crew(types_a, types_b):
     return bool(_crew_groups(types_a) & _crew_groups(types_b))
 
 
+# ===== 2026-11-05 車程緩衝自動算：用案場座標（業務自治區→Airtable 電廠座標）算兩案之間實際開車時間＋額外 10 分鐘 =====
+TRAVEL_EXTRA_MIN = 10
+_CASE_POINT_CACHE = {}   # 案號 -> (時間, (lat, lon) 或 None)
+_PAIR_DRIVE = {}         # ((lat,lon),(lat,lon)) -> 開車秒數（只快取 OSRM 真的算出來的）
+
+
+def _case_point(case_no):
+    """案場座標 (lat, lon)；沒有座標回 None（這個功能只用座標、不用地址轉換）。結果快取。"""
+    case_no = (case_no or "").strip()
+    if not case_no:
+        return None
+    now = time.time()
+    hit = _CASE_POINT_CACHE.get(case_no)
+    if hit and now - hit[0] < (6 * 3600 if hit[1] else 600):
+        return hit[1]
+    pt = None
+    try:
+        _ensure_biz_snapshots_loaded()
+        c = _parse_coords(BIZ_COORDS_CACHE.get(case_no))
+        if not c:
+            esc = case_no.replace("'", chr(92) + "'")
+            recs = airtable_get_all(CASE_API_URL, "{" + FIELD_CASE_NO + "}='" + esc + "'", [FIELD_CASE_NO, FIELD_PLANT_COORDS])
+            if recs:
+                c = _parse_coords(recs[0]["fields"].get(FIELD_PLANT_COORDS))
+        if c:
+            la, lo = c.split(",")
+            pt = (float(la), float(lo))
+    except Exception as e:
+        print(f"[travel] 查座標失敗 {case_no}：{e}", flush=True)
+    _CASE_POINT_CACHE[case_no] = (now, pt)
+    return pt
+
+
+def _auto_gaps(task_case, booking_cases):
+    """這案（task_case）跟同廠商既有預約之間需要的車程間隔（分鐘，已加 TRAVEL_EXTRA_MIN）。
+    回傳 {既有預約的案號: (這案排在它前面時, 這案結束到它開始至少要隔幾分鐘; 這案排在它後面時, 它結束到這案開始至少要隔幾分鐘)}。
+    只有雙方都有座標、且 OSRM 算得出來才有；沒有的案號不會出現在結果裡（呼叫端退回手動緩衝）。"""
+    import math
+    try:
+        me = _case_point(task_case)
+        if not me:
+            return {}
+        pts = {}
+        for c in set(x for x in booking_cases if x and x != task_case):
+            p = _case_point(c)
+            if p:
+                pts[c] = p
+        if not pts:
+            return {}
+        need = [c for c, p in pts.items() if (me, p) not in _PAIR_DRIVE or (p, me) not in _PAIR_DRIVE]
+        if need:
+            plist = [me] + [pts[c] for c in need]
+            D, src = _drive_matrix(plist)
+            if src == "osrm":
+                for k, c in enumerate(need, start=1):
+                    _PAIR_DRIVE[(me, pts[c])] = D[0][k]
+                    _PAIR_DRIVE[(pts[c], me)] = D[k][0]
+        out = {}
+        for c, p in pts.items():
+            if (me, p) in _PAIR_DRIVE and (p, me) in _PAIR_DRIVE:
+                out[c] = (int(math.ceil(_PAIR_DRIVE[(me, p)] / 60.0)) + TRAVEL_EXTRA_MIN,
+                          int(math.ceil(_PAIR_DRIVE[(p, me)] / 60.0)) + TRAVEL_EXTRA_MIN)
+        return out
+    except Exception as e:
+        print(f"[travel] 算車程失敗（退回手動緩衝）：{e}", flush=True)
+        return {}
+
+
+def _task_auto_ok(task):
+    """這個任務會不會用自動車程（一般預約、有座標）；進場（整天）、聯合排程不用。"""
+    return not (task.get("group_id") or _owner_date_only(task)) and bool(_case_point(task.get("case")))
+
+
+def _attach_travel_gaps(busy, task):
+    """busy 每筆帶 "_case"（內部用）；有自動車程的加上 gap_before／gap_after，最後一律移除 "_case"。回傳 True＝有任何一筆用自動車程。"""
+    gaps = {}
+    if not (task.get("group_id") or _owner_date_only(task)):
+        gaps = _auto_gaps(task.get("case"), [b.get("_case") for b in busy])
+    used = False
+    for b in busy:
+        g = gaps.get(b.get("_case"))
+        if g:
+            b["gap_before"], b["gap_after"] = g[0], g[1]
+            used = True
+        b.pop("_case", None)
+    return used
+
+
 DEFAULT_BOOKING_BUFFER = 30   # 預約沒有記錄車程緩衝時，當作 30 分鐘（2026-11-05 使用者決定）
 
 
@@ -763,7 +851,7 @@ def _slot_buffer(v):
     return max(0, min(180, n))
 
 
-def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0, types=None):
+def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buffer_min=0, types=None, auto_case=None):
     """同廠商同日期的既有「已預約」有沒有跟這段時間重疊。有的話回傳衝突那筆的
     資訊 dict，沒有回傳 None；查詢失敗直接丟例外給呼叫端處理。"""
     escaped_vendor = vendor.replace("'", "\\'")
@@ -776,6 +864,7 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
         SLOT_API_URL, formula,
         [FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE, FIELD_SLOT_REGISTRANT, FIELD_SLOT_BUFFER],
     )
+    travel = _auto_gaps(auto_case, [r["fields"].get(FIELD_SLOT_CASE_NO, "") for r in existing]) if auto_case else {}
     found = []
     for r in existing:
         if ignore_ids and r["id"] in ignore_ids:   # 變更預約時，自己（和同時預約的案件）不算衝突
@@ -791,13 +880,14 @@ def _find_slot_conflict(vendor, date, start_time, end_time, ignore_ids=None, buf
             # 車程緩衝（2026-11-05 改）：只算「開車到下一個行程」那一段，每段只算一次——
             #   這案排在既有預約後面：開始 ≥ 既有結束 + 這案自己的緩衝；
             #   這案排在既有預約前面：既有開始 ≥ 這案結束 + 既有那筆自己記錄的緩衝（沒記錄當 30 分鐘）。
-            if not buffer_min:
+            auto = travel.get(ef.get(FIELD_SLOT_CASE_NO, ""))   # 有座標：用實際車程＋10 分鐘（前後各自算）
+            if not buffer_min and not auto:
                 continue
             ns, ne, xs, xe = _parse_hhmm(start_time), _parse_hhmm(end_time), _parse_hhmm(es), _parse_hhmm(ee)
             if xe <= ns:
-                too_close = ns < xe + buffer_min
+                too_close = ns < xe + (auto[1] if auto else buffer_min)
             else:
-                too_close = xs < ne + _slot_buffer(ef.get(FIELD_SLOT_BUFFER))
+                too_close = xs < ne + (auto[0] if auto else _slot_buffer(ef.get(FIELD_SLOT_BUFFER)))
             if not too_close:
                 continue
             near = True
@@ -863,7 +953,7 @@ def _case_alias(case_no):
 
 
 def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_type, registrant, note,
-                       owner_name=None, owner_phone=None, companions=None, buffer_min=None, allow_overlap=False, any_crew=False, record_buffer=None):
+                       owner_name=None, owner_phone=None, companions=None, buffer_min=None, allow_overlap=False, any_crew=False, record_buffer=None, auto_travel=False):
     """實際建立一筆「已預約」記錄的共用邏輯：驗證格式、查同廠商同日期的既有預約
     有沒有時間重疊、寫入 Airtable。被兩個地方呼叫：
       1. POST /api/vendor-slots/bookings（PM/業務在主控台裡直接預約）
@@ -894,7 +984,7 @@ def _book_vendor_slot(vendor, date, start_time, end_time, case_no, alias, slot_t
     if not allow_overlap:   # allow_overlap：窗口看過同廠商當天的其他行程，判斷不會互相阻擋，才允許同時段預約
         try:
             # any_crew：屋主自己選時間時，場勘跟施工類也互相佔用（2026-11-04）；窗口自己排才分班
-            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min or 0, types=None if any_crew else slot_type)
+            conflict = _find_slot_conflict(vendor, date, start_time, end_time, buffer_min=buffer_min or 0, types=None if any_crew else slot_type, auto_case=case_no if auto_travel else None)
         except Exception as e:
             return None, ({"error": "查詢既有預約失敗", "detail": str(e)}, 502)
     if conflict:
@@ -1699,7 +1789,7 @@ def get_vendor_slot_task_by_token(token):
                 f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))"
             )
             busy_records = airtable_get_all(
-                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER],
+                SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER, FIELD_SLOT_CASE_NO],
             )
             for br in busy_records:
                 bf = br["fields"]
@@ -1711,7 +1801,9 @@ def get_vendor_slot_task_by_token(token):
                         "start_time": bf[FIELD_SLOT_START],
                         "end_time": bf[FIELD_SLOT_END],
                         "buffer": _slot_buffer(bf.get(FIELD_SLOT_BUFFER)),
+                        "_case": bf.get(FIELD_SLOT_CASE_NO, ""),
                     })
+            task["auto_travel"] = _attach_travel_gaps(task["busy_slots"], task)
         except Exception as e:
             print(f"[get_vendor_slot_task_by_token] 撈已預約時段失敗（不影響頁面）：{e}", flush=True)
     if task["status"] != TASK_STATUS_DONE and task.get("duration_min") and not task.get("est_start"):
@@ -1803,7 +1895,7 @@ def book_vendor_slot_task(token):
         task["vendor"], date, body.get("start_time"), body.get("end_time"),
         task["case"], task["alias"], task["type"], body.get("registrant"), body.get("note"),
         owner_name=body.get("owner_name"), owner_phone=body.get("owner_phone"), companions=task.get("companions"),
-        buffer_min=task.get("buffer_min", 0),
+        buffer_min=task.get("buffer_min", 0), auto_travel=_task_auto_ok(task),
     )
     if err:
         err_body, status = err
@@ -2262,12 +2354,12 @@ def _vendor_busy_slots(vendor, types=None):
     formula = (f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',{{{FIELD_SLOT_VENDOR}}}='{esc}',"
                f"IS_AFTER({{{FIELD_SLOT_DATE}}},DATEADD(TODAY(),-1,'days')))")
     out = []
-    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER]):
+    for br in airtable_get_all(SLOT_API_URL, formula, [FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_TYPE, FIELD_SLOT_BUFFER, FIELD_SLOT_CASE_NO]):
         bf = br["fields"]
         if types is not None and not _same_crew(types, bf.get(FIELD_SLOT_TYPE) or []):
             continue
         if bf.get(FIELD_SLOT_DATE) and bf.get(FIELD_SLOT_START) and bf.get(FIELD_SLOT_END):
-            out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END], "buffer": _slot_buffer(bf.get(FIELD_SLOT_BUFFER))})
+            out.append({"date": bf[FIELD_SLOT_DATE], "start_time": bf[FIELD_SLOT_START], "end_time": bf[FIELD_SLOT_END], "buffer": _slot_buffer(bf.get(FIELD_SLOT_BUFFER)), "_case": bf.get(FIELD_SLOT_CASE_NO, "")})
     return out
 
 
@@ -2373,7 +2465,7 @@ def _owner_slot_from_start(task, date, start):
         if st != fx[0]:
             return None, f"這個預約的時間固定是 {wins[0][0]}–{wins[0][1]}"
         et = fx[1]
-    elif st % (30 if _valid_buffer(task.get("buffer_min")) else 60) != 0 and not any(st == _parse_hhmm(a) for a, _ in wins):   # 屋主只能選整點開始（2026-10-12 使用者要求）；時段本身從半點開始時，時段起點也可選（2026-10-15）
+    elif st % (30 if (_valid_buffer(task.get("buffer_min")) or _task_auto_ok(task)) else 60) != 0 and not any(st == _parse_hhmm(a) for a, _ in wins):   # 屋主只能選整點開始（2026-10-12 使用者要求）；時段本身從半點開始時，時段起點也可選（2026-10-15）
         return None, "請選整點的開始時間"
     if not any(st >= _parse_hhmm(a) and et <= _parse_hhmm(b) for a, b in wins):
         return None, "請選 " + "、".join(f"{a}–{b}" for a, b in wins) + " 之間的時間"
@@ -2480,7 +2572,8 @@ def owner_booking_get(otoken):
             pass
     elif status != "done":
         try:
-            out["busy_slots"] = _vendor_busy_slots(task["vendor"], None)   # 屋主自己選：場勘／施工類全部算佔用（2026-11-04）
+            out["busy_slots"] = _vendor_busy_slots(task["vendor"], None)
+            out["auto_travel"] = _attach_travel_gaps(out["busy_slots"], task)   # 有座標：車程＝實際開車時間＋10 分鐘（2026-11-05）   # 屋主自己選：場勘／施工類全部算佔用（2026-11-04）
         except Exception as e:
             print(f"[owner_booking_get] 撈已預約時段失敗：{e}", flush=True)
         try:   # 別縣市行程中間的空檔不開放（避免廠商來回跑）；far_dates＝當天有別縣市行程的日期（頁面提示到達時間可能調整）
@@ -2549,7 +2642,7 @@ def owner_booking_book(otoken):
     record, err = _book_vendor_slot(
         task["vendor"], date, slot["start_time"], slot["end_time"], task["case"], task["alias"], task["type"],
         f"屋主 {name}", db_note, owner_name=name, owner_phone=phone, companions=task.get("companions"),
-        buffer_min=task.get("buffer_min", 0), any_crew=True,
+        buffer_min=task.get("buffer_min", 0), any_crew=True, auto_travel=_task_auto_ok(task),
     )
     if err:
         err_body, status = err
