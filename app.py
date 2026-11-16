@@ -10016,26 +10016,30 @@ def md_notice_preview():
             items = _md_assistant_items((request.args.get("vendor") or "").strip())
             bound = False
             slack_bound = False
+            slack_id = ""
             if to:
                 try:
                     b = _get_binding(to)
                     bound = bool(b["uid"] or b["slack"])
                     slack_bound = bool(b["slack"])
+                    slack_id = b["slack"] or ""
                 except Exception:
                     bound = False
             return jsonify({"role": "assistant", "to": to, "rep": to, "count": len(items), "ids": [i["id"] for i in items],
                             "bound": bound, "share_url": _md_share_url(ma=to, v=(request.args.get("vendor") or "").strip()) if items else "",
-                            "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_me_ready": bool(_slack_user_token()),
+                            "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_id": slack_id, "slack_me_ready": bool(_slack_user_token()),
                             "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
         rep = (request.args.get("rep") or "").strip()
         items = _md_rep_items(rep)
         bound = False
         slack_bound = False
+        slack_id = ""
         if rep:
             try:
                 b = _get_binding(rep)
                 bound = bool(b["uid"] or b["slack"])
                 slack_bound = bool(b["slack"])
+                slack_id = b["slack"] or ""
             except Exception:
                 bound = False
     except Exception as e:
@@ -10044,7 +10048,7 @@ def md_notice_preview():
     miss = sorted({i["case_no"] for i in items if i["case_no"] and not _md_folder_url(i["case_no"])})
     return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
                     "cards": len(cards), "no_folder": miss, "share_url": _md_share_url(mr=rep) if items else "",
-                    "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_me_ready": bool(_slack_user_token()),
+                    "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_id": slack_id, "slack_me_ready": bool(_slack_user_token()),
                     "text": _md_build_message(rep, items) if items else ""})
 
 
@@ -10055,6 +10059,9 @@ def md_notify():
     記錄留給通知業務助理時用。"""
     body = request.get_json(force=True) or {}
     manual = bool(body.get("manual"))   # 2026-11-02：使用者自己複製文字貼給對方，系統只記「已通知」、不推播
+    slack_to = (body.get("slack_to") or "").strip()   # 2026-11-16：用本人 Slack 傳時，直接指定 Slack 收件人（不需要綁定）
+    if slack_to and not _re.match(r"^[UW][A-Z0-9]{6,20}$", slack_to):
+        return jsonify({"error": "Slack 收件人格式不對"}), 400
     if body.get("role") == "assistant":
         to = (body.get("to") or "").strip()
         if not to and not manual:
@@ -10068,7 +10075,7 @@ def md_notify():
         text = _md_build_assistant_message(to or "業務助理", items)
         cards = _md_assistant_cards(to, items)
         if body.get("via") == "slack_me" and not manual:
-            ok, err = _md_send_slack_me(to, cards)
+            ok, err = _slack_send_as_me(slack_to, cards) if slack_to else _md_send_slack_me(to, cards)
             if ok:
                 _md_stamp_notified(items)
             return jsonify({"ok": True, "sent": ok, "count": len(items), "text": text, "error": err})
@@ -10088,7 +10095,7 @@ def md_notify():
     text = _md_build_message(rep, items)
     cards = _md_notice_cards(rep, items)
     if body.get("via") == "slack_me" and not manual:   # 2026-11-16：用使用者本人的 Slack 帳號私訊（不是機器人），不另傳副本（自己的私訊就看得到）
-        ok, err = _md_send_slack_me(rep, cards)
+        ok, err = _slack_send_as_me(slack_to, cards) if slack_to else _md_send_slack_me(rep, cards)
         if ok:
             _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
         return jsonify({"ok": True, "sent": ok, "count": len(items), "text": text, "to": rep, "copied": False, "error": err})
