@@ -9778,6 +9778,12 @@ def md_got_notice_mark():
     return jsonify({"ok": True, "done": done})
 
 
+def _md_preview_items(items):
+    """預覽視窗列出全部缺件（跨廠商，依廠商分段）用：只給前端顯示需要的欄位。"""
+    return [{"id": i["id"], "vendor": i["vendor"], "alias": i["alias"] or i["case_no"], "doc_type": i["doc_type"],
+             "note": i["note"], "provider": i["provider"], "notified": i["notified"], "supplied": i["supplied"]} for i in items]
+
+
 @app.route("/api/missing-docs/notice", methods=["GET"])
 def md_notice_preview():
     """預覽要傳的訊息（不會送出）。?rep=業務名字；或 ?role=assistant&to=收件人&vendor=廠商（傳給業務助理）。"""
@@ -9794,6 +9800,7 @@ def md_notice_preview():
                     bound = False
             return jsonify({"role": "assistant", "to": to, "rep": to, "count": len(items), "ids": [i["id"] for i in items],
                             "bound": bound, "share_url": _md_share_url(ma=to, v=(request.args.get("vendor") or "").strip()) if items else "",
+                            "items": _md_preview_items(items),
                             "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
         rep = (request.args.get("rep") or "").strip()
         items = _md_rep_items(rep)
@@ -9810,6 +9817,7 @@ def md_notice_preview():
     miss = sorted({i["case_no"] for i in items if i["case_no"] and not _md_folder_url(i["case_no"])})
     return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
                     "cards": len(cards), "no_folder": miss, "share_url": _md_share_url(mr=rep) if items else "",
+                    "items": _md_preview_items(items),
                     "text": _md_build_message(rep, items) if items else ""})
 
 
