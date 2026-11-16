@@ -8287,9 +8287,14 @@ def _slack_token():
     return os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
 
-def _slack_call(method, payload=None, get=False):
-    """呼叫 Slack Web API，回傳 JSON（ok=false 時帶 error）。"""
-    headers = {"Authorization": f"Bearer {_slack_token()}"}
+def _slack_user_token():
+    """使用者本人的 Slack User OAuth Token（xoxp-…，user scope：chat:write、im:write）。2026-11-16：用本人帳號私訊業務缺件字卡。"""
+    return os.environ.get("SLACK_USER_TOKEN", "").strip()
+
+
+def _slack_call(method, payload=None, get=False, token=None):
+    """呼叫 Slack Web API，回傳 JSON（ok=false 時帶 error）。token 沒給就用機器人 token。"""
+    headers = {"Authorization": f"Bearer {token or _slack_token()}"}
     if get:
         r = requests.get(f"{SLACK_API}/{method}", headers=headers, params=payload or {}, timeout=15)
     else:
@@ -8334,7 +8339,29 @@ def _card_to_slack(card):
     rows = [(k, v) for k, v in (card.get("rows") or []) if v not in (None, "")]
     for i in range(0, len(rows), 10):
         blocks.append({"type": "section", "fields": [{"type": "mrkdwn", "text": f"*{k}*\n{v}"[:2000]} for k, v in rows[i:i + 10]]})
+    btn_n = 0
     for heading, lines in card.get("sections") or []:
+        def _http(v):
+            return isinstance(v, str) and v.startswith("http")
+        has_btn = "可複製" not in heading and any(
+            isinstance(x, (tuple, list)) and ((len(x) > 2 and _http(x[1])) or (len(x) > 4 and _http(x[3]))) for x in lines)
+        if has_btn:   # 缺件通知：標題一段，每個案場一個區塊＋按鈕列（連結按鈕不需要 Slack 互動設定）
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{heading}*"[:3000]}})
+            for x in lines:
+                if not isinstance(x, (tuple, list)):
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": str(x)[:3000]}})
+                    continue
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": str(x[0])[:3000]}})
+                elems = []
+                if len(x) > 2 and _http(x[1]):
+                    btn_n += 1
+                    elems.append({"type": "button", "text": {"type": "plain_text", "text": str(x[2])[:75], "emoji": True}, "url": x[1], "action_id": f"mdb_{btn_n}"})
+                if len(x) > 4 and _http(x[3]):
+                    btn_n += 1
+                    elems.append({"type": "button", "style": "primary", "text": {"type": "plain_text", "text": str(x[4])[:75], "emoji": True}, "url": x[3], "action_id": f"mdb_{btn_n}"})
+                if elems:
+                    blocks.append({"type": "actions", "elements": elems})
+            continue
         body = "\n".join((x[0] + (f"  <{x[1]}|{x[2]}>" if len(x) > 2 and str(x[1]).startswith("http") else "")
                           + (f"  <{x[3]}|{x[4]}>" if len(x) > 4 and str(x[3]).startswith("http") else "")) if isinstance(x, (tuple, list)) else x for x in lines)
         if "可複製" in heading:   # 要複製貼給屋主的訊息：放進程式碼區塊，Slack 上有「複製」按鈕、換行也不會跑掉
@@ -8354,6 +8381,52 @@ def _card_to_slack(card):
     if card.get("footer"):
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": card["footer"][:3000]}]})
     return blocks, _card_plain_text(card)
+
+
+def _blocks_to_mrkdwn(blocks):
+    """Slack 不收 blocks 時的備援：把區塊攤成帶連結的文字。"""
+    out = []
+    for blk in blocks:
+        t = blk.get("type")
+        if t == "header":
+            out.append("*" + blk["text"]["text"] + "*")
+        elif t == "section" and blk.get("text"):
+            out.append(blk["text"]["text"])
+        elif t == "actions":
+            out.append("　".join(f"<{e['url']}|{e['text']['text']}>" for e in blk.get("elements", []) if e.get("url")))
+        elif t == "context":
+            out.append("_" + " ".join(e.get("text", "") for e in blk.get("elements", [])) + "_")
+    return "\n".join(x for x in out if x)
+
+
+SLACK_ME_ERRORS = {
+    "": "還沒設定 SLACK_USER_TOKEN（Render 環境變數）：到 Slack App 的 OAuth & Permissions 新增 User Token Scopes：chat:write、im:write，重新安裝後把 User OAuth Token 設進 Render。",
+    "invalid_auth": "SLACK_USER_TOKEN 不正確，請重新複製 User OAuth Token（xoxp- 開頭）。",
+    "not_authed": "SLACK_USER_TOKEN 不正確，請重新複製 User OAuth Token（xoxp- 開頭）。",
+    "token_revoked": "SLACK_USER_TOKEN 已被撤銷，請重新安裝 Slack App 後取得新的 User OAuth Token。",
+    "missing_scope": "Slack 個人權限不夠：User Token Scopes 需要 chat:write 和 im:write，加好後要重新安裝 App。",
+}
+
+
+def _slack_send_as_me(slack_id, cards):
+    """用使用者本人的 Slack 帳號私訊 slack_id（SLACK_USER_TOKEN）。回傳 (ok, 白話錯誤)。"""
+    tok = _slack_user_token()
+    if not tok:
+        return False, SLACK_ME_ERRORS[""]
+    opened = _slack_call("conversations.open", {"users": slack_id}, token=tok)
+    if not opened.get("ok"):
+        e = opened.get("error") or "conversations.open 失敗"
+        return False, SLACK_ME_ERRORS.get(e, f"Slack 開啟私訊失敗：{e}")
+    ch = opened["channel"]["id"]
+    for c in cards:
+        blocks, plain = _card_to_slack(c)
+        res = _slack_call("chat.postMessage", {"channel": ch, "blocks": blocks, "text": plain[:3000], "unfurl_links": False}, token=tok)
+        if not res.get("ok") and res.get("error") not in ("missing_scope", "invalid_auth", "not_authed", "token_revoked", "channel_not_found"):
+            res = _slack_call("chat.postMessage", {"channel": ch, "text": _blocks_to_mrkdwn(blocks)[:39000], "unfurl_links": False}, token=tok)
+        if not res.get("ok"):
+            e = res.get("error") or "chat.postMessage 失敗"
+            return False, SLACK_ME_ERRORS.get(e, f"Slack 傳送失敗：{e}")
+    return True, ""
 
 
 def _slack_dm(user_id, card=None, text=""):
@@ -9565,6 +9638,16 @@ def _md_share_build(data):
     return (_md_assistant_cards(to, items) if items else []), items
 
 
+def _md_send_slack_me(name, cards):
+    try:
+        sid = _get_binding((name or "").strip()).get("slack")
+    except Exception as e:
+        return False, f"查綁定失敗：{e}"
+    if not sid:
+        return False, f"{name} 還沒綁定 Slack，沒辦法用 Slack 傳（可到「💬 Slack 綁定」設定）"
+    return _slack_send_as_me(sid, cards)
+
+
 def _md_push_cards_to_name(name, cards, text):
     """業務有綁 LINE → 字卡輪播一則送出；有綁 Slack → 每張字卡私訊。LINE 失敗（含沒綁／額度用完）退回純文字。"""
     name = (name or "").strip()
@@ -9792,23 +9875,27 @@ def md_notice_preview():
             to = (request.args.get("to") or "").strip()
             items = _md_assistant_items((request.args.get("vendor") or "").strip())
             bound = False
+            slack_bound = False
             if to:
                 try:
                     b = _get_binding(to)
                     bound = bool(b["uid"] or b["slack"])
+                    slack_bound = bool(b["slack"])
                 except Exception:
                     bound = False
             return jsonify({"role": "assistant", "to": to, "rep": to, "count": len(items), "ids": [i["id"] for i in items],
                             "bound": bound, "share_url": _md_share_url(ma=to, v=(request.args.get("vendor") or "").strip()) if items else "",
-                            "items": _md_preview_items(items),
+                            "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_me_ready": bool(_slack_user_token()),
                             "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
         rep = (request.args.get("rep") or "").strip()
         items = _md_rep_items(rep)
         bound = False
+        slack_bound = False
         if rep:
             try:
                 b = _get_binding(rep)
                 bound = bool(b["uid"] or b["slack"])
+                slack_bound = bool(b["slack"])
             except Exception:
                 bound = False
     except Exception as e:
@@ -9817,7 +9904,7 @@ def md_notice_preview():
     miss = sorted({i["case_no"] for i in items if i["case_no"] and not _md_folder_url(i["case_no"])})
     return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
                     "cards": len(cards), "no_folder": miss, "share_url": _md_share_url(mr=rep) if items else "",
-                    "items": _md_preview_items(items),
+                    "items": _md_preview_items(items), "slack_bound": slack_bound, "slack_me_ready": bool(_slack_user_token()),
                     "text": _md_build_message(rep, items) if items else ""})
 
 
@@ -9840,6 +9927,11 @@ def md_notify():
             return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
         text = _md_build_assistant_message(to or "業務助理", items)
         cards = _md_assistant_cards(to, items)
+        if body.get("via") == "slack_me" and not manual:
+            ok, err = _md_send_slack_me(to, cards)
+            if ok:
+                _md_stamp_notified(items)
+            return jsonify({"ok": True, "sent": ok, "count": len(items), "text": text, "error": err})
         sent = True if manual else _md_push_cards_to_name(to, cards, text)
         if sent:
             _md_stamp_notified(items)
@@ -9855,6 +9947,11 @@ def md_notify():
         return jsonify({"error": f"{rep} 名下目前沒有缺件"}), 400
     text = _md_build_message(rep, items)
     cards = _md_notice_cards(rep, items)
+    if body.get("via") == "slack_me" and not manual:   # 2026-11-16：用使用者本人的 Slack 帳號私訊（不是機器人），不另傳副本（自己的私訊就看得到）
+        ok, err = _md_send_slack_me(rep, cards)
+        if ok:
+            _md_stamp_notified([i for i in items if i["provider"] != "業務助理"])
+        return jsonify({"ok": True, "sent": ok, "count": len(items), "text": text, "to": rep, "copied": False, "error": err})
     sent = True if manual else _md_push_cards_to_name(rep, cards, text)
     copied = False
     if sent and not manual:
