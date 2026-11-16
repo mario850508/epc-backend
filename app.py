@@ -9289,15 +9289,72 @@ def _md_today():
     return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
 
 
+# 2026-11-16 業務離職交接：離職業務 → 繼任業務。對照表存在「系統狀態」表（key=md_handover），
+# 缺件讀出來時把 rep 換成繼任者（Airtable 原始資料不動，取消交接就恢復），並記 handover_from 讓訊息／列表註明「某某的案件」。
+MD_HANDOVER_KEY = "md_handover"
+MD_HANDOVER = {"data": None, "at": 0.0}
+
+
+def _md_handover_map(force=False):
+    """{離職業務: {"to": 繼任業務, "since": 日期}}；60 秒快取。"""
+    if not force and MD_HANDOVER["data"] is not None and time.time() - MD_HANDOVER["at"] < 60:
+        return MD_HANDOVER["data"]
+    data = {}
+    try:
+        raw = _state_get_long(MD_HANDOVER_KEY)
+        if raw:
+            data = json.loads(raw)
+    except Exception as e:
+        print(f"[md_handover] 讀取交接對照表失敗：{e!r}", flush=True)
+        if MD_HANDOVER["data"] is not None:
+            return MD_HANDOVER["data"]
+    MD_HANDOVER.update({"data": data, "at": time.time()})
+    return data
+
+
+def _md_handover_lookup(name, hv):
+    """name 在對照表裡的 key（直接寫法或業務名單統一名字）；沒有回 None。"""
+    name = (name or "").strip()
+    if not name:
+        return None
+    for cand in (name, _canon_rep(name)):
+        if cand in hv:
+            return cand
+    return None
+
+
+def _md_resolve_rep(raw):
+    """回傳 (實際負責業務, 原業務)。沒有交接＝(raw, "")；最多連續轉 3 層，避免循環。"""
+    hv = _md_handover_map()
+    if not hv:
+        return raw, ""
+    cur, origin = raw, ""
+    for _ in range(3):
+        k = _md_handover_lookup(cur, hv)
+        if not k:
+            break
+        origin = origin or (raw or k)
+        cur = hv[k].get("to") or cur
+    return cur, origin
+
+
+def _md_case_tag(its):
+    """案場名稱後面的註記：這案原本是哪位（已離職）業務的。"""
+    src = (its[0].get("handover_from") or "") if its else ""
+    return f"（{src}的案件）" if src else ""
+
+
 def _md_to_dict(r):
     f = r["fields"]
 
     def g(k):
         return f.get(MD_F[k])
 
+    rep_raw = g("rep") or ""
+    rep_eff, rep_from = _md_resolve_rep(rep_raw)
     return {
         "id": r["id"], "alias": g("alias") or "", "case_no": g("case_no") or "", "vendor": g("vendor") or "",
-        "doc_type": g("doc_type") or "", "note": g("note") or "", "rep": g("rep") or "",
+        "doc_type": g("doc_type") or "", "note": g("note") or "", "rep": rep_eff, "rep_raw": rep_raw, "handover_from": rep_from,
         "provider": g("provider") or "", "status": g("status") or MD_STATUS_MISSING,
         "created": g("created") or "", "confirmed": g("confirmed") or "", "got": g("got") or "",
         "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
@@ -9416,6 +9473,14 @@ def md_update(rec_id):
     for key in ("note", "rep", "provider", "doc_type"):
         if key in body:
             fields[MD_F[key]] = (body.get(key) or "").strip()
+    if "rep" in body and _md_handover_map():
+        try:
+            cur = requests.get(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=20).json()
+            raw = (cur.get("fields", {}).get(MD_F["rep"]) or "").strip()
+            if raw and _md_resolve_rep(raw)[0] == (body.get("rep") or "").strip() and _md_resolve_rep(raw)[1]:
+                fields.pop(MD_F["rep"], None)   # 沒改業務，保留原始（離職）業務，交接取消才會恢復
+        except Exception as e:
+            print(f"[md_update] 查原始業務失敗：{e!r}", flush=True)
     if body.get("status") in (MD_STATUS_MISSING, MD_STATUS_GOT):
         fields[MD_F["status"]] = body["status"]
         fields[MD_F["got"]] = _md_today() if body["status"] == MD_STATUS_GOT else None
@@ -9465,6 +9530,64 @@ def md_restore(rec_id):
     return jsonify({"ok": True, "status": prev})
 
 
+@app.route("/api/missing-docs/handover", methods=["GET"])
+def md_handover_list():
+    """交接清單＋可選的人。candidates＝目前缺件裡出現過、還沒交接的業務名字（離職的人從這裡選）；reps＝業務名單（繼任者從這裡選）。"""
+    try:
+        hv = _md_handover_map(force=True)
+        items = _md_load(only_missing=True)
+        counts = collections.Counter(i["handover_from"] for i in items if i.get("handover_from"))
+        out = [{"from": k, "to": v.get("to", ""), "since": v.get("since", ""), "count": counts.get(k, 0)} for k, v in hv.items()]
+        raw_names = sorted({i["rep_raw"] for i in items if i["rep_raw"] and not i.get("handover_from")})
+        reps = sorted({r["name"] for r in _load_reps()["reps"]})
+        return jsonify({"handovers": out, "candidates": raw_names, "reps": reps})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+
+
+@app.route("/api/missing-docs/handover", methods=["POST"])
+def md_handover_set():
+    """body: {from, to}。to 有填＝設定交接（這位業務的缺件改掛繼任者，並清掉舊的通知記錄讓繼任者重新收到通知）；to 空＝取消交接。"""
+    body = request.get_json(force=True) or {}
+    src = (body.get("from") or "").strip()
+    to = (body.get("to") or "").strip()
+    if not src:
+        return jsonify({"error": "請選擇離職的業務"}), 400
+    try:
+        hv = dict(_md_handover_map(force=True))
+        key = _md_handover_lookup(src, hv) or src
+        if not to:
+            hv.pop(key, None)
+            _state_set_long(MD_HANDOVER_KEY, json.dumps(hv, ensure_ascii=False))
+            MD_HANDOVER.update({"data": hv, "at": time.time()})
+            return jsonify({"ok": True, "cancelled": key})
+        to = _canon_rep(to)
+        if to == src or to == key or _canon_rep(src) == to:
+            return jsonify({"error": "繼任業務不能是本人"}), 400
+        # 不能形成循環（繼任者本身又交接回離職者）
+        nxt, seen = to, {key}
+        for _ in range(4):
+            k2 = _md_handover_lookup(nxt, hv)
+            if not k2:
+                break
+            if k2 in seen:
+                return jsonify({"error": "這樣會形成循環交接，請先取消另一筆"}), 400
+            seen.add(k2)
+            nxt = hv[k2].get("to") or nxt
+        moved = [i for i in _md_load(only_missing=True) if i["rep_raw"] and _md_handover_lookup(i["rep_raw"], {key: 1}) == key]
+        hv[key] = {"to": to, "since": _md_today()}
+        _state_set_long(MD_HANDOVER_KEY, json.dumps(hv, ensure_ascii=False))
+        MD_HANDOVER.update({"data": hv, "at": time.time()})
+        # 舊的「已通知／已補件」是對離職的人記的，繼任者還沒收到 → 清掉，才會顯示未通知
+        for i in range(0, len(moved), 10):
+            chunk = moved[i:i + 10]
+            requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+                {"id": it["id"], "fields": {MD_F["notified"]: None, MD_F["notify_count"]: 0, MD_F["supplied"]: None}} for it in chunk]})
+        return jsonify({"ok": True, "from": key, "to": to, "moved": len(moved)})
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 502
+
+
 @app.route("/api/missing-docs/confirm", methods=["POST"])
 def md_confirm_many():
     """每週確認：把一批缺件標成「今天已確認」。body: {ids:[...]}。"""
@@ -9493,7 +9616,7 @@ def _md_lines_by_case(items, show_rep=False):
         if vendor:
             lines += [f"◆{vendor}缺件", ""]
         for name, its in cases.items():
-            lines.append(f"▍{name}" + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else ""))
+            lines.append(f"▍{name}" + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else "") + _md_case_tag(its))
             for it in its:
                 extra = f"（{it['note']}）" if it["note"] else ""
                 lines.append(f"　・{it['doc_type']}{extra}")
@@ -9579,7 +9702,7 @@ def _md_cards(items, tag, color, title, subtitle, btn_label, show_rep=False, foo
             for v, name, its in chunk:
                 if v != vendor:
                     continue
-                head = name + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else "")
+                head = name + (f"（業務：{its[0]['rep']}）" if show_rep and its[0]["rep"] else "") + _md_case_tag(its)
                 body = "\n".join(f"・{it['doc_type']}" + (f"（{it['note']}）" if it["note"] else "") for it in its)
                 url = _md_folder_url(its[0]["case_no"])
                 text = f"{head}\n{body}"
@@ -9880,7 +10003,8 @@ def md_got_notice_mark():
 def _md_preview_items(items):
     """預覽視窗列出全部缺件（跨廠商，依廠商分段）用：只給前端顯示需要的欄位。"""
     return [{"id": i["id"], "vendor": i["vendor"], "alias": i["alias"] or i["case_no"], "doc_type": i["doc_type"],
-             "note": i["note"], "provider": i["provider"], "notified": i["notified"], "supplied": i["supplied"]} for i in items]
+             "note": i["note"], "provider": i["provider"], "notified": i["notified"], "supplied": i["supplied"],
+             "handover_from": i.get("handover_from", "")} for i in items]
 
 
 @app.route("/api/missing-docs/notice", methods=["GET"])
