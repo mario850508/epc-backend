@@ -9638,6 +9638,22 @@ def _md_share_build(data):
     return (_md_assistant_cards(to, items) if items else []), items
 
 
+@app.route("/api/missing-docs/slack-me-test", methods=["POST"])
+def md_slack_me_test():
+    """用本人 Slack 帳號傳一張「測試字卡」給使用者自己（預設 Slack 收件人），確認 SLACK_USER_TOKEN 與字卡版面；不動任何缺件資料、不傳給業務。"""
+    sid = _slack_default_user()
+    if not sid:
+        return jsonify({"ok": False, "error": "還沒設定預設 Slack 收件人（Slack 綁定畫面的「我的通知」）"}), 400
+    fake = [{"id": "test", "alias": "【測試】五結新店1+3+5", "case_no": "潤特宜蘭40號", "vendor": "三創", "doc_type": "電費單", "note": "一樓",
+             "rep": "（測試）", "provider": "業務", "notified": "", "supplied": ""}]
+    cards = _md_notice_cards("（測試）", fake)
+    for c in cards:
+        c["tag"] = "🧪 測試｜" + c["tag"]
+        c["footer"] = "這是系統測試字卡，不是真的缺件，按「已補件」也不會有任何作用。"
+    ok, err = _slack_send_as_me(sid, cards)
+    return jsonify({"ok": ok, "error": err})
+
+
 def _md_send_slack_me(name, cards):
     try:
         sid = _get_binding((name or "").strip()).get("slack")
