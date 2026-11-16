@@ -9182,11 +9182,14 @@ MD_F = {
     "provider": "fld61thfg3BhdkD5A", "status": "fld0BWszqHASi1p8u", "created": "fldrthxYsx6PO4Efh",
     "confirmed": "fldSeCVW1w4Flkv4R", "got": "fldLUmDsNHrw1Hrj8", "notified": "fldGIqa2OxbwU2MHx",
     "notify_count": "fldGWKyrcc9H0afA1",
+    "deleted": "fldz3B40m7TjhjMde", "prev_status": "fldtQWwy9ZG6Kvegg",   # 2026-11-16 刪除改成「已刪除」可還原
     "vendor_notified": "fldqZ2Gznskb8e8dz",   # 2026-11-04 已把「補件完成」通知廠商的日期
     "supplied": "fldW5DnCptA9NF0w1",   # 2026-11-03 業務在字卡按「✅ 已補件」的日期（等陽光確認後才標已取得）
     "source": "fldErz5HBNOAtkz9N", "reporter": "fldgA6l4c0aucxF64",   # 2026-11-02 廠商填報:來源=「廠商填報」、填報人=聯絡人
 }
 MD_STATUS_MISSING, MD_STATUS_GOT = "缺件", "已取得"
+MD_STATUS_DELETED = "已刪除"   # 軟刪除：列表看不到，「最近刪除」可還原
+MD_DELETED_KEEP_DAYS = 60
 MD_PROVIDER_MARIO = "Mario"   # 這類資料由 Mario 自己提供（例如出場保固書），不會寫進通知業務的訊息
 
 
@@ -9208,13 +9211,15 @@ def _md_to_dict(r):
         "notified": g("notified") or "", "notify_count": g("notify_count") or 0,
         "source": g("source") or "", "reporter": g("reporter") or "", "supplied": g("supplied") or "",
         "vendor_notified": g("vendor_notified") or "",
+        "deleted": g("deleted") or "", "prev_status": g("prev_status") or "",
     }
 
 
-def _md_load(only_missing=False):
+def _md_load(only_missing=False, include_deleted=False):
     formula = f"{{{MD_F['status']}}}='{MD_STATUS_MISSING}'" if only_missing else "TRUE()"
     recs = airtable_get_all(MD_API_URL, formula, list(MD_F.values()))
-    return [_md_to_dict(r) for r in recs]
+    items = [_md_to_dict(r) for r in recs]
+    return items if include_deleted else [i for i in items if i["status"] != MD_STATUS_DELETED]
 
 
 def _md_default_provider(doc_type):
@@ -9230,10 +9235,14 @@ def _md_default_provider(doc_type):
 @app.route("/api/missing-docs", methods=["GET"])
 def md_list():
     try:
-        items = _md_load()
+        everything = _md_load(include_deleted=True)
     except Exception as e:
         return jsonify({"error": str(e), "items": []}), 502
-    return jsonify({"items": items, "today": _md_today()})
+    cut = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=MD_DELETED_KEEP_DAYS)).strftime("%Y-%m-%d")
+    items = [i for i in everything if i["status"] != MD_STATUS_DELETED]
+    deleted = sorted((i for i in everything if i["status"] == MD_STATUS_DELETED and (i["deleted"] or "9999") >= cut),
+                     key=lambda x: x["deleted"], reverse=True)
+    return jsonify({"items": items, "deleted": deleted, "today": _md_today()})
 
 
 @app.route("/api/missing-docs", methods=["POST"])
@@ -9331,10 +9340,37 @@ def md_update(rec_id):
 
 @app.route("/api/missing-docs/<rec_id>", methods=["DELETE"])
 def md_delete(rec_id):
-    resp = requests.delete(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), timeout=20)
+    """不是真的刪：標成「已刪除」＋記刪除日與刪除前狀態，之後可在「最近刪除」還原（2026-11-16 使用者誤刪後要求）。"""
+    got = requests.get(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=20)
+    if got.status_code >= 400:
+        return jsonify({"error": "找不到這筆缺件", "detail": got.text}), 404
+    prev = got.json().get("fields", {}).get(MD_F["status"]) or MD_STATUS_MISSING
+    if prev == MD_STATUS_DELETED:
+        return jsonify({"ok": True})
+    resp = requests.patch(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), timeout=20, json={"fields": {
+        MD_F["status"]: MD_STATUS_DELETED, MD_F["deleted"]: _md_today(), MD_F["prev_status"]: prev}})
     if resp.status_code >= 400:
         return jsonify({"error": "Airtable 刪除失敗", "detail": resp.text}), 502
     return jsonify({"ok": True})
+
+
+@app.route("/api/missing-docs/<rec_id>/restore", methods=["POST"])
+def md_restore(rec_id):
+    """把「已刪除」的缺件還原成刪除前的狀態（缺件／已取得）。"""
+    got = requests.get(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), params={"returnFieldsByFieldId": "true"}, timeout=20)
+    if got.status_code >= 400:
+        return jsonify({"error": "找不到這筆缺件", "detail": got.text}), 404
+    f = got.json().get("fields", {})
+    if f.get(MD_F["status"]) != MD_STATUS_DELETED:
+        return jsonify({"ok": True, "status": f.get(MD_F["status"])})
+    prev = f.get(MD_F["prev_status"]) or MD_STATUS_MISSING
+    if prev not in (MD_STATUS_MISSING, MD_STATUS_GOT):
+        prev = MD_STATUS_MISSING
+    resp = requests.patch(f"{MD_API_URL}/{rec_id}", headers=airtable_headers(), timeout=20, json={"fields": {
+        MD_F["status"]: prev, MD_F["deleted"]: None, MD_F["prev_status"]: ""}})
+    if resp.status_code >= 400:
+        return jsonify({"error": "Airtable 還原失敗", "detail": resp.text}), 502
+    return jsonify({"ok": True, "status": prev})
 
 
 @app.route("/api/missing-docs/confirm", methods=["POST"])
