@@ -3381,6 +3381,8 @@ def _split_share_token(token):
         return token[:-5], "card"
     if token.endswith("~vb"):
         return token[:-3], "vb"
+    if token.endswith("~mc"):
+        return token[:-3], "mc"
     return token, "vendor"
 
 
@@ -3419,6 +3421,13 @@ def vendor_share_get(token):
                 return jsonify({"error": "這天已經沒有元晶到貨的訂單（可能已改期或出貨）"}), 404
             card = _driver_request_card(target, cases)
             return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "card", "sent_at": ""})
+        if data.get("mr") is not None or data.get("ma") is not None:   # 缺件通知字卡：使用者自己選要傳給哪位業務（2026-11-16）
+            cards, _stamp = _md_share_build(data)
+            if not cards:
+                return jsonify({"error": "目前沒有需要通知的缺件（可能已經補齊或被刪除）"}), 404
+            flex = _card_to_flex(cards[0]) if len(cards) == 1 else {"type": "carousel", "contents": [_card_to_flex(c) for c in cards[:MD_CARD_MAX]]}
+            alt = "｜".join(f"{c['tag']}：{c['title']}" for c in cards)[:390]
+            return jsonify({"kind": "mc", "cards": cards, "flex": flex, "alt": alt, "count": len(cards), "sent_at": ""})
         b = _case_brief(data.get("c"))
         if kind == "own":   # 要傳給屋主的文字訊息
             fn = _owner_confirm_msg if data.get("m") == "confirm" else _reminder_owner_msg
@@ -3452,6 +3461,16 @@ def vendor_share_sent(token):
             except Exception as e:
                 print(f"[vendor_share_sent] 記錄廠商通知時間失敗 {bid}：{e}", flush=True)
         return jsonify({"ok": True, "sent_at": now})
+    if kind == "mc":   # 缺件字卡：使用者用自己的 LINE 傳出去了 → 這批缺件記「已通知」
+        data = _reminder_token_parse(token)
+        if not data or (data.get("mr") is None and data.get("ma") is None):
+            return jsonify({"error": "找不到這則缺件通知"}), 404
+        try:
+            _cards, stamp = _md_share_build(data)
+            _md_stamp_notified(stamp)
+        except Exception as e:
+            print(f"[vendor_share_sent] 記錄缺件已通知失敗：{e!r}", flush=True)
+        return jsonify({"ok": True})
     if kind in ("rep", "own", "fwd", "card"):   # 通知業務／傳給屋主／廠商轉分享不記錄「已通知廠商」
         return jsonify({"ok": True})
     try:
@@ -9519,6 +9538,33 @@ def _md_notice_cards(rep, items):
     return cards[:MD_CARD_MAX]
 
 
+def _md_assistant_cards(to, items):
+    return _md_cards(items, "📎 缺件申請｜請協助申請", "#D97706", f"{to or '業務助理'} 您好，以下案場廠商還缺資料",
+                     "麻煩協助申請取得後，按「📂 上傳」放進該案的雲端資料夾，放好再按「✅ 已補件」。", "📂 上傳", show_rep=True,
+                     footer_extra="按「✅ 已補件」系統會直接通知我，謝謝！", supply_scope="assist", supply_who=to or "業務助理")
+
+
+def _md_share_url(**data):
+    """缺件字卡的 LIFF 分享連結（2026-11-16）：使用者自己的 LINE 開啟→預覽字卡→shareTargetPicker 選要傳給哪位業務／群組。
+    token 只記收件對象（mr＝業務名字；ma＝業務助理收件人、v＝廠商），打開時現場依最新缺件重建字卡。7 天有效。沒設 LIFF_ID 回空字串。"""
+    liff_id = os.environ.get("LIFF_ID", "").strip()
+    if not liff_id:
+        return ""
+    token = _reminder_token_make({**data, "x": int(time.time()) + 7 * 86400})
+    return f"https://liff.line.me/{liff_id}?vshare={token}~mc"
+
+
+def _md_share_build(data):
+    """依分享 token 的內容現場重建字卡。回傳 (cards, 要記「已通知」的項目)。"""
+    if data.get("mr") is not None:
+        rep = data["mr"]
+        items = _md_rep_items(rep)
+        return (_md_notice_cards(rep, items) if items else []), [i for i in items if i["provider"] != "業務助理"]
+    to = data.get("ma") or ""
+    items = _md_assistant_items(data.get("v") or "")
+    return (_md_assistant_cards(to, items) if items else []), items
+
+
 def _md_push_cards_to_name(name, cards, text):
     """業務有綁 LINE → 字卡輪播一則送出；有綁 Slack → 每張字卡私訊。LINE 失敗（含沒綁／額度用完）退回純文字。"""
     name = (name or "").strip()
@@ -9747,7 +9793,8 @@ def md_notice_preview():
                 except Exception:
                     bound = False
             return jsonify({"role": "assistant", "to": to, "rep": to, "count": len(items), "ids": [i["id"] for i in items],
-                            "bound": bound, "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
+                            "bound": bound, "share_url": _md_share_url(ma=to, v=(request.args.get("vendor") or "").strip()) if items else "",
+                            "text": _md_build_assistant_message(to or "業務助理", items) if items else ""})
         rep = (request.args.get("rep") or "").strip()
         items = _md_rep_items(rep)
         bound = False
@@ -9762,7 +9809,7 @@ def md_notice_preview():
     cards = _md_notice_cards(rep, items) if items else []
     miss = sorted({i["case_no"] for i in items if i["case_no"] and not _md_folder_url(i["case_no"])})
     return jsonify({"rep": rep, "count": len(items), "ids": [i["id"] for i in items], "bound": bound,
-                    "cards": len(cards), "no_folder": miss,
+                    "cards": len(cards), "no_folder": miss, "share_url": _md_share_url(mr=rep) if items else "",
                     "text": _md_build_message(rep, items) if items else ""})
 
 
@@ -9784,9 +9831,7 @@ def md_notify():
         if not items:
             return jsonify({"error": "目前沒有業務助理要處理的缺件"}), 400
         text = _md_build_assistant_message(to or "業務助理", items)
-        cards = _md_cards(items, "📎 缺件申請｜請協助申請", "#D97706", f"{to or '業務助理'} 您好，以下案場廠商還缺資料",
-                          "麻煩協助申請取得後，按「📂 上傳」放進該案的雲端資料夾，放好再按「✅ 已補件」。", "📂 上傳", show_rep=True,
-                          footer_extra="按「✅ 已補件」系統會直接通知我，謝謝！", supply_scope="assist", supply_who=to or "業務助理")
+        cards = _md_assistant_cards(to, items)
         sent = True if manual else _md_push_cards_to_name(to, cards, text)
         if sent:
             _md_stamp_notified(items)
