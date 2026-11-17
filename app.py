@@ -5985,9 +5985,42 @@ def vendor_portal_missing_list(token):
             continue
         out.append({"id": i["id"], "case_no": i["case_no"], "alias": i["alias"], "doc_type": i["doc_type"], "note": i["note"],
                     "status": i["status"], "created": i["created"], "got": i["got"],
+                    "folder": _md_folder_url(i["case_no"]),   # 2026-11-17 業務雲端資料夾連結（廠商不用另外找）
                     "mine": i["source"] == VP_MD_SOURCE, "cancel": i["source"] == VP_MD_SOURCE and i["status"] == MD_STATUS_MISSING})
     out.sort(key=lambda x: (x["status"] != MD_STATUS_MISSING, x["case_no"]))
     return jsonify({"items": out, "types": VP_MD_TYPES})
+
+
+VP_COUNTY_ORDER = ["桃園", "新北", "新竹", "苗栗", "宜蘭"]
+
+
+@app.route("/api/vendor-portal/<token>/unmetered")
+def vendor_portal_unmetered(token):
+    """2026-11-17：這家廠商進行中、還沒掛表的案件，附縣市、潤特／工程、目前階段、業務雲端資料夾連結。"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    try:
+        stages = {s["case"]: s["stage"] for s in _vp_stage_cases(vendor)}   # 順便把案件池載好
+        pool = _VP_STAGE_CACHE["pool"].get(vendor, [])
+        _ensure_biz_snapshots_loaded()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    cancelled = CANCELLED_CASE_CACHE["case_nos"]
+    out, seen = [], set()
+    for r in pool:
+        f = r["fields"]
+        cn = f.get(FIELD_CASE_NO, "")
+        if not cn or cn in cancelled or cn in seen:
+            continue
+        seen.add(cn)
+        addr = " ".join((f.get(FIELD_ADDRESS) or "").split())
+        alias = f.get(FIELD_ALIAS, "") or ""
+        out.append({"case": cn, "alias": alias, "address": addr,
+                    "county": _county_of(addr, cn, alias, CASE_ADDR_CACHE.get(cn, "")) or "其他",
+                    "kind": "潤特" if cn.startswith("潤特") else "工程",
+                    "stage": stages.get(cn, ""), "folder": _md_folder_url(cn)})
+    return jsonify({"items": out, "county_order": VP_COUNTY_ORDER})
 
 
 @app.route("/api/vendor-portal/<token>/missing", methods=["POST"])
