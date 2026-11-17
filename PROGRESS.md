@@ -343,3 +343,4 @@ eparse_full.log。
 - 開放開關：預設不開放給廠商（bc_public|尚展），陽光先在發票請款頁上方「💰 請款確認」面板預覽，沒問題再按「開放給廠商」。
 - 後端 `_bc_compute` 約 1 分鐘（讀案件池＋多張表），10 分鐘背景暖機＋快取；廠商端沒快取時回 loading 前端輪詢。API：/api/vendor-portal/<t>/billing、/billing/upload；/api/billing/overview｜uploads｜uploads/<id>/review｜public｜history。前端 vendor.html（請款確認分頁）、billing-admin.js（陽光面板）。
 - 待確認／待做：金額顯示（合約各期金額）、Drive 自動歸檔上傳檔、其他廠商（曙光、三創）開放、sheet 歷史每小時自動同步（目前手動跑 billing_history.py）、10/8～10/28 之間沒進 Sheet 也沒進發票頁的發票會被誤判可請款。
+- 2026-11-17 使用者回覆：①桃園千塘／新竹風城／苗栗油桐先排除；已取得正式售電函的案件整案排除（`_bc_compute` 讀完文件後濾掉）。②Sheet「送電」＝正式售電（打錯字）、「工進」＝工班進場。③工班進場款的進場日期改看 Airtable 進度管理「得知指定開工日」有日期就算有（`BC_REQS`，也接受舊的「進場屋主預約」；廠商頁標示「指定開工日（由陽光系統確認）」）。④尚展 Sheet 約每兩週更新一次 → cert_agent.py 每 6 小時自動跑 billing_history.sync（cps_cert_sync\_agent_billing_stamp.txt）。

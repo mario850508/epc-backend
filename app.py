@@ -18322,6 +18322,10 @@ def route_plan():
 # 文件有沒有齊＝跟發票請款同一套規則（INV_REQS／_inv_check_req），但一次批次讀表、不逐案查。
 # ============================================================
 BC_VENDORS = ("尚展",)
+# 請款確認的節點文件規則＝發票請款的 INV_REQS，只有「工班進場款」的進場日期改成：Airtable 進度管理「得知指定開工日」有日期就算有（使用者 2026-11-17），
+# 舊的「進場屋主預約」有日期也算。
+BC_REQS = json.loads(json.dumps(INV_REQS))
+BC_REQS["工班進場款"][0]["ms"] = ["得知指定開工日", "進場屋主預約"]
 BC_UPLOAD_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tbllc4sVDaUWyZnmO"
 BC_UP_F = {"title": "fldISRBKi5TtBqzp2", "vendor": "fldhCJYjHwN1Hdiay", "case_no": "fldCD3YekkHk1ONLF", "node": "fld9EwF9edJR0Fa4O",
            "label": "fldpRxaJ4MR1QJgfZ", "file": "fldLOvyqhIkjTCURS", "status": "fldGGAvoXYTc6Igoq", "at": "fldbgJzYaw7qZVy93",
@@ -18334,7 +18338,7 @@ _BC_TTL = 600
 BC_NODE_WORDS = [("簽約款", ("簽約",)), ("同意備案款", ("同備", "同意備案")), ("材料訂購款", ("材料", "材訂", "訂購")), ("工班進場款", ("進場", "工進")),
                  ("掛錶驗收款", ("掛表", "掛錶", "驗收")), ("設備登記款", ("設登", "設備登記")), ("正式售電款", ("正式售電", "售電", "送電"))]   # 尚展發票明細的簡寫：材訂／訂購、工進、送電＝正式售電（文件款）
 # 廠商看到的文件名稱（內部名稱有些只有陽光看得懂）
-BC_PUBLIC_LABEL = {"掛表（Airtable 掛表日期＋已完成）": "掛表完成（由陽光系統確認）", "進場屋主預約時間": "進場日期（由陽光系統確認）",
+BC_PUBLIC_LABEL = {"掛表（Airtable 掛表日期＋已完成）": "掛表完成（由陽光系統確認）", "進場屋主預約時間": "指定開工日（由陽光系統確認）",
                    "驗收單（驗收合格）": "驗收單（驗收合格）"}
 
 
@@ -18418,7 +18422,7 @@ def _bc_bulk_docs(vcases):
     """一次讀齊這些案件的文件，格式跟 _inv_case_docs 一樣。"""
     docs = {c["case_no"]: {"ms": {}, "pdf": {}, "draw": {}, "ids": dict(c.get("ids") or {}), "ops": []} for c in vcases}
     t_ms, t_pdf, t_draw = set(), set(), set()
-    for reqs in INV_REQS.values():
+    for reqs in BC_REQS.values():
         for r in reqs:
             t_ms |= set(r.get("ms") or [])
             t_pdf |= set(r.get("pdf") or [])
@@ -18470,6 +18474,8 @@ def _bc_compute(vendor):
     active = [c for c in allv if c.get("closed") in ("進行中", "TRUE") and c["case_no"] not in cancelled]
     paid, unmatched = _bc_paid_map(vendor, allv)
     docs = _bc_bulk_docs(active)
+    # 已經取得正式售電函的案件整案排除（使用者 2026-11-17：這些案件都已走完，不在這個流程）
+    active = [c for c in active if not any(docs[c["case_no"]][k].get("正式售電函") for k in ("pdf", "draw", "ms"))]
     ups = _bc_uploads(vendor)
     try:
         ready_state = json.loads(_state_get_long(f"bc_ready|{vendor}") or "null")
@@ -18488,7 +18494,7 @@ def _bc_compute(vendor):
             if node in pm:
                 continue
             items, ok_n = [], 0
-            for req in INV_REQS[node]:
+            for req in BC_REQS[node]:
                 chk = _inv_check_req(req, docs[cn], today)
                 ok, via = chk["ok"], ""
                 mine = ups.get((cn, node, req["label"]), [])
