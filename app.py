@@ -10064,7 +10064,7 @@ def md_notify():
         return jsonify({"error": "Slack 收件人格式不對"}), 400
     if body.get("role") == "assistant":
         to = (body.get("to") or "").strip()
-        if not to and not manual:
+        if not to and not manual and not slack_to:
             return jsonify({"error": "請先選要傳給誰（業務助理）"}), 400
         try:
             items = _md_assistant_items((body.get("vendor") or "").strip(), body.get("ids"))
