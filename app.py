@@ -18326,6 +18326,9 @@ BC_VENDORS = ("尚展",)
 # 舊的「進場屋主預約」有日期也算。
 BC_REQS = json.loads(json.dumps(INV_REQS))
 BC_REQS["工班進場款"][0]["ms"] = ["得知指定開工日", "進場屋主預約"]
+# 簽約款：不能用專案細節的「合約編號」當證明（合約編號在產生合約時就先編好，還沒簽也有；使用者 2026-11-17 抽查工程苗栗18號）。
+# 要有進度管理「工程合約簽約」日期，或已歸檔／同步的工程合約檔才算。
+BC_REQS["簽約款"][0].pop("id", None)
 BC_UPLOAD_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tbllc4sVDaUWyZnmO"
 BC_UP_F = {"title": "fldISRBKi5TtBqzp2", "vendor": "fldhCJYjHwN1Hdiay", "case_no": "fldCD3YekkHk1ONLF", "node": "fld9EwF9edJR0Fa4O",
            "label": "fldpRxaJ4MR1QJgfZ", "file": "fldLOvyqhIkjTCURS", "status": "fldGGAvoXYTc6Igoq", "at": "fldbgJzYaw7qZVy93",
