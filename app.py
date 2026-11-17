@@ -18563,15 +18563,62 @@ def _bc_public(vendor):
         return False
 
 
-def _bc_get_nowait(vendor):
-    """有快取就回快取；沒有就在背景算，先回 None（前端稍後再要）。"""
-    ent = _BC_CACHE.get(vendor)
+_BC_REFRESHING = set()
+
+
+def _bc_store(vendor, data, ts=None):
+    """放進記憶體快取，同時存一份到狀態表（後端重啟後直接還原，不用等 2 分鐘重算）。"""
+    _BC_CACHE[vendor] = {"ts": time.time() if ts is None else ts, "data": data}
+    try:
+        _state_put_chunked(f"bc_cache|{vendor}", json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        print(f"[billing] 存結果快取失敗：{e}", flush=True)
+
+
+def _bc_restore(vendor):
+    """記憶體沒有時從狀態表還原上次的結果（當成已過期，會馬上在背景重算）。"""
+    try:
+        raw = _state_get_chunked(f"bc_cache|{vendor}")
+        if raw:
+            data = json.loads(raw)
+            _BC_CACHE[vendor] = {"ts": 0, "data": data}
+            return _BC_CACHE[vendor]
+    except Exception as e:
+        print(f"[billing] 還原結果快取失敗：{e}", flush=True)
+    return None
+
+
+def _bc_refresh_bg(vendor):
+    """背景重算（同一家同時只跑一個）。"""
+    if vendor in _BC_REFRESHING:
+        return
+    _BC_REFRESHING.add(vendor)
+
+    def run():
+        try:
+            _bc_get(vendor, force=True)
+        except Exception as e:
+            print(f"[billing] 背景重算 {vendor} 失敗：{e}", flush=True)
+        finally:
+            _BC_REFRESHING.discard(vendor)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _bc_invalidate(vendor=None):
+    """資料有變（上傳／確認／歷史更新）：舊結果先留著給人看，標成過期，下次有人看就背景重算。"""
+    for v in ([vendor] if vendor else list(_BC_CACHE)):
+        if v in _BC_CACHE:
+            _BC_CACHE[v]["ts"] = 0
+
+
+def _bc_get_nowait(vendor, force_refresh=False):
+    """有結果就馬上回（再過期也先給舊的，同時背景重算）；完全沒有才回 None（前端稍後再要）。"""
+    ent = _BC_CACHE.get(vendor) or _bc_restore(vendor)
     if ent:
-        if time.time() - ent["ts"] >= _BC_TTL and not _BC_LOCK.locked():
-            threading.Thread(target=lambda: _bc_get(vendor, force=True), daemon=True).start()
+        if force_refresh or time.time() - ent["ts"] >= _BC_TTL:
+            _bc_refresh_bg(vendor)
         return ent["data"]
-    if not _BC_LOCK.locked():
-        threading.Thread(target=lambda: _bc_get(vendor, force=True), daemon=True).start()
+    _bc_refresh_bg(vendor)
     return None
 
 
@@ -18584,7 +18631,7 @@ def _bc_get(vendor, force=False):
         if ent and not force and time.time() - ent["ts"] < 60:
             return ent["data"]
         data = _bc_compute(vendor)
-        _BC_CACHE[vendor] = {"ts": time.time(), "data": data}
+        _bc_store(vendor, data)
         return data
 
 
@@ -18658,7 +18705,16 @@ def vendor_portal_billing_upload(token):
             return jsonify({"error": "檔案上傳失敗：" + r.text[:200]}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 502
-    _BC_CACHE.pop(vendor, None)
+    _bc_invalidate(vendor)
+    ent = _BC_CACHE.get(vendor)
+    if ent:   # 先把上傳狀態直接寫進舊結果，廠商一重新整理就看到「已上傳、等陽光確認」，不用等重算
+        for c in ent["data"].get("cases", []):
+            if c["case"] == case_no:
+                for n in c["nodes"]:
+                    if n["node"] == node:
+                        for it in n["items"]:
+                            if it["key"] == label:
+                                it["upload"], it["upload_files"], it["upload_note"] = "待確認", [filename], ""
     try:
         _line_push_card(_card("📥 廠商上傳請款文件", "#2563EB", f"{vendor}｜{case_no}", rows=[("節點", node), ("文件", label), ("檔名", filename)],
                               note="請到主控台「發票請款」頁確認或退回", button=("開啟主控台", _dash_url() + "/")))
@@ -18674,9 +18730,13 @@ def billing_overview():
     if vendor not in BC_VENDORS:
         return jsonify({"error": "這家廠商還沒開放請款確認"}), 400
     try:
-        return jsonify(_bc_get(vendor, force=request.args.get("fresh") == "1"))
+        fresh = request.args.get("fresh") == "1"
+        data = _bc_get_nowait(vendor, force_refresh=fresh)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
+    if data is None:
+        return jsonify({"loading": True, "vendor": vendor, "cases": []})
+    return jsonify(dict(data, refreshing=(vendor in _BC_REFRESHING)))
 
 
 @app.route("/api/billing/public", methods=["GET", "POST"])
@@ -18721,8 +18781,13 @@ def billing_manual_mark():
         data["ready_count"] = sum(1 for c in data["cases"] for n in c["nodes"] if n["status"] == "ready")
         data["partial_count"] = sum(1 for c in data["cases"] for n in c["nodes"] if n["status"] == "partial")
         data["manual"] = cur
+        try:
+            _state_put_chunked(f"bc_cache|{vendor}", json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            print(f"[billing] 存結果快取失敗：{e}", flush=True)
     else:
-        _BC_CACHE.pop(vendor, None)
+        _bc_invalidate(vendor)
+        _bc_refresh_bg(vendor)
     return jsonify({"ok": True, "manual": cur})
 
 
@@ -18759,7 +18824,7 @@ def billing_upload_review(rid):
     try:
         r = requests.patch(f"{BC_UPLOAD_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30)
         r.raise_for_status()
-        _BC_CACHE.clear()
+        _bc_invalidate()
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True})
@@ -18780,7 +18845,7 @@ def billing_history_push():
         return jsonify({"error": "資料太大"}), 400
     try:
         _state_set_long(f"bc_paid|{vendor}", text)
-        _BC_CACHE.pop(vendor, None)
+        _bc_invalidate(vendor)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True, "count": len(clean)})
