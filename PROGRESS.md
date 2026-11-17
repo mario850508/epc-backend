@@ -333,3 +333,13 @@ eparse_full.log。
 - 原因：碩天 Excel「已出貨訂單」表頭改成「案號」「別名」（原本「專案」「專案別名」），order_sheets.py／後端 SHIP_ALIASES 不認 → 該分頁 1600 多列全被略過，網站顯示「沒有訂單」（例：工程桃園39號）。
 - 修：兩處別名表加入「案號」「別名」；清掉 _order_sheets_state.json 的碩天 key，小幫手 15 分鐘內重新解析上傳（解析後 1828 列，含已出貨）。
 - 教訓：Excel 表頭被改名會讓整頁讀成 0 列又不報錯；之後可加「某分頁解析出 0 列」警示。
+
+## 2026-11-17 請款確認（廠商預約頁新分頁，先做尚展）
+- 背景：公司要求 EPC 先把請款節點文件給陽光，才能開發票請款（不再先開發票再判斷）。廠商預約頁新增「💰 請款確認」：列出文件已齊「可以請款」的節點、還缺文件的節點（可直接上傳），已請款過的節點排除。
+- 判斷規則＝發票請款同一套（INV_REQS／_inv_check_req），但一次批次讀表（`_bc_bulk_docs`）；只算「工程○○／潤特○○」開頭、進行中、非撤案的案件（桃園千塘／新竹風城等舊系列不在這流程，待使用者確認）。某節點「有部分文件」→ 缺件；後面的節點已有文件、這期一份都沒有 → 也算缺件；一份都沒有且後面也沒有 → 不顯示。
+- 已請款排除：①尚展 Google Sheet「發票明細」（18xX_n4LlaCoy11gaRlfeuifwivdS7wbELxvllxMGAHQ）由本機 cps_cert_sync\billing_history.py 讀取後 POST /api/billing/history，存在狀態表 bc_paid|尚展；摘要裡的節點用關鍵字判斷（同備/材訂/進場/掛表/設登/售電…），簡稱（工桃8、桃1、竹53、新4）對回案號；②發票請款頁非退回的發票。③後面的節點已請款 → 前面視為已請款（推定）。
+- 上傳：POST /api/vendor-portal/<token>/billing/upload（PDF/JPG/PNG ≤8MB）存到 Airtable「請款文件上傳」tbllc4sVDaUWyZnmO（狀態 待確認/已確認/退回）；陽光在發票請款頁上方面板按確認，該項才算齊；Slack/LINE 通知窗口。
+- 通知：節點新變成「可請款」時（第一次計算只建基準不通知）Slack 即時＋LINE 彙整給窗口（廠商沒有推播管道，靠預約頁分頁徽章＋🆕）。狀態存 bc_ready|廠商。
+- 開放開關：預設不開放給廠商（bc_public|尚展），陽光先在發票請款頁上方「💰 請款確認」面板預覽，沒問題再按「開放給廠商」。
+- 後端 `_bc_compute` 約 1 分鐘（讀案件池＋多張表），10 分鐘背景暖機＋快取；廠商端沒快取時回 loading 前端輪詢。API：/api/vendor-portal/<t>/billing、/billing/upload；/api/billing/overview｜uploads｜uploads/<id>/review｜public｜history。前端 vendor.html（請款確認分頁）、billing-admin.js（陽光面板）。
+- 待確認／待做：金額顯示（合約各期金額）、Drive 自動歸檔上傳檔、其他廠商（曙光、三創）開放、sheet 歷史每小時自動同步（目前手動跑 billing_history.py）、10/8～10/28 之間沒進 Sheet 也沒進發票頁的發票會被誤判可請款。

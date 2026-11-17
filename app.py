@@ -18314,6 +18314,427 @@ def route_plan():
     })
 
 
+# ============================================================
+# 請款確認（2026-11-17）：EPC 要先把請款節點文件給陽光，才能開發票請款。
+# 廠商預約頁「💰 請款確認」顯示：哪些節點文件已齊（可以開發票請款）、哪些節點還缺什麼（可直接上傳）。
+# 已請款的節點排除：尚展 Google Sheet「發票明細」（本機 billing_history.py 推上來，存在狀態表 bc_paid|廠商）＋
+# 發票請款頁裡（非退回）的發票。後面的節點已請款，前面的節點視為已請款（推定）。
+# 文件有沒有齊＝跟發票請款同一套規則（INV_REQS／_inv_check_req），但一次批次讀表、不逐案查。
+# ============================================================
+BC_VENDORS = ("尚展",)
+BC_UPLOAD_API_URL = f"https://api.airtable.com/v0/{BASE_ID}/tbllc4sVDaUWyZnmO"
+BC_UP_F = {"title": "fldISRBKi5TtBqzp2", "vendor": "fldhCJYjHwN1Hdiay", "case_no": "fldCD3YekkHk1ONLF", "node": "fld9EwF9edJR0Fa4O",
+           "label": "fldpRxaJ4MR1QJgfZ", "file": "fldLOvyqhIkjTCURS", "status": "fldGGAvoXYTc6Igoq", "at": "fldbgJzYaw7qZVy93",
+           "vnote": "fldewFELE82SpU4E2", "pnote": "fldxN8rGvQXtWm6xC", "by": "fld5khPr1x3sqGJ0c", "pat": "fldvf22SyOeQUSJSA"}
+BC_UP_MAX_BYTES = 8 * 1024 * 1024
+BC_UP_TYPES = {"application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png"}
+_BC_CACHE = {}
+_BC_LOCK = threading.Lock()
+_BC_TTL = 600
+BC_NODE_WORDS = [("簽約款", ("簽約",)), ("同意備案款", ("同備", "同意備案")), ("材料訂購款", ("材料", "材訂")), ("工班進場款", ("進場",)),
+                 ("掛錶驗收款", ("掛表", "掛錶", "驗收")), ("設備登記款", ("設登", "設備登記")), ("正式售電款", ("正式售電", "售電"))]
+# 廠商看到的文件名稱（內部名稱有些只有陽光看得懂）
+BC_PUBLIC_LABEL = {"掛表（Airtable 掛表日期＋已完成）": "掛表完成（由陽光系統確認）", "進場屋主預約時間": "進場日期（由陽光系統確認）",
+                   "驗收單（驗收合格）": "驗收單（驗收合格）"}
+
+
+def _bc_nodes_of(text):
+    out = []
+    for node, words in BC_NODE_WORDS:
+        if any(w in (text or "") for w in words) and node not in out:
+            out.append(node)
+    return out
+
+
+def _bc_short_candidates(case_no, alias=""):
+    """尚展發票明細的案場簡稱寫法：工桃8（工程桃園8號）、桃1（潤特桃園1號）、竹53、新4（潤特新北4號）、工苗2。"""
+    m = re.search(r"(\d+)\s*號", case_no or "")
+    county = _county_of(case_no, alias)
+    if not m or not county:
+        return set()
+    pre = "工" if (case_no or "").startswith("工程") else ""
+    return {pre + s + m.group(1) for s in _INV_COUNTY_SHORT.get(county, [county[0]])}
+
+
+def _bc_vendor_cases(vendor):
+    """只算「工程○○」「潤特○○」這兩種跟 EPC 簽工程合約、依七期請款的案件（桃園千塘／新竹風城等舊案系列不在這個流程）。"""
+    return [c for c in _pdf_case_ref() if c.get("vendor") == vendor and (c["case_no"].startswith("工程") or c["case_no"].startswith("潤特"))]
+
+
+def _bc_paid_map(vendor, vcases):
+    """({案號: {節點: 來源}}, 對不到案件的簡稱清單)；來源＝'表單'（Google Sheet 發票明細）、'發票'（發票請款有）、'推定'（後面的節點已請款）。"""
+    paid, unmatched = {}, []
+    cand = {}
+    for c in vcases:
+        for s in _bc_short_candidates(c["case_no"], c.get("alias", "")):
+            cand.setdefault(s, set()).add(c["case_no"])
+    try:
+        raw = json.loads(_state_get_long(f"bc_paid|{vendor}") or "[]")
+    except Exception as e:
+        print(f"[billing] 讀已請款歷史失敗：{e}", flush=True)
+        raw = []
+    for e in raw:
+        cs = cand.get((e.get("short") or "").strip())
+        nodes = _bc_nodes_of(e.get("summary") or "")
+        if not nodes:
+            continue
+        if not cs or len(cs) != 1:
+            unmatched.append(e.get("short"))
+            continue
+        for n in nodes:
+            paid.setdefault(next(iter(cs)), {})[n] = "表單"
+    try:
+        for r in airtable_get_all(INV_API_URL, "{" + INV_F["status"] + "}!='退回'", [INV_F["case_no"], INV_F["nodes"]]):
+            f = r["fields"]
+            cn = (f.get(INV_F["case_no"]) or "").strip()
+            for n in (f.get(INV_F["nodes"]) or "").split("、"):
+                if cn and n in INV_NODES:
+                    paid.setdefault(cn, {}).setdefault(n, "發票")
+    except Exception as e:
+        print(f"[billing] 讀發票請款失敗：{e}", flush=True)
+    for cn, d in paid.items():   # 後面的節點已請款 → 前面的視為已請款
+        hi = max((INV_NODES.index(n) for n in d if n in INV_NODES), default=-1)
+        for i, n in enumerate(INV_NODES):
+            if i < hi and n not in d:
+                d[n] = "推定"
+    return paid, sorted({u for u in unmatched if u})
+
+
+def _bc_bulk_docs(vcases):
+    """一次讀齊這些案件的文件，格式跟 _inv_case_docs 一樣。"""
+    docs = {c["case_no"]: {"ms": {}, "pdf": {}, "draw": {}, "ids": dict(c.get("ids") or {}), "ops": []} for c in vcases}
+    t_ms, t_pdf, t_draw = set(), set(), set()
+    for reqs in INV_REQS.values():
+        for r in reqs:
+            t_ms |= set(r.get("ms") or [])
+            t_pdf |= set(r.get("pdf") or [])
+            t_draw |= set(r.get("draw") or [])
+    f = "AND(NOT({" + FIELD_MS_ACTUAL_DATE + "}=BLANK()),OR(" + ",".join("{" + FIELD_MS_TYPE + "}='" + t + "'" for t in sorted(t_ms)) + "))"
+    for m in airtable_get_all(MILESTONE_API_URL, f, [FIELD_MS_PROJECT_NAME, FIELD_MS_TYPE, FIELD_MS_ACTUAL_DATE, FIELD_MS_STATUS]):
+        mf = m["fields"]
+        cn = mf.get(FIELD_MS_PROJECT_NAME)
+        if cn in docs and mf.get(FIELD_MS_TYPE) and mf.get(FIELD_MS_ACTUAL_DATE):
+            docs[cn]["ms"].setdefault(mf[FIELD_MS_TYPE], []).append((mf[FIELD_MS_ACTUAL_DATE], mf.get(FIELD_MS_STATUS) or ""))
+    f = ("AND(OR({" + PDF_F["status"] + "}='" + PDF_ST_CONFIRMED + "',{" + PDF_F["status"] + "}='" + PDF_ST_ARCHIVED + "'),OR("
+         + ",".join("{" + PDF_F["doc_type"] + "}='" + t + "'" for t in sorted(t_pdf)) + "))")
+    for p in airtable_get_all(PDF_API_URL, f, [PDF_F["case_no"], PDF_F["doc_type"], PDF_F["final_name"]]):
+        pf = p["fields"]
+        cn = (pf.get(PDF_F["case_no"]) or "").strip()
+        if cn in docs and pf.get(PDF_F["doc_type"]):
+            docs[cn]["pdf"].setdefault(pf[PDF_F["doc_type"]], []).append(pf.get(PDF_F["final_name"], ""))
+    f = "OR(" + ",".join("{" + DRAWING_F["kind"] + "}='" + t + "'" for t in sorted(t_draw)) + ")"
+    for d in airtable_get_all(DRAWING_API_URL, f, [DRAWING_F["case_no"], DRAWING_F["kind"], DRAWING_F["filename"]]):
+        df = d["fields"]
+        cn = (df.get(DRAWING_F["case_no"]) or "").strip()
+        if cn in docs and df.get(DRAWING_F["kind"]):
+            docs[cn]["draw"].setdefault(df[DRAWING_F["kind"]], []).append(df.get(DRAWING_F["filename"], ""))
+    for o in airtable_get_all(OPS_API_URL, None, [OPS_FIELD_CASE_NO, OPS_FIELD_RESULT, OPS_FIELD_STATUS, OPS_FIELD_OWNER_SIGN_DATE]):
+        of = o["fields"]
+        cn = (of.get(OPS_FIELD_CASE_NO) or "").strip()
+        if cn in docs:
+            docs[cn]["ops"].append({"result": of.get(OPS_FIELD_RESULT) or [], "status": of.get(OPS_FIELD_STATUS) or "", "date": of.get(OPS_FIELD_OWNER_SIGN_DATE) or ""})
+    return docs
+
+
+def _bc_uploads(vendor):
+    """這家廠商的上傳紀錄：{(案號,節點,文件項目): [記錄 dict（新的在前）]}。"""
+    out = {}
+    recs = airtable_get_all(BC_UPLOAD_API_URL, "{" + BC_UP_F["vendor"] + "}='" + _vp_esc(vendor) + "'", list(BC_UP_F.values()))
+    for r in sorted(recs, key=lambda x: x["fields"].get(BC_UP_F["at"], ""), reverse=True):
+        f = r["fields"]
+        out.setdefault((f.get(BC_UP_F["case_no"], ""), f.get(BC_UP_F["node"], ""), f.get(BC_UP_F["label"], "")), []).append(
+            {"id": r["id"], "status": f.get(BC_UP_F["status"], ""), "at": f.get(BC_UP_F["at"], ""), "note": f.get(BC_UP_F["pnote"], ""),
+             "files": [a.get("filename", "") for a in (f.get(BC_UP_F["file"]) or [])]})
+    return out
+
+
+def _bc_compute(vendor):
+    today = datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    _ensure_biz_snapshots_loaded()
+    cancelled = CANCELLED_CASE_CACHE["case_nos"]
+    allv = _bc_vendor_cases(vendor)
+    active = [c for c in allv if c.get("closed") in ("進行中", "TRUE") and c["case_no"] not in cancelled]
+    paid, unmatched = _bc_paid_map(vendor, allv)
+    docs = _bc_bulk_docs(active)
+    ups = _bc_uploads(vendor)
+    try:
+        ready_state = json.loads(_state_get_long(f"bc_ready|{vendor}") or "null")
+    except Exception:
+        ready_state = None
+    seeded = isinstance(ready_state, dict)
+    ready_state = ready_state if seeded else {}
+    now_iso = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+    week_ago = (datetime.now(TW_TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
+    cases_out, new_ready, cur_ready = [], [], set()
+    for c in sorted(active, key=lambda x: x["case_no"]):
+        cn = c["case_no"]
+        pm = paid.get(cn, {})
+        status_of = {}
+        for node in INV_NODES:
+            if node in pm:
+                continue
+            items, ok_n = [], 0
+            for req in INV_REQS[node]:
+                chk = _inv_check_req(req, docs[cn], today)
+                ok, via = chk["ok"], ""
+                mine = ups.get((cn, node, req["label"]), [])
+                if not ok and any(u["status"] == "已確認" for u in mine):
+                    ok, via = True, "已上傳確認"
+                can_up = bool(req.get("pdf") or req.get("draw") or req.get("ops"))
+                last = next((u for u in mine if u["status"] in ("待確認", "退回")), None)
+                items.append({"label": BC_PUBLIC_LABEL.get(req["label"], req["label"]), "key": req["label"], "ok": ok, "via": via,
+                              "can_upload": bool(can_up and not ok), "upload": (last or {}).get("status", ""),
+                              "upload_note": (last or {}).get("note", "") if (last or {}).get("status") == "退回" else "",
+                              "upload_files": (last or {}).get("files", []), "pending": [] if ok else chk.get("pending", [])})
+                ok_n += 1 if ok else 0
+            status_of[node] = ("ready" if ok_n == len(items) else "partial" if ok_n else "none", items)
+        hi = max((i for i, n in enumerate(INV_NODES) if status_of.get(n, ("none",))[0] != "none"), default=-1)
+        nodes = []
+        for i, node in enumerate(INV_NODES):
+            if node not in status_of:
+                continue
+            st, items = status_of[node]
+            if st == "none" and i < hi:
+                st = "partial"   # 後面的節點已經有文件了，這期還一份都沒有 → 一樣要補
+            if st == "none":
+                continue
+            key = f"{cn}|{node}"
+            ent = {"node": node, "status": st, "items": items}
+            if st == "ready":
+                cur_ready.add(key)
+                if key not in ready_state:
+                    ready_state[key] = now_iso
+                    if seeded:
+                        new_ready.append((cn, c.get("alias", ""), node))
+                ent["since"] = ready_state.get(key) or ""
+                ent["new"] = bool(ent["since"]) and ent["since"][:10] >= week_ago
+            nodes.append(ent)
+        if nodes:
+            addr = " ".join((c.get("address") or "").split())
+            cases_out.append({"case": cn, "alias": c.get("alias", ""), "address": addr,
+                              "county": _county_of(addr, cn, c.get("alias", ""), CASE_ADDR_CACHE.get(cn, "")) or "其他",
+                              "kind": "潤特" if cn.startswith("潤特") else "工程", "folder": _md_folder_url(cn), "nodes": nodes})
+    try:
+        if not seeded:   # 第一次：把現有的可請款全部當作已知，不通知
+            _state_set_long(f"bc_ready|{vendor}", json.dumps({k: "" for k in cur_ready}, ensure_ascii=False))
+        elif new_ready or any(k not in cur_ready for k in ready_state):
+            keep = {k: v for k, v in ready_state.items() if k in cur_ready}   # 已請款／又缺件的移出，之後再齊會再通知
+            _state_set_long(f"bc_ready|{vendor}", json.dumps(keep, ensure_ascii=False))
+    except Exception as e:
+        print(f"[billing] 存可請款狀態失敗：{e}", flush=True)
+    if new_ready:
+        try:
+            lines = [f"• {cn} {al}　{node}" for cn, al, node in new_ready[:30]]
+            _line_push_card(_card("💰 請款節點文件已齊", "#16A34A", f"{vendor}有 {len(new_ready)} 個節點可以請款了", sections=[("新可請款", lines)],
+                                  note="廠商預約頁「💰 請款確認」已顯示；請通知廠商可以開發票", button=("開啟主控台", _dash_url() + "/")))
+        except Exception as e:
+            print(f"[billing] 通知可請款失敗：{e}", flush=True)
+    return {"vendor": vendor, "enabled": True, "generated_at": now_iso, "cases": cases_out,
+            "ready_count": sum(1 for c in cases_out for n in c["nodes"] if n["status"] == "ready"),
+            "partial_count": sum(1 for c in cases_out for n in c["nodes"] if n["status"] == "partial"),
+            "unmatched_history": unmatched, "county_order": VP_COUNTY_ORDER}
+
+
+def _bc_public(vendor):
+    """廠商預約頁有沒有開放「請款確認」（陽光在主控台先預覽、確認沒問題才開放）。"""
+    try:
+        return (_state_get_long(f"bc_public|{vendor}") or "").strip() == "1"
+    except Exception:
+        return False
+
+
+def _bc_get_nowait(vendor):
+    """有快取就回快取；沒有就在背景算，先回 None（前端稍後再要）。"""
+    ent = _BC_CACHE.get(vendor)
+    if ent:
+        if time.time() - ent["ts"] >= _BC_TTL and not _BC_LOCK.locked():
+            threading.Thread(target=lambda: _bc_get(vendor, force=True), daemon=True).start()
+        return ent["data"]
+    if not _BC_LOCK.locked():
+        threading.Thread(target=lambda: _bc_get(vendor, force=True), daemon=True).start()
+    return None
+
+
+def _bc_get(vendor, force=False):
+    ent = _BC_CACHE.get(vendor)
+    if ent and not force and time.time() - ent["ts"] < _BC_TTL:
+        return ent["data"]
+    with _BC_LOCK:
+        ent = _BC_CACHE.get(vendor)
+        if ent and not force and time.time() - ent["ts"] < 60:
+            return ent["data"]
+        data = _bc_compute(vendor)
+        _BC_CACHE[vendor] = {"ts": time.time(), "data": data}
+        return data
+
+
+def _bc_warm():
+    for v in BC_VENDORS:
+        try:
+            _bc_get(v, force=True)
+        except Exception as e:
+            print(f"[billing] 暖機 {v} 失敗：{e}", flush=True)
+
+
+scheduler.add_job(_bc_warm, IntervalTrigger(minutes=10), id="bc_warm", replace_existing=True,
+                  next_run_time=datetime.now(timezone(timedelta(hours=8))) + timedelta(seconds=150), max_instances=1, coalesce=True)
+
+
+@app.route("/api/vendor-portal/<token>/billing")
+def vendor_portal_billing(token):
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    if vendor not in BC_VENDORS or not _bc_public(vendor):
+        return jsonify({"enabled": False, "vendor": vendor, "cases": []})
+    try:
+        data = _bc_get_nowait(vendor)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    if data is None:
+        return jsonify({"enabled": True, "loading": True, "vendor": vendor, "cases": []})
+    return jsonify(data)
+
+
+@app.route("/api/vendor-portal/<token>/billing/upload", methods=["POST"])
+def vendor_portal_billing_upload(token):
+    """body: {case, node, label(文件項目 key), filename, content_type, data(base64), note}"""
+    vendor = _vp_vendor_from_token(token)
+    if not vendor:
+        return jsonify({"error": "連結不正確或已失效"}), 404
+    if vendor not in BC_VENDORS or not _bc_public(vendor):
+        return jsonify({"error": "這家廠商還沒開放請款確認"}), 403
+    body = request.get_json(silent=True) or {}
+    case_no, node, label = (body.get("case") or "").strip(), (body.get("node") or "").strip(), (body.get("label") or "").strip()
+    ctype = (body.get("content_type") or "").strip().lower()
+    if node not in INV_NODES or label not in [r["label"] for r in INV_REQS[node]]:
+        return jsonify({"error": "節點或文件項目不正確"}), 400
+    req = next(r for r in INV_REQS[node] if r["label"] == label)
+    if not (req.get("pdf") or req.get("draw") or req.get("ops")):
+        return jsonify({"error": "這一項由陽光系統確認，不需要上傳"}), 400
+    if ctype not in BC_UP_TYPES:
+        return jsonify({"error": "只能上傳 PDF 或 JPG／PNG 圖片"}), 400
+    try:
+        raw = base64.b64decode(body.get("data") or "", validate=False)
+    except Exception:
+        return jsonify({"error": "檔案內容不正確"}), 400
+    if not raw or len(raw) > BC_UP_MAX_BYTES:
+        return jsonify({"error": "檔案不能超過 8 MB（請壓縮或分開上傳）"}), 400
+    if not _vp_case_of_vendor(vendor, case_no):
+        return jsonify({"error": "這個案號不是貴公司的案件"}), 403
+    filename = re.sub(r'[\\/:*?"<>|]', "_", (body.get("filename") or "").strip())[:80] or ("upload." + BC_UP_TYPES[ctype])
+    now_iso = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
+    fields = {BC_UP_F["title"]: f"{vendor} {case_no} {node} {label}", BC_UP_F["vendor"]: vendor, BC_UP_F["case_no"]: case_no,
+              BC_UP_F["node"]: node, BC_UP_F["label"]: label, BC_UP_F["status"]: "待確認", BC_UP_F["at"]: now_iso,
+              BC_UP_F["vnote"]: (body.get("note") or "").strip()[:500]}
+    try:
+        r = requests.post(BC_UPLOAD_API_URL, headers=airtable_headers(), json={"fields": fields}, timeout=30)
+        r.raise_for_status()
+        rid = r.json()["id"]
+        r = requests.post(f"https://content.airtable.com/v0/{BASE_ID}/{rid}/{BC_UP_F['file']}/uploadAttachment", headers=airtable_headers(), timeout=120,
+                          json={"contentType": ctype, "filename": filename, "file": base64.b64encode(raw).decode()})
+        if r.status_code >= 400:
+            requests.delete(f"{BC_UPLOAD_API_URL}/{rid}", headers=airtable_headers(), timeout=20)
+            return jsonify({"error": "檔案上傳失敗：" + r.text[:200]}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    _BC_CACHE.pop(vendor, None)
+    try:
+        _line_push_card(_card("📥 廠商上傳請款文件", "#2563EB", f"{vendor}｜{case_no}", rows=[("節點", node), ("文件", label), ("檔名", filename)],
+                              note="請到主控台「發票請款」頁確認或退回", button=("開啟主控台", _dash_url() + "/")))
+    except Exception as e:
+        print(f"[billing] 通知上傳失敗：{e}", flush=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/billing/overview")
+def billing_overview():
+    """主控台用：某廠商的請款確認結果（跟廠商預約頁看到的一樣）。"""
+    vendor = (request.args.get("vendor") or "尚展").strip()
+    if vendor not in BC_VENDORS:
+        return jsonify({"error": "這家廠商還沒開放請款確認"}), 400
+    try:
+        return jsonify(_bc_get(vendor, force=request.args.get("fresh") == "1"))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/billing/public", methods=["GET", "POST"])
+def billing_public_toggle():
+    """主控台：看／切換「請款確認」有沒有開放給廠商。POST body {vendor, on}"""
+    if request.method == "GET":
+        return jsonify({"vendors": {v: _bc_public(v) for v in BC_VENDORS}})
+    body = request.get_json(silent=True) or {}
+    vendor = (body.get("vendor") or "").strip()
+    if vendor not in BC_VENDORS:
+        return jsonify({"error": "這家廠商還沒支援請款確認"}), 400
+    try:
+        _state_set_long(f"bc_public|{vendor}", "1" if body.get("on") else "0")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True, "on": bool(body.get("on"))})
+
+
+@app.route("/api/billing/uploads")
+def billing_uploads_list():
+    status = (request.args.get("status") or "待確認").strip()
+    f = None if status == "all" else "{" + BC_UP_F["status"] + "}='" + _vp_esc(status) + "'"
+    try:
+        recs = airtable_get_all(BC_UPLOAD_API_URL, f, list(BC_UP_F.values()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    out = []
+    for r in recs:
+        x = r["fields"]
+        out.append({"id": r["id"], "vendor": x.get(BC_UP_F["vendor"], ""), "case_no": x.get(BC_UP_F["case_no"], ""), "node": x.get(BC_UP_F["node"], ""),
+                    "label": x.get(BC_UP_F["label"], ""), "status": x.get(BC_UP_F["status"], ""), "at": x.get(BC_UP_F["at"], ""),
+                    "vendor_note": x.get(BC_UP_F["vnote"], ""), "note": x.get(BC_UP_F["pnote"], ""), "by": x.get(BC_UP_F["by"], ""),
+                    "files": [{"name": a.get("filename", ""), "url": a.get("url", ""), "size": a.get("size", 0)} for a in (x.get(BC_UP_F["file"]) or [])]})
+    out.sort(key=lambda u: u["at"], reverse=True)
+    return jsonify({"items": out})
+
+
+@app.route("/api/billing/uploads/<rid>/review", methods=["POST"])
+def billing_upload_review(rid):
+    """body: {status: 已確認|退回|待確認, note, by}"""
+    if not re.fullmatch(r"rec[A-Za-z0-9]{14}", rid or ""):
+        return jsonify({"error": "id 不正確"}), 400
+    body = request.get_json(silent=True) or {}
+    status = (body.get("status") or "").strip()
+    if status not in ("已確認", "退回", "待確認"):
+        return jsonify({"error": "狀態不正確"}), 400
+    fields = {BC_UP_F["status"]: status, BC_UP_F["pnote"]: (body.get("note") or "").strip()[:500],
+              BC_UP_F["by"]: (body.get("by") or "").strip()[:20], BC_UP_F["pat"]: datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")}
+    try:
+        r = requests.patch(f"{BC_UPLOAD_API_URL}/{rid}", headers=airtable_headers(), json={"fields": fields}, timeout=30)
+        r.raise_for_status()
+        _BC_CACHE.clear()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True})
+
+
+@app.route("/api/billing/history", methods=["POST"])
+def billing_history_push():
+    """本機 billing_history.py 把廠商 Google Sheet「發票明細」解析後推上來：body {vendor, entries:[{short, summary, invoice_no, date, amount}]}"""
+    body = request.get_json(silent=True) or {}
+    vendor = (body.get("vendor") or "").strip()
+    entries = [e for e in (body.get("entries") or []) if isinstance(e, dict)]
+    if vendor not in BC_VENDORS or not entries:
+        return jsonify({"error": "vendor 或 entries 不正確"}), 400
+    clean = [{"short": str(e.get("short") or "").strip(), "summary": str(e.get("summary") or "").strip()[:60], "invoice_no": str(e.get("invoice_no") or "").strip(),
+              "date": str(e.get("date") or "").strip(), "amount": e.get("amount")} for e in entries][:2000]
+    text = json.dumps(clean, ensure_ascii=False)
+    if len(text) > 95000:
+        return jsonify({"error": "資料太大"}), 400
+    try:
+        _state_set_long(f"bc_paid|{vendor}", text)
+        _BC_CACHE.pop(vendor, None)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True, "count": len(clean)})
+
+
 if __name__ == "__main__":
     # 本機開發模式（直接 `python app.py` 執行，不透過 gunicorn）：
     # 這裡沒有 fork()，所以要自己啟動背景初始化跟排程，行為才會跟正式環境一致。
