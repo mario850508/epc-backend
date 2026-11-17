@@ -5686,28 +5686,40 @@ def vendor_portal_contacts(token):
     return jsonify({"ok": True, "contacts": contacts})
 
 
+def _vendor_unacked_lines():
+    """今天、明天的預約裡，有預約頁的廠商還沒按確認的，每筆一行。排程檢查跟 LINE 彙整送出前重查都用這個。"""
+    tw = timezone(timedelta(hours=8))
+    today = datetime.now(tw)
+    days = [today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")]
+    recs = airtable_get_all(
+        SLOT_API_URL,
+        f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',OR(" + ",".join(f"IS_SAME({{{FIELD_SLOT_DATE}}},'{d}','day')" for d in days) + "))",
+        [FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
+         FIELD_SLOT_ACK_AT, FIELD_SLOT_ISSUE])
+    lines = []
+    for r in sorted(recs, key=lambda x: (x["fields"].get(FIELD_SLOT_DATE, ""), x["fields"].get(FIELD_SLOT_START, ""))):
+        f = r["fields"]
+        if (f.get(FIELD_SLOT_VENDOR) or "") not in VP_VENDORS or f.get(FIELD_SLOT_ACK_AT):
+            continue
+        d = f.get(FIELD_SLOT_DATE, "")
+        lines.append(f"• {'今天' if d == days[0] else '明天'} {f.get(FIELD_SLOT_START, '')} {f.get(FIELD_SLOT_VENDOR, '')}｜{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}"
+                     f"（{'、'.join(f.get(FIELD_SLOT_TYPE) or [])}）" + ("　⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else ""))
+    return lines
+
+
+def _vendor_unacked_card(lines):
+    card = _card("⏳ 廠商還沒確認行程", "#D97706", f"共 {len(lines)} 筆（今天、明天）", sections=[("尚未確認", lines)],
+                 note="請直接打給廠商確認；他們在預約頁按「確認收到」後就會消失", button=("開啟主控台", _dash_url() + "/"))
+    card["recheck"] = "vendor_unacked"   # LINE 彙整送出前用這個標記重查，已確認的拿掉（2026-11-17）
+    return card
+
+
 def check_vendor_unacked():
     """今天、明天的預約，廠商（有預約頁的）還沒按確認 → 一張卡片列給窗口（Slack 即時、LINE 進每日彙整）。每天 08:30、15:30。"""
     try:
-        tw = timezone(timedelta(hours=8))
-        today = datetime.now(tw)
-        days = [today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")]
-        recs = airtable_get_all(
-            SLOT_API_URL,
-            f"AND({{{FIELD_SLOT_KIND}}}='{SLOT_KIND_BOOKING}',OR(" + ",".join(f"IS_SAME({{{FIELD_SLOT_DATE}}},'{d}','day')" for d in days) + "))",
-            [FIELD_SLOT_VENDOR, FIELD_SLOT_DATE, FIELD_SLOT_START, FIELD_SLOT_END, FIELD_SLOT_CASE_NO, FIELD_SLOT_ALIAS, FIELD_SLOT_TYPE,
-             FIELD_SLOT_ACK_AT, FIELD_SLOT_ISSUE])
-        lines = []
-        for r in sorted(recs, key=lambda x: (x["fields"].get(FIELD_SLOT_DATE, ""), x["fields"].get(FIELD_SLOT_START, ""))):
-            f = r["fields"]
-            if (f.get(FIELD_SLOT_VENDOR) or "") not in VP_VENDORS or f.get(FIELD_SLOT_ACK_AT):
-                continue
-            d = f.get(FIELD_SLOT_DATE, "")
-            lines.append(f"• {'今天' if d == days[0] else '明天'} {f.get(FIELD_SLOT_START, '')} {f.get(FIELD_SLOT_VENDOR, '')}｜{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}"
-                         f"（{'、'.join(f.get(FIELD_SLOT_TYPE) or [])}）" + ("　⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else ""))
+        lines = _vendor_unacked_lines()
         if lines:
-            _line_push_card(_card("⏳ 廠商還沒確認行程", "#D97706", f"共 {len(lines)} 筆（今天、明天）", sections=[("尚未確認", lines)],
-                                 note="請直接打給廠商確認；他們在預約頁按「確認收到」後就會消失", button=("開啟主控台", _dash_url() + "/")))
+            _line_push_card(_vendor_unacked_card(lines))
     except Exception as e:
         print(f"[check_vendor_unacked] 例外：{e!r}", flush=True)
 
@@ -7276,6 +7288,31 @@ def _line_post_messages(target, messages):
     return resp
 
 
+def _digest_refresh_items(items):
+    """送出前重查會過期的卡片（目前只有「廠商還沒確認行程」）：排進佇列後廠商才按確認的就拿掉，全部確認了整張不送。
+    不是今天排進來的舊卡片直接丟掉（今天、明天的說法已經不對）。重查失敗就維持原樣送出。"""
+    today = _tw_today_str()
+    out, fresh = [], None
+    for it in items:
+        card = it.get("card")
+        if not (isinstance(card, dict) and card.get("recheck") == "vendor_unacked"):
+            out.append(it)
+            continue
+        if str(it.get("at") or "")[:10] != today:
+            continue
+        if fresh is None:
+            try:
+                fresh = _vendor_unacked_lines()
+            except Exception as e:
+                print(f"[line_digest] 重查廠商確認失敗，照原卡片送：{e!r}", flush=True)
+                fresh = False
+        if fresh is False:
+            out.append(it)
+        elif fresh:
+            out.append(dict(it, card=_vendor_unacked_card(fresh)))
+    return out
+
+
 def _line_digest_flush(force=False):
     """把佇列依收件人合併後各送一則。一般只在每天固定時間跑一次（done_date 擋重複）；force＝手動立刻送。"""
     token, _ = _line_config()
@@ -7302,7 +7339,14 @@ def _line_digest_flush(force=False):
         if not force and LINE_DIGEST["sent_on"].get(target) == today:
             continue      # 今天已經送過這個人（重試時不重送）
         try:
-            msg, cards = _digest_messages(its)
+            send_its = _digest_refresh_items(its)
+            if not send_its:      # 重查後沒有任何要送的（例如廠商都確認了）：只清掉佇列，不送、不扣額度
+                with _LINE_DIGEST_LOCK:
+                    keys = {x["k"] for x in its}
+                    LINE_DIGEST["items"] = [x for x in LINE_DIGEST["items"] if x["k"] not in keys]
+                results.append({"to": target[:6] + "…", "n": len(its), "ok": True, "error": "", "skipped": "重查後沒有要送的"})
+                continue
+            msg, cards = _digest_messages(send_its)
             resp = _line_post_messages(target, [msg])
             ok = resp.status_code < 400
             err = "" if ok else f"{resp.status_code} {resp.text[:160]}"
