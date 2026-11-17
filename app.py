@@ -18361,6 +18361,15 @@ def _bc_vendor_cases(vendor):
     return [c for c in _pdf_case_ref() if c.get("vendor") == vendor and (c["case_no"].startswith("工程") or c["case_no"].startswith("潤特"))]
 
 
+def _bc_manual_get(vendor):
+    try:
+        raw = json.loads(_state_get_long(f"bc_manual|{vendor}") or "[]")
+        return [x for x in raw if isinstance(x, str) and "|" in x]
+    except Exception as e:
+        print(f"[billing] 讀手動已請款失敗：{e}", flush=True)
+        return []
+
+
 def _bc_paid_map(vendor, vcases):
     """({案號: {節點: 來源}}, 對不到案件的簡稱清單)；來源＝'表單'（Google Sheet 發票明細）、'發票'（發票請款有）、'推定'（後面的節點已請款）。"""
     paid, unmatched = {}, []
@@ -18392,6 +18401,11 @@ def _bc_paid_map(vendor, vcases):
                     paid.setdefault(cn, {}).setdefault(n, "發票")
     except Exception as e:
         print(f"[billing] 讀發票請款失敗：{e}", flush=True)
+    for key in _bc_manual_get(vendor):   # 陽光在主控台手動標記「已請款」（舊年度的發票不在 Sheet 裡）
+        cn, _, node = key.partition("|")
+        for n in (INV_NODES if node == "*" else [node]):
+            if cn and n in INV_NODES:
+                paid.setdefault(cn, {}).setdefault(n, "手動")
     for cn, d in paid.items():   # 後面的節點已請款 → 前面的視為已請款
         hi = max((INV_NODES.index(n) for n in d if n in INV_NODES), default=-1)
         for i, n in enumerate(INV_NODES):
@@ -18532,7 +18546,7 @@ def _bc_compute(vendor):
     return {"vendor": vendor, "enabled": True, "generated_at": now_iso, "cases": cases_out,
             "ready_count": sum(1 for c in cases_out for n in c["nodes"] if n["status"] == "ready"),
             "partial_count": sum(1 for c in cases_out for n in c["nodes"] if n["status"] == "partial"),
-            "unmatched_history": unmatched, "county_order": VP_COUNTY_ORDER}
+            "unmatched_history": unmatched, "county_order": VP_COUNTY_ORDER, "manual": _bc_manual_get(vendor)}
 
 
 def _bc_public(vendor):
@@ -18673,6 +18687,37 @@ def billing_public_toggle():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
     return jsonify({"ok": True, "on": bool(body.get("on"))})
+
+
+@app.route("/api/billing/manual", methods=["POST"])
+def billing_manual_mark():
+    """陽光手動標記某案某節點（或整案 *）已請款／取消標記。body {vendor, case, node('*' 或節點名), on}"""
+    body = request.get_json(silent=True) or {}
+    vendor, cn, node = (body.get("vendor") or "").strip(), (body.get("case") or "").strip(), (body.get("node") or "").strip()
+    if vendor not in BC_VENDORS or not cn or (node != "*" and node not in INV_NODES):
+        return jsonify({"error": "參數不正確"}), 400
+    key = f"{cn}|{node}"
+    cur = _bc_manual_get(vendor)
+    cur = [x for x in cur if x != key]
+    if body.get("on"):
+        cur.append(key)
+    try:
+        _state_set_long(f"bc_manual|{vendor}", json.dumps(cur, ensure_ascii=False))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    ent = _BC_CACHE.get(vendor)
+    if body.get("on") and ent:   # 標記已請款：直接從快取結果拿掉，不用重算（重算要 1 分鐘）；取消標記才重算
+        data = ent["data"]
+        for c in data.get("cases", []):
+            if c["case"] == cn:
+                c["nodes"] = [n for n in c["nodes"] if node != "*" and n["node"] != node]
+        data["cases"] = [c for c in data.get("cases", []) if c["nodes"]]
+        data["ready_count"] = sum(1 for c in data["cases"] for n in c["nodes"] if n["status"] == "ready")
+        data["partial_count"] = sum(1 for c in data["cases"] for n in c["nodes"] if n["status"] == "partial")
+        data["manual"] = cur
+    else:
+        _BC_CACHE.pop(vendor, None)
+    return jsonify({"ok": True, "manual": cur})
 
 
 @app.route("/api/billing/uploads")
