@@ -5529,6 +5529,78 @@ def _vp_own_booking(token, bid):
     return vendor, rec, None
 
 
+# ===== 2026-11-18 廠商相關通知分區：Slack 依廠商分給負責的 PM；LINE 照舊（只給預設收件人／每日彙整）=====
+# 對照表預設如下（使用者 2026-11-18 確認），可用 POST /api/vendor-pm 改（存狀態表 vendor_pm_map）。
+VENDOR_PM_DEFAULT = [
+    {"name": "許家豪_Mario", "slack": "U05GQN29CDS", "vendors": ["尚展", "曙光", "三創", "全富"]},
+    {"name": "李宇哲_Nick", "slack": "U0AH99QPX98", "vendors": ["宇陽達", "聚曜", "光鼎", "澄品"]},
+    {"name": "顏敏瑄_Asta", "slack": "U0ANTBX2725", "vendors": ["凰太竹", "大昇", "國欽", "展亦", "振庭"]},
+]
+VENDOR_ALIAS = {"弦華": "振庭"}
+_VENDOR_PM_CACHE = {"ts": 0, "data": None}
+
+
+def _vendor_pm_table():
+    now = time.time()
+    if _VENDOR_PM_CACHE["data"] is not None and now - _VENDOR_PM_CACHE["ts"] < 120:
+        return _VENDOR_PM_CACHE["data"]
+    data = None
+    try:
+        raw = _state_get_long("vendor_pm_map")
+        parsed = json.loads(raw) if raw else None
+        if isinstance(parsed, list) and parsed:
+            data = parsed
+    except Exception as e:
+        print(f"[vendor_pm] 讀對照表失敗，用預設：{e}", flush=True)
+    _VENDOR_PM_CACHE.update({"ts": now, "data": data or VENDOR_PM_DEFAULT})
+    return _VENDOR_PM_CACHE["data"]
+
+
+def _vendor_pm_slack(vendor):
+    """這家廠商負責的 PM 的 Slack ID；對不到（沒列在對照表）就給預設收件人（使用者）。"""
+    v = VENDOR_ALIAS.get((vendor or "").strip(), (vendor or "").strip())
+    for pm in _vendor_pm_table():
+        if v in (pm.get("vendors") or []) and pm.get("slack"):
+            return pm["slack"]
+    return _slack_default_user()
+
+
+def _vendor_notify(vendor, card, line=True, skip_slack_ids=()):
+    """廠商相關通知：LINE 照舊（預設收件人、進每日彙整），Slack 只給這家廠商負責的 PM。"""
+    if line:
+        try:
+            _line_push_card(card, slack=False)
+        except Exception as e:
+            print(f"[vendor_notify] LINE 失敗：{e!r}", flush=True)
+    sid = _vendor_pm_slack(vendor)
+    if sid and sid not in skip_slack_ids:
+        _slack_notify(sid, card)
+
+
+@app.route("/api/vendor-pm", methods=["GET", "POST"])
+def vendor_pm_api():
+    """廠商→負責 PM（Slack）對照表。POST body {pms:[{name, slack, vendors:[...]}]}；POST {reset:true} 還原預設。"""
+    if request.method == "GET":
+        return jsonify({"pms": _vendor_pm_table(), "default": VENDOR_PM_DEFAULT, "alias": VENDOR_ALIAS})
+    body = request.get_json(silent=True) or {}
+    if body.get("reset"):
+        data = None
+    else:
+        data = []
+        for pm in body.get("pms") or []:
+            if not isinstance(pm, dict) or not re.fullmatch(r"U[A-Z0-9]{8,12}", str(pm.get("slack") or "")):
+                return jsonify({"error": "每位 PM 要有正確的 Slack ID（U 開頭）"}), 400
+            data.append({"name": str(pm.get("name") or "")[:30], "slack": pm["slack"], "vendors": [str(v)[:20] for v in (pm.get("vendors") or [])][:30]})
+        if not data:
+            return jsonify({"error": "pms 不能是空的"}), 400
+    try:
+        _state_set_long("vendor_pm_map", json.dumps(data, ensure_ascii=False) if data else "")
+        _VENDOR_PM_CACHE["data"] = None
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+    return jsonify({"ok": True, "pms": _vendor_pm_table()})
+
+
 def _vp_notify_pm(rec, card_fn, recs=None):
     """通知陽光窗口（預設收件人，Slack 即時＋LINE 進每日彙整）與這筆（或這幾筆）預約任務的安排人員。
     2026-10-28：預設收件人的 Slack 跟安排人員是同一個帳號時，只發一次（以前同一則會收到兩次）。"""
@@ -5544,15 +5616,16 @@ def _vp_notify_pm(rec, card_fn, recs=None):
                     creators.append(n)
         except Exception as e:
             print(f"[vendor-portal] 查安排人員失敗：{e}", flush=True)
+    vendor = (f.get(FIELD_SLOT_VENDOR) or "").strip()
+    pm_sid = _vendor_pm_slack(vendor)   # 2026-11-18：Slack 給這家廠商負責的 PM（LINE 照舊）
     dup_slack = False
     try:
-        dsid = _slack_default_user()
-        if dsid:
-            dup_slack = any((_get_binding(n) or {}).get("slack") == dsid for n in creators)
+        if pm_sid:
+            dup_slack = any((_get_binding(n) or {}).get("slack") == pm_sid for n in creators)   # 安排人員就是這位 PM：安排人員那邊會收到，不重複
     except Exception as e:
         print(f"[vendor-portal] 比對 Slack 收件人失敗：{e}", flush=True)
     try:
-        _line_push_card(card, slack=not dup_slack)
+        _vendor_notify(vendor, card, skip_slack_ids=(pm_sid,) if dup_slack else ())
     except Exception as e:
         print(f"[vendor-portal] 通知 PM 失敗：{e}", flush=True)
     for n in creators:
@@ -5688,6 +5761,11 @@ def vendor_portal_contacts(token):
 
 def _vendor_unacked_lines():
     """今天、明天的預約裡，有預約頁的廠商還沒按確認的，每筆一行。排程檢查跟 LINE 彙整送出前重查都用這個。"""
+    return [line for _, line in _vendor_unacked_items()]
+
+
+def _vendor_unacked_items():
+    """同上，回傳 [(廠商, 行文字)]，給 Slack 依廠商分區用。"""
     tw = timezone(timedelta(hours=8))
     today = datetime.now(tw)
     days = [today.strftime("%Y-%m-%d"), (today + timedelta(days=1)).strftime("%Y-%m-%d")]
@@ -5702,8 +5780,8 @@ def _vendor_unacked_lines():
         if (f.get(FIELD_SLOT_VENDOR) or "") not in VP_VENDORS or f.get(FIELD_SLOT_ACK_AT):
             continue
         d = f.get(FIELD_SLOT_DATE, "")
-        lines.append(f"• {'今天' if d == days[0] else '明天'} {f.get(FIELD_SLOT_START, '')} {f.get(FIELD_SLOT_VENDOR, '')}｜{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}"
-                     f"（{'、'.join(f.get(FIELD_SLOT_TYPE) or [])}）" + ("　⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else ""))
+        lines.append((f.get(FIELD_SLOT_VENDOR) or "", f"• {'今天' if d == days[0] else '明天'} {f.get(FIELD_SLOT_START, '')} {f.get(FIELD_SLOT_VENDOR, '')}｜{f.get(FIELD_SLOT_CASE_NO, '')} {f.get(FIELD_SLOT_ALIAS, '')}"
+                      f"（{'、'.join(f.get(FIELD_SLOT_TYPE) or [])}）" + ("　⚠️廠商回報問題" if f.get(FIELD_SLOT_ISSUE) else "")))
     return lines
 
 
@@ -5717,9 +5795,14 @@ def _vendor_unacked_card(lines):
 def check_vendor_unacked():
     """今天、明天的預約，廠商（有預約頁的）還沒按確認 → 一張卡片列給窗口（Slack 即時、LINE 進每日彙整）。每天 08:30、15:30。"""
     try:
-        lines = _vendor_unacked_lines()
-        if lines:
-            _line_push_card(_vendor_unacked_card(lines))
+        items = _vendor_unacked_items()
+        if items:
+            _line_push_card(_vendor_unacked_card([l for _, l in items]), slack=False)   # LINE 照舊：全部廠商一張卡給預設收件人（進彙整）
+            groups = {}
+            for v, l in items:   # Slack：依廠商分給各自負責的 PM，每位 PM 一張只含自己廠商的卡
+                groups.setdefault(_vendor_pm_slack(v), []).append(l)
+            for sid, ls in groups.items():
+                _slack_notify(sid, _vendor_unacked_card(ls))
     except Exception as e:
         print(f"[check_vendor_unacked] 例外：{e!r}", flush=True)
 
@@ -5917,7 +6000,7 @@ def vendor_portal_submit(token):
                      rows=[("項目", "、".join(items)), ("希望日期", "、".join(wd(d) for d in dates)), ("希望星期", _vp_weekdays_text(weekdays)),
                            ("希望時段", fields[VP_F["time_pref"]]), ("備註", fields[VP_F["note"]]), ("聯絡人", fields[VP_F["contact"]])],
                      button=("到主控台處理", _dash_url() + "/#slots-requests"), footer="主控台「廠商時段協調 → 廠商申請」可轉成指派任務或退回。")
-        _line_push_card(card)
+        _vendor_notify(vendor, card)
     except Exception as e:
         print(f"[vendor-portal] 推播 PM 失敗：{e}", flush=True)
     return jsonify({"ok": True, "id": resp.json().get("id")})
@@ -6074,7 +6157,7 @@ def vendor_portal_missing_submit(token):
             card = _card("📎 廠商回報缺件", "#D97706", f"{vendor}｜{case_no} {c.get('alias') or ''}".strip(), "",
                          rows=[("缺件", "、".join(created)), ("備註", note), ("填報人", contact), ("負責業務", rep)],
                          button=("到缺件追蹤", _dash_url()), footer="廠商在預約頁自己通報的；到主控台「缺件追蹤」處理、通知業務。")
-            _line_push_card(card)    # Slack 即時；LINE 進每日中午彙整
+            _vendor_notify(vendor, card)    # Slack 給該廠商負責的 PM、即時；LINE 進每日中午彙整
         except Exception as e:
             print(f"[vendor-portal] 缺件通報推播失敗：{e}", flush=True)
     return jsonify({"ok": True, "created": created, "skipped": skipped})
@@ -18548,8 +18631,8 @@ def _bc_compute(vendor):
     if new_ready:
         try:
             lines = [f"• {cn} {al}　{node}" for cn, al, node in new_ready[:30]]
-            _line_push_card(_card("💰 請款節點文件已齊", "#16A34A", f"{vendor}有 {len(new_ready)} 個節點可以請款了", sections=[("新可請款", lines)],
-                                  note="廠商預約頁「💰 請款確認」已顯示；請通知廠商可以開發票", button=("開啟主控台", _dash_url() + "/")))
+            _vendor_notify(vendor, _card("💰 請款節點文件已齊", "#16A34A", f"{vendor}有 {len(new_ready)} 個節點可以請款了", sections=[("新可請款", lines)],
+                                         note="廠商預約頁「💰 請款確認」已顯示；請通知廠商可以開發票", button=("開啟主控台", _dash_url() + "/")))
         except Exception as e:
             print(f"[billing] 通知可請款失敗：{e}", flush=True)
     return {"vendor": vendor, "enabled": True, "generated_at": now_iso, "cases": cases_out,
@@ -18719,8 +18802,8 @@ def vendor_portal_billing_upload(token):
                             if it["key"] == label:
                                 it["upload"], it["upload_files"], it["upload_note"] = "待確認", [filename], ""
     try:
-        _line_push_card(_card("📥 廠商上傳請款文件", "#2563EB", f"{vendor}｜{case_no}", rows=[("節點", node), ("文件", label), ("檔名", filename)],
-                              note="請到主控台「發票請款」頁確認或退回", button=("開啟主控台", _dash_url() + "/")))
+        _vendor_notify(vendor, _card("📥 廠商上傳請款文件", "#2563EB", f"{vendor}｜{case_no}", rows=[("節點", node), ("文件", label), ("檔名", filename)],
+                                     note="請到主控台「發票請款」頁確認或退回", button=("開啟主控台", _dash_url() + "/")))
     except Exception as e:
         print(f"[billing] 通知上傳失敗：{e}", flush=True)
     return jsonify({"ok": True})
