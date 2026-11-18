@@ -6115,6 +6115,33 @@ def vendor_portal_unmetered(token):
                     "county": _county_of(addr, cn, alias, CASE_ADDR_CACHE.get(cn, "")) or "其他",
                     "kind": "潤特" if cn.startswith("潤特") else "工程",
                     "stage": stages.get(cn, ""), "folder": _md_folder_url(cn)})
+    # 2026-11-18：業務自治區已公證、廠商已指派，但 Airtable 專案細節還沒建檔的案件（例：潤特新竹82號）也要列，
+    # 不然廠商搜不到。這類案件只有業務自治區資料：地址用 CASE_ADDR_CACHE，階段標「已公證（待建檔）」。
+    cands = [x for x in (CERTIFIED_CASE_CACHE.get("cases") or [])
+             if (x.get("case") or "").strip() and (x.get("case") or "").strip() not in seen and (x.get("case") or "").strip() not in cancelled
+             and not (x.get("case") or "").strip().endswith("-轉") and (x.get("vendor") or "").strip() == vendor
+             and (x.get("case") or "").strip().startswith(("工程", "潤特"))]
+    in_at = set()   # 已經在 Airtable 的（含已掛表／結案的）不算，只補「Airtable 完全沒有」的
+    for i in range(0, len(cands), 30):
+        f2 = "OR(" + ",".join("{" + FIELD_CASE_NO + "}='" + _vp_esc((c.get("case") or "").strip()) + "'" for c in cands[i:i + 30]) + ")"
+        try:
+            for r in airtable_get_all(CASE_API_URL, f2, [FIELD_CASE_NO]):
+                in_at.add(r["fields"].get(FIELD_CASE_NO, ""))
+        except Exception as e:
+            print(f"[vendor-portal] 查已公證案件是否建檔失敗：{e}", flush=True)
+            cands = []
+            break
+    for x in cands:
+        cn = (x.get("case") or "").strip()
+        if cn in in_at or cn in seen:
+            continue
+        seen.add(cn)
+        alias = x.get("alias") or ""
+        addr = " ".join((CASE_ADDR_CACHE.get(cn) or "").split())
+        out.append({"case": cn, "alias": alias, "address": addr,
+                    "county": _county_of(addr, cn, alias, addr) or "其他",
+                    "kind": "潤特" if cn.startswith("潤特") else "工程",
+                    "stage": "已公證", "folder": _md_folder_url(cn)})
     return jsonify({"items": out, "county_order": VP_COUNTY_ORDER})
 
 
