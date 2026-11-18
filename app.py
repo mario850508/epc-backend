@@ -616,6 +616,7 @@ FIELD_TASK_ORDER = "fldmvbYaBaYUzr9La"            # 2026-10-21：聯合排程回
 FIELD_TASK_CLUSTER = "fldlNIwfs0ZePjPtG"          # 2026-10-21：聯合排程的「同排住戶組」（任一戶方便開門即可；同時預約欄位列出其他戶）
 FIELD_TASK_NO_ALT = "fldwuPFU4WawJfABl"           # 2026-10-20：屋主不可自填時間（勾選＝以上時間都不行時只能回覆不方便，由窗口請 EPC 重提）
 FIELD_TASK_DAYS = "fld1wr03w7FM9uDrF"             # 2026-10-20：預計施工天數文字（進場給屋主看，例如「4～5 天」）
+FIELD_TASK_WEEKEND = "fldw42WA4RKmv9sxs"           # 2026-11-18：廠商會在週末施工的日子（「六」「日」「六日」；空白＝週末不施工），屋主頁估完工日把這些天算進施工日
 FIELD_TASK_BUFFER = "fldtVqyV99xZXA8bd"           # 2026-10-19：車程緩衝（分鐘）：兩個預約之間要留的路程時間
 FIELD_TASK_OWNER_MODE = "fld7qN5jOoOyB0SY5"       # 屋主版已發出（由屋主自己填表；期限提醒改寫法）
 TASK_STATUS_PENDING = "待業務安排"
@@ -1372,7 +1373,7 @@ def _task_fields():
         FIELD_TASK_DEADLINE, FIELD_TASK_EST_START,
         FIELD_TASK_OWNER_TOKEN, FIELD_TASK_OWNER_WIN_START, FIELD_TASK_OWNER_WIN_END, FIELD_TASK_OWNER_MODE,
         FIELD_TASK_OWNER_WIN2_START, FIELD_TASK_OWNER_WIN2_END, FIELD_TASK_GROUP_ID, FIELD_TASK_OWNER_REPLY,
-        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_NO_ALT, FIELD_TASK_CLUSTER, FIELD_TASK_ORDER,
+        FIELD_TASK_COMPANIONS, FIELD_TASK_BUFFER, FIELD_TASK_DAYS, FIELD_TASK_WEEKEND, FIELD_TASK_NO_ALT, FIELD_TASK_CLUSTER, FIELD_TASK_ORDER,
     ]
 
 
@@ -1444,6 +1445,7 @@ def _task_to_dict(r):
         "owner_mode": bool(f.get(FIELD_TASK_OWNER_MODE)),
         "buffer_min": _valid_buffer(f.get(FIELD_TASK_BUFFER)),
         "days_label": (f.get(FIELD_TASK_DAYS) or "").strip(),
+        "weekend": _clean_weekend(f.get(FIELD_TASK_WEEKEND)),
         "no_alt": bool(f.get(FIELD_TASK_NO_ALT)),
         "cluster": bool(f.get(FIELD_TASK_CLUSTER)),
         "order": int(f.get(FIELD_TASK_ORDER) or 1),
@@ -1520,6 +1522,8 @@ def create_vendor_slot_task():
             fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min"))
         if (body.get("days_label") or "").strip():
             fields[FIELD_TASK_DAYS] = body["days_label"].strip()[:20]
+        if _clean_weekend(body.get("weekend")):
+            fields[FIELD_TASK_WEEKEND] = _clean_weekend(body.get("weekend"))
         if body.get("no_alt"):
             fields[FIELD_TASK_NO_ALT] = True
         est_start = (body.get("est_start") or "").strip()
@@ -1596,6 +1600,7 @@ def update_vendor_slot_task(record_id):
     fields[FIELD_TASK_COMPANIONS] = "、".join(_clean_companions(body.get("companions"), case_no)) or None
     fields[FIELD_TASK_BUFFER] = _valid_buffer(body.get("buffer_min")) or None
     fields[FIELD_TASK_DAYS] = (body.get("days_label") or "").strip()[:20] or None
+    fields[FIELD_TASK_WEEKEND] = _clean_weekend(body.get("weekend")) or None
     fields[FIELD_TASK_NO_ALT] = bool(body.get("no_alt"))
     if task["stage"] == TASK_STAGE_WAIT_EPC:   # 窗口改了候選日期＝EPC 重新提供了時間：屋主用同一條連結就能重新選
         fields[FIELD_TASK_STAGE] = None
@@ -2277,6 +2282,20 @@ def _owner_find_task(otoken):
 OWNER_MULTIDAY_LABEL = {"進場": "3～5 天"}
 
 
+def _clean_weekend(v):
+    """施工週末：只留「六」「日」，固定順序（六日）；其他一律丟掉。"""
+    t = str(v or "")
+    return "".join(c for c in "六日" if c in t)
+
+
+def _owner_weekend_days(task):
+    """給屋主頁用：廠商會施工的週末日（JS getDay：六＝6、日＝0）；只有進場（多天施工）才有意義。"""
+    if not _owner_date_only(task):
+        return []
+    w = task.get("weekend") or ""
+    return ([6] if "六" in w else []) + ([0] if "日" in w else [])
+
+
 def _owner_date_only(task):
     return any(t in OWNER_MULTIDAY_LABEL for t in (task.get("type") or []))
 
@@ -2540,7 +2559,7 @@ def owner_booking_get(otoken):
         "candidate_dates": task["candidate_dates"],
         "duration_min": _owner_duration(task),
         "date_only": _owner_date_only(task),
-        "duration_label": _owner_multiday_label(task),
+        "duration_label": _owner_multiday_label(task), "work_weekend": _owner_weekend_days(task),
         "window_start": ws, "window_end": we,
         "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
@@ -2846,7 +2865,7 @@ def vendor_slot_task_owner_link(record_id):
         "candidate_dates": task["candidate_dates"], "duration_min": _owner_duration(task),
         "window_start": ws, "window_end": we, "windows": [list(w) for w in _owner_windows(task)],
         "fixed": bool(_owner_fixed(task)),
-        "date_only": _owner_date_only(task), "duration_label": _owner_multiday_label(task),
+        "date_only": _owner_date_only(task), "duration_label": _owner_multiday_label(task), "work_weekend": _owner_weekend_days(task),
         "assignee": task["assignee"], "status": task["status"],
         "assignee_bound": bool(task["assignee"] and _get_line_binding(task["assignee"])),
         "rep_bind_url": _rep_bind_url(task["assignee"]),
