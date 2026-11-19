@@ -3440,13 +3440,14 @@ def vendor_share_get(token):
                 return jsonify({"error": "這天已經沒有元晶到貨的訂單（可能已改期或出貨）"}), 404
             card = _driver_request_card(target, cases)
             return jsonify({"card": card, "flex": _card_to_flex(card), "alt": _card_alt(card), "kind": "card", "sent_at": ""})
-        if data.get("mr") is not None or data.get("ma") is not None:   # 缺件通知字卡：使用者自己選要傳給哪位業務（2026-11-16）
+        if data.get("mr") is not None or data.get("ma") is not None or data.get("mg") is not None:   # 缺件通知字卡：使用者自己選要傳給哪位業務／廠商（2026-11-16）
             cards, _stamp = _md_share_build(data)
             if not cards:
                 return jsonify({"error": "目前沒有需要通知的缺件（可能已經補齊或被刪除）"}), 404
             flex = _card_to_flex(cards[0]) if len(cards) == 1 else {"type": "carousel", "contents": [_card_to_flex(c) for c in cards[:MD_CARD_MAX]]}
             alt = "｜".join(f"{c['tag']}：{c['title']}" for c in cards)[:390]
-            return jsonify({"kind": "mc", "cards": cards, "flex": flex, "alt": alt, "count": len(cards), "sent_at": ""})
+            return jsonify({"kind": "mc", "mode": "got" if data.get("mg") is not None else "need", "cards": cards, "flex": flex, "alt": alt,
+                            "count": len(cards), "sent_at": ""})
         b = _case_brief(data.get("c"))
         if kind == "own":   # 要傳給屋主的文字訊息
             fn = _owner_confirm_msg if data.get("m") == "confirm" else _reminder_owner_msg
@@ -3482,11 +3483,14 @@ def vendor_share_sent(token):
         return jsonify({"ok": True, "sent_at": now})
     if kind == "mc":   # 缺件字卡：使用者用自己的 LINE 傳出去了 → 這批缺件記「已通知」
         data = _reminder_token_parse(token)
-        if not data or (data.get("mr") is None and data.get("ma") is None):
+        if not data or (data.get("mr") is None and data.get("ma") is None and data.get("mg") is None):
             return jsonify({"error": "找不到這則缺件通知"}), 404
         try:
             _cards, stamp = _md_share_build(data)
-            _md_stamp_notified(stamp)
+            if data.get("mg") is not None:   # 補件完成卡片傳給廠商了 → 記「已通知廠商」
+                _md_stamp_vendor_notified([i["id"] for i in stamp])
+            else:
+                _md_stamp_notified(stamp)
         except Exception as e:
             print(f"[vendor_share_sent] 記錄缺件已通知失敗：{e!r}", flush=True)
         return jsonify({"ok": True})
@@ -9595,6 +9599,9 @@ def md_list():
         return jsonify({"error": str(e), "items": []}), 502
     cut = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=MD_DELETED_KEEP_DAYS)).strftime("%Y-%m-%d")
     items = [i for i in everything if i["status"] != MD_STATUS_DELETED]
+    for i in items:   # 2026-11-19 已補件提示視窗要能直接開資料夾確認
+        if i["supplied"] and i["status"] == MD_STATUS_MISSING:
+            i["folder"] = _md_folder_url(i["case_no"])
     deleted = sorted((i for i in everything if i["status"] == MD_STATUS_DELETED and (i["deleted"] or "9999") >= cut),
                      key=lambda x: x["deleted"], reverse=True)
     return jsonify({"items": items, "deleted": deleted, "today": _md_today()})
@@ -9956,8 +9963,35 @@ def _md_share_url(**data):
     return f"https://liff.line.me/{liff_id}?vshare={token}~mc"
 
 
+def _md_got_cards(vendor, items):
+    """「補件完成」卡片（傳給廠商）：陽光已收到、資料齊了的案場。8 個案場一張，多張輪播。"""
+    by_case = collections.OrderedDict()
+    for it in sorted(items, key=lambda x: _md_case_key(x["case_no"] or x["alias"])):
+        by_case.setdefault(it["alias"] or it["case_no"], []).append(it)
+    rows = list(by_case.items())
+    cards = []
+    for i in range(0, len(rows), 8):
+        lines = ["\n".join([name] + [f"・{it['doc_type']}" + (f"（{it['note']}）" if it["note"] else "") for it in its]) for name, its in rows[i:i + 8]]
+        page = f"（{i // 8 + 1}/{(len(rows) + 7) // 8}）" if len(rows) > 8 else ""
+        cards.append(_card("✅ 補件完成｜陽光已收到資料" + page, "#16A34A", f"{vendor} 您好，以下案場先前缺的資料已補齊",
+                           "陽光已收到、資料齊了，麻煩繼續後續作業。", sections=[("◆已補件案場", lines)],
+                           footer=f"共 {len(rows)} 個案場、{len(items)} 項。謝謝！"))
+    return cards[:MD_CARD_MAX]
+
+
+def _md_stamp_vendor_notified(ids):
+    today = _md_today()
+    for i in range(0, len(ids), 10):
+        requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={
+            "records": [{"id": rid, "fields": {MD_F["vendor_notified"]: today}} for rid in ids[i:i + 10]]})
+
+
 def _md_share_build(data):
     """依分享 token 的內容現場重建字卡。回傳 (cards, 要記「已通知」的項目)。"""
+    if data.get("mg") is not None:   # 補件完成 → 傳給廠商
+        ids = set(data.get("ids") or [])
+        items = [i for i in _md_load() if i["id"] in ids and i["status"] == MD_STATUS_GOT]
+        return (_md_got_cards(data["mg"], items) if items else []), items
     if data.get("mr") is not None:
         rep = data["mr"]
         items = _md_rep_items(rep)
@@ -10129,6 +10163,33 @@ def md_supplied():
     except Exception as e:
         print(f"[md_supplied] 通知失敗：{e!r}", flush=True)
     return _md_supply_page("已通知陽光", "謝謝！陽光收到您補件的通知了，確認資料後會處理。")
+
+
+@app.route("/api/missing-docs/supplied-confirm", methods=["POST"])
+def md_supplied_confirm():
+    """業務按了「已補件」、PM 看過資料夾後一鍵確認（2026-11-19）：把這些缺件標成「已取得」，回傳用自己 LINE 傳『補件完成』卡片給廠商的分享連結。
+    body: {vendor, ids}。只處理狀態還是「缺件」、而且業務已按過已補件的項目。卡片傳出去（LIFF 回報）才記「已通知廠商」。"""
+    body = request.get_json(force=True) or {}
+    vendor = (body.get("vendor") or "").strip()
+    ids = set(body.get("ids") or [])
+    if not vendor or not ids:
+        return jsonify({"error": "缺少廠商或項目"}), 400
+    try:
+        items = [i for i in _md_load(only_missing=True) if i["id"] in ids and i["vendor"] == vendor and i["supplied"]]
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 502
+    if not items:
+        return jsonify({"error": "這些項目已經處理過了（可能已被標成已取得）"}), 404
+    today = _md_today()
+    for k in range(0, len(items), 10):
+        resp = requests.patch(MD_API_URL, headers=airtable_headers(), timeout=30, json={"records": [
+            {"id": it["id"], "fields": {MD_F["status"]: MD_STATUS_GOT, MD_F["got"]: today, MD_F["confirmed"]: today}}
+            for it in items[k:k + 10]]})
+        if resp.status_code >= 400:
+            return jsonify({"error": "Airtable 寫入失敗", "detail": resp.text[:200]}), 502
+    got_ids = [i["id"] for i in items]
+    return jsonify({"ok": True, "count": len(items), "ids": got_ids, "share_url": _md_share_url(mg=vendor, ids=got_ids),
+                    "text": _md_got_message(vendor, [dict(i, status=MD_STATUS_GOT) for i in items])})
 
 
 MD_GOT_NOTICE_DAYS = 21   # 「已取得」多久內還沒通知廠商的，才列進「通知廠商已補件」
