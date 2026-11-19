@@ -1409,9 +1409,27 @@ def _valid_buffer(v):
     return -(-n // 30) * 30   # 預約時段以 30 分鐘為單位，緩衝一律進位到 30 的倍數（舊的 15／45 分鐘 → 30／60）
 
 
+DEFAULT_DEADLINE_HOUR = 8   # 沒指定回覆期限時，預設＝最早候選日期當天早上 08:00（台北時間）
+
+
+def _auto_deadline(candidate_dates):
+    """沒指定回覆期限 → 用最早候選日期當天早上 08:00（+08:00）。沒有合法日期回空字串。"""
+    ds = []
+    for d in candidate_dates or []:
+        try:
+            ds.append(datetime.strptime(str(d).strip()[:10], "%Y-%m-%d").date())
+        except Exception:
+            pass
+    if not ds:
+        return ""
+    return f"{min(ds).isoformat()}T{DEFAULT_DEADLINE_HOUR:02d}:00:00+08:00"
+
+
 def _task_to_dict(r):
     f = r["fields"]
     dates_raw = f.get(FIELD_TASK_CANDIDATE_DATES, "") or ""
+    _cands = [d.strip() for d in dates_raw.split(",") if d.strip()]
+    _explicit_dl = f.get(FIELD_TASK_DEADLINE) or ""
     return {
         "record_id": r["id"],
         "vendor": f.get(FIELD_TASK_VENDOR),
@@ -1432,7 +1450,8 @@ def _task_to_dict(r):
         "alt_slots": _json_or_default(f.get(FIELD_TASK_ALT_SLOTS), []),
         "chosen_slot": _json_or_default(f.get(FIELD_TASK_CHOSEN_SLOT), {}) or None,
         "rep_note": f.get(FIELD_TASK_REP_NOTE, ""),
-        "deadline": f.get(FIELD_TASK_DEADLINE) or "",
+        "deadline": _explicit_dl or _auto_deadline(_cands),
+        "deadline_auto": (not _explicit_dl) and bool(_auto_deadline(_cands)),
         "est_start": f.get(FIELD_TASK_EST_START) or "",
         "owner_token": f.get(FIELD_TASK_OWNER_TOKEN) or "",
         "owner_win_start": f.get(FIELD_TASK_OWNER_WIN_START) or "",
@@ -7777,7 +7796,8 @@ def send_deadline_reminders():
         # 待窗口確認＝業務已經回傳備選時段，球在窗口手上，不用催業務
         if f.get(FIELD_TASK_STAGE) in (TASK_STAGE_WAIT_PM, TASK_STAGE_WAIT_EPC):
             continue
-        raw = f.get(FIELD_TASK_DEADLINE)
+        raw = f.get(FIELD_TASK_DEADLINE) or _auto_deadline(
+            [d.strip() for d in (f.get(FIELD_TASK_CANDIDATE_DATES, "") or "").split(",") if d.strip()])
         if not raw:
             continue
         try:
