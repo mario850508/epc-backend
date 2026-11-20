@@ -12577,6 +12577,7 @@ def _pdf_record_to_dict(r):
         "confidence": g("confidence"),
         "evidence": g("evidence") or "",
         "issues": result.get("issues") or [],
+        "trimmed_note": result.get("trimmed_note") or "",   # 原檔超過 5MB、雲端只存前 6 頁 → 不能自動歸檔
         "notes": result.get("notes") or [],
         "candidates": result.get("candidates") or [],
         "engine": result.get("engine") or "",
