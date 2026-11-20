@@ -262,6 +262,7 @@ def build_docx(d):
     edits[z + 3] = str(d['date_m'])
     edits[z + 5] = str(d['date_d'])
     xml = _set_tokens(xml, edits)
+    xml = _signature_to_new_page(xml)
 
     # ---- 4. 寫回 docx
     out = io.BytesIO()
@@ -271,6 +272,32 @@ def build_docx(d):
                 data = xml.encode('utf-8')
             zo.writestr(infos[name], data)
     return out.getvalue()
+
+
+def _signature_to_new_page(xml):
+    """簽署頁固定從新的一頁開始：拿掉「(簽署頁)」前面的空白段落，改用『段落前分頁』。"""
+    paras = list(re.finditer(r'<w:p[ >].*?</w:p>', xml, re.S))
+    idx = None
+    for n, m in enumerate(paras):
+        if '(簽署頁)' in re.sub(r'<[^>]+>', '', m.group(0)):
+            idx = n
+            break
+    if idx is None:
+        return xml
+    # 往前找連續的空白段落（無文字）
+    j = idx
+    while j > 0 and not re.sub(r'<[^>]+>', '', paras[j - 1].group(0)).strip() \
+            and '<w:sectPr' not in paras[j - 1].group(0):
+        j -= 1
+    target = paras[idx].group(0)
+    if '<w:pageBreakBefore' not in target:
+        if '<w:pPr>' in target:
+            new_target = target.replace('<w:pPr>', '<w:pPr><w:pageBreakBefore/>', 1)
+        else:
+            new_target = re.sub(r'(<w:p(?: [^>]*)?>)', r'\1<w:pPr><w:pageBreakBefore/></w:pPr>', target, 1)
+    else:
+        new_target = target
+    return xml[:paras[j].start()] + new_target + xml[paras[idx].end():]
 
 
 def _num4(v):
