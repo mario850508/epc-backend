@@ -16715,6 +16715,148 @@ def meter_check_agreement_upload():
         return jsonify({"error": f"檔案已收到但後續處理失敗：{e}", "record_id": rid}), 502
 
 
+def _agr_money_round(unit, cap):
+    """合約算法：未稅總價＝單價×容量 四捨五入到百位，含稅＝未稅×1.05（跟合約產生器一致）。"""
+    return int(round(int(float(unit) * float(cap) / 100 + 0.5) * 100 * 1.05))
+
+
+@app.route("/api/meter-check/agreement/prefill", methods=["POST"])
+def meter_check_agreement_prefill():
+    """產出工程變更協議書前，先把這案能自動帶的資料算好給前端預覽、修改。
+    body: {case_no, cap_to（掛表時容量）, price_to（掛表時電價）, cap_from?, price_from?}
+    來源：專案細節（別名、廠商、合約編號）、工程合約（單價、總價、付款期程）、發票請款（已開發票的期別）。"""
+    import agreement_gen as AG
+    b = request.get_json(silent=True) or {}
+    case_no = (b.get("case_no") or "").strip()
+    if not case_no:
+        return jsonify({"error": "缺少 case_no"}), 400
+    warnings = []
+    try:
+        esc = case_no.replace("'", chr(92) + "'")
+        recs = airtable_get_all(CASE_API_URL, "{%s}='%s'" % (FIELD_CASE_NO, esc),
+                                [FIELD_CASE_NO, FIELD_ALIAS, FIELD_VENDOR, FIELD_CASE_CONTRACT_NO])
+        f = recs[0]["fields"] if recs else {}
+        alias = f.get(FIELD_ALIAS, "") or ""
+        vendor = f.get(FIELD_VENDOR) or ""
+        if isinstance(vendor, list):
+            vendor = vendor[0] if vendor else ""
+        cno = f.get(FIELD_CASE_CONTRACT_NO) or ""
+        if isinstance(cno, list):
+            cno = cno[0] if cno else ""
+        cno = str(cno).strip()
+    except Exception as e:
+        return jsonify({"error": "讀專案細節失敗：" + str(e)}), 502
+    vinfo = AG.VENDORS.get(vendor)
+    if not vinfo:
+        warnings.append("找不到廠商「%s」的公司資料，乙方名稱／代表人／統編／地址請自己填" % vendor)
+        vinfo = {"name": vendor, "rep": "", "tax": "", "addr": ""}
+    eng = {}
+    try:
+        eng = _mc_eng_contracts([case_no]).get(case_no) or {}
+    except Exception as e:
+        warnings.append("讀工程合約失敗：" + str(e))
+    sched_res = {}
+    try:
+        sched_res = _inv_contract_schedule(case_no)
+    except Exception as e:
+        warnings.append("讀付款期程失敗：" + str(e))
+    sched = sched_res.get("sched") or {}
+    if not sched:
+        warnings.append(sched_res.get("note") or "工程合約裡讀不到付款期程，各期金額請自己填")
+    cap_to = b.get("cap_to")
+    cap_from = b.get("cap_from") if b.get("cap_from") not in (None, "") else eng.get("cap")
+    price_to = b.get("price_to")
+    price_from = b.get("price_from") if b.get("price_from") not in (None, "") else eng.get("price")
+    if cap_to in (None, "") or cap_from in (None, ""):
+        return jsonify({"error": "缺少容量（工程合約容量或掛表時容量）"}), 400
+    unit_from = eng.get("unit_price")
+    total_from = sched_res.get("total")
+    if not unit_from and total_from and cap_from:
+        unit_from = int(round(float(total_from) / 1.05 / float(cap_from)))
+        warnings.append("合約單價讀不到，用總價反推")
+    if not unit_from:
+        warnings.append("讀不到工程單價，請自己填")
+        unit_from = 0
+    if not total_from and unit_from:
+        total_from = _agr_money_round(unit_from, cap_from)
+        warnings.append("合約總價讀不到，用單價×容量算")
+    total_from = int(round(float(total_from or 0)))
+    total_to = _agr_money_round(unit_from, cap_to) if unit_from else 0
+    # 已開發票的期別（退回的不算）：金額不動，其餘期別依原比例分攤
+    paid = {}
+    try:
+        invs = airtable_get_all(INV_API_URL, "{%s}='%s'" % (INV_F["case_no"], esc),
+                                [INV_F[k] for k in ("invoice_no", "status", "nodes", "pay_date", "total")])
+        for r in invs:
+            ff = r["fields"]
+            if ff.get(INV_F["status"]) == "退回":
+                continue
+            nodes = ff.get(INV_F["nodes"]) or []
+            if isinstance(nodes, str):
+                nodes = [x.strip() for x in re.split(r"[、,，]", nodes) if x.strip()]
+            for n in nodes:
+                n = n.replace("掛表", "掛錶")
+                if n not in AG.NODES:
+                    continue
+                p = paid.setdefault(n, {"invoice": [], "date": ""})
+                if ff.get(INV_F["invoice_no"]):
+                    p["invoice"].append(ff[INV_F["invoice_no"]])
+                if ff.get(INV_F["status"]) == "已付款" and ff.get(INV_F["pay_date"]):
+                    d = str(ff[INV_F["pay_date"]])[:10]
+                    p["date"] = d.replace("-0", "-").replace("-", "/")
+    except Exception as e:
+        warnings.append("讀發票請款失敗（發票號碼、支付日期請自己填）：" + str(e))
+    orig_amt = {n: float((sched.get(n) or {}).get("amount") or 0) for n in AG.NODES}
+    new_amt, refund = AG.plan_payments(orig_amt, paid, total_to) if total_to else ({n: 0 for n in AG.NODES}, 0)
+    cd = AG.contract_date_from_no(cno)
+    if not cd:
+        warnings.append("合約編號「%s」看不出簽約日期，請自己填原合約簽訂日" % cno)
+    items, direction = [], set()
+    if cap_from not in (None, "") and abs(float(cap_from) - float(cap_to)) > 0.0005:
+        items.append("容量")
+        direction.add("down" if float(cap_to) < float(cap_from) else "up")
+    if price_from not in (None, "") and price_to not in (None, "") and abs(float(price_from) - float(price_to)) > 0.00005:
+        items.append("電價")
+        direction.add("down" if float(price_to) < float(price_from) else "up")
+    today = _tw_now()
+    return jsonify({
+        "case_name": case_no, "addr_cell": alias, "contract_no": cno,
+        "sign_y": cd[0] if cd else "", "sign_m": cd[1] if cd else "", "sign_d": cd[2] if cd else "",
+        "vendor": vendor, "vendor_name": vinfo["name"], "vendor_rep": vinfo["rep"], "vendor_tax": vinfo["tax"], "vendor_addr": vinfo["addr"],
+        "items": items or ["容量"], "direction": (list(direction)[0] if len(direction) == 1 else "mixed") if direction else "down",
+        "cap_from": cap_from, "cap_to": cap_to, "price_from": price_from, "price_to": price_to,
+        "unit_from": unit_from, "unit_to": unit_from, "total_from": total_from, "total_to": total_to,
+        "payments": [{"node": n, "orig": int(round(orig_amt[n])), "new": int(new_amt.get(n, 0)), "paid": n in paid,
+                      "invoice": "、".join((paid.get(n) or {}).get("invoice") or []), "date": (paid.get(n) or {}).get("date") or ""}
+                     for n in AG.NODES],
+        "refund": refund,
+        "date_y": today.year - 1911, "date_m": today.month, "date_d": today.day,
+        "warnings": warnings,
+    })
+
+
+@app.route("/api/meter-check/agreement/generate", methods=["POST"])
+def meter_check_agreement_generate():
+    """依預覽畫面（可能被使用者修改過）的內容產出協議書 docx 檔案下載。"""
+    import agreement_gen as AG
+    from urllib.parse import quote
+    b = request.get_json(silent=True) or {}
+    need = ("vendor_name", "vendor_rep", "vendor_tax", "vendor_addr", "case_name", "sign_y", "sign_m", "sign_d",
+            "cap_from", "cap_to", "unit_from", "unit_to", "total_from", "total_to", "payments", "date_y", "date_m", "date_d")
+    miss = [k for k in need if b.get(k) in (None, "")]
+    if miss:
+        return jsonify({"error": "還有欄位沒填：" + "、".join(miss)}), 400
+    try:
+        data = AG.build_docx(b)
+    except Exception as e:
+        print(f"[agreement_generate] {b.get('case_name')} 失敗：{e}", flush=True)
+        return jsonify({"error": "產生失敗：" + str(e)}), 500
+    name = f"{b.get('case_name')}_{(b.get('addr_cell') or '').strip()}_工程變更協議書.docx".replace("__", "_")
+    return Response(data, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": "attachment; filename=\"agreement.docx\"; filename*=UTF-8''" + quote(name),
+                             "X-Filename": quote(name), "Access-Control-Expose-Headers": "X-Filename"})
+
+
 @app.route("/api/meter-check/<record_id>", methods=["DELETE"])
 def delete_meter_check(record_id):
     if not _re.fullmatch(r"rec[A-Za-z0-9]{14}", record_id or ""):
