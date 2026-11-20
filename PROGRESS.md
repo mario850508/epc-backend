@@ -382,3 +382,4 @@ eparse_full.log。
 - 前端：meter-check.js「📝 產出協議書」→ 預覽視窗（可改）→「產出 Word」下載；v23。
 - 待確認：「地址」欄範本放的是別名（現照放）；電價有變時是否影響工程價金（目前只多一列躉購電價，價金不動）。
 - 2026-11-20 修正：簽署頁(「(簽署頁)」段落)改用「段落前分頁」固定從第 2 頁開始（agreement_gen._signature_to_new_page，並拿掉前面的空白段落）；簽署頁甲乙方資訊與日期之間維持範本的空白段落(Enter)，日期落在簽署頁底部，共 2 頁。
+- 2026-11-20 協議書預覽視窗內容自動儲存：Airtable「掛表資訊確認」表新欄位「協議書草稿」(fldxXzgMMoE08fkgL, JSON)；`GET/POST /api/meter-check/agreement/draft`（month+case_no，POST draft=null 清除）。前端 meter-check.js v24：改過／重算／產出時儲存（改動後 1.5 秒自動存、關視窗也存），重開自動載入；「↺ 捨棄，重新帶入最新資料」可重來；沒改過不存。

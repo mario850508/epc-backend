@@ -16720,6 +16720,56 @@ def _agr_money_round(unit, cap):
     return int(round(int(float(unit) * float(cap) / 100 + 0.5) * 100 * 1.05))
 
 
+MC_AG_DRAFT_F = "fldxXzgMMoE08fkgL"   # 掛表資訊確認表「協議書草稿」(長文字, JSON)：預覽視窗上次的內容
+
+
+def _mc_ag_find(month, case_no):
+    esc = case_no.replace("'", chr(92) + "'")
+    return airtable_get_all(
+        MC_API_URL,
+        f"AND({{{MC_F['month']}}}='{month}',{{{MC_F['case_no']}}}='{esc}',{{{MC_F['kind']}}}='掛表')",
+        [MC_F["case_no"], MC_AG_DRAFT_F],
+    )
+
+
+@app.route("/api/meter-check/agreement/draft", methods=["GET", "POST"])
+def meter_check_agreement_draft():
+    """協議書預覽視窗的內容（發票號碼、各期金額…）存回 Airtable，關掉再打開不會歸零。
+    GET ?month=&case_no= → {draft: {...}|null}；POST {month, case_no, draft:{...}|null(清除)}"""
+    b = request.get_json(silent=True) or {} if request.method == "POST" else request.args
+    month = (b.get("month") or "").strip()
+    case_no = (b.get("case_no") or "").strip()
+    if not _re.fullmatch(r"\d{4}-\d{2}", month) or not case_no:
+        return jsonify({"error": "缺少 month／case_no"}), 400
+    try:
+        found = _mc_ag_find(month, case_no)
+        if request.method == "GET":
+            raw = (found[0].get("fields", {}).get(MC_AG_DRAFT_F) or "") if found else ""
+            try:
+                return jsonify({"draft": json.loads(raw) if raw else None})
+            except ValueError:
+                return jsonify({"draft": None})
+        draft = b.get("draft")
+        if draft is not None:
+            if not isinstance(draft, dict):
+                return jsonify({"error": "draft 格式不正確"}), 400
+            draft["_saved"] = _tw_now().strftime("%Y-%m-%d %H:%M")
+        fields = {MC_AG_DRAFT_F: json.dumps(draft, ensure_ascii=False) if draft is not None else ""}
+        if found:
+            resp = requests.patch(f"{MC_API_URL}/{found[0]['id']}", headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
+        else:
+            if draft is None:
+                return jsonify({"ok": True})
+            fields.update({MC_F["title"]: f"{month} 掛表 {case_no}", MC_F["month"]: month,
+                           MC_F["case_no"]: case_no, MC_F["kind"]: "掛表"})
+            resp = requests.post(MC_API_URL, headers=airtable_headers(), json={"fields": fields, "typecast": True}, timeout=20)
+        resp.raise_for_status()
+        return jsonify({"ok": True, "saved": (draft or {}).get("_saved", "")})
+    except Exception as e:
+        print(f"[agreement_draft] {month} {case_no} 失敗：{e}", flush=True)
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/api/meter-check/agreement/prefill", methods=["POST"])
 def meter_check_agreement_prefill():
     """產出工程變更協議書前，先把這案能自動帶的資料算好給前端預覽、修改。
